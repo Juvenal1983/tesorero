@@ -1,0 +1,158 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --brand: #0F6E56;
+    --brand-mid: #1D9E75;
+    --brand-light: #E1F5EE;
+    --brand-dark: #085041;
+    --danger: #E24B4A;
+    --danger-light: #FCEBEB;
+    --warning: #EF9F27;
+    --warning-light: #FAEEDA;
+    --info: #378ADD;
+    --info-light: #E6F1FB;
+    --bg: #F5F9F7;
+    --border: #D3D1C7;
+  }
+
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  html, body {
+    height: 100%;
+  }
+
+  body {
+    font-size: 15px;
+    line-height: 1.5;
+  }
+
+  /* Scrollbar personalizado */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #D3D1C7; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #B4B2A9; }
+}
+
+@layer components {
+  /* ── Sidebar ── */
+  .sidebar-item {
+    @apply flex items-center gap-2.5 px-3 py-2 rounded-lg cursor-pointer
+           text-gray-500 text-sm transition-colors duration-150
+           hover:bg-brand-50 hover:text-brand-600;
+  }
+  .sidebar-item.active {
+    @apply bg-brand-50 text-brand-600 font-semibold;
+  }
+
+  /* ── Cards ── */
+  .card {
+    @apply bg-white rounded-xl border border-gray-200 p-5;
+  }
+  .card-sm {
+    @apply bg-white rounded-lg border border-gray-200 p-4;
+  }
+
+  /* ── Metric card ── */
+  .metric-card {
+    @apply bg-gray-50 rounded-lg p-4;
+  }
+  .metric-label {
+    @apply text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1.5;
+  }
+  .metric-value {
+    @apply text-2xl font-black tracking-tight leading-none;
+  }
+
+  /* ── Buttons ── */
+  .btn {
+    @apply inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-semibold
+           border border-gray-200 bg-white text-gray-700 transition-colors duration-150
+           cursor-pointer hover:bg-gray-50 active:scale-[0.98] focus:outline-none
+           focus:ring-2 focus:ring-brand-400 focus:ring-offset-1;
+  }
+  .btn-primary {
+    @apply bg-brand-600 text-white border-brand-600 hover:bg-brand-800;
+  }
+  .btn-danger {
+    @apply text-danger border-danger hover:bg-danger-light;
+  }
+  .btn-sm {
+    @apply px-3 py-1.5 text-xs;
+  }
+  .btn-ghost {
+    @apply border-transparent hover:border-gray-200;
+  }
+
+  /* ── Forms ── */
+  .form-input {
+    @apply w-full px-3 py-2 border border-gray-200 rounded-lg text-sm
+           bg-white text-gray-900 transition-colors duration-150
+           focus:outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-400/20;
+  }
+  .form-label {
+    @apply block text-sm font-semibold text-gray-500 mb-1.5;
+  }
+  .form-group {
+    @apply flex flex-col gap-1;
+  }
+
+  /* ── Badges ── */
+  .badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded-full text-xs font-bold;
+  }
+  .badge-green { @apply bg-brand-50 text-brand-800; }
+  .badge-red   { @apply bg-danger-light text-danger-600; }
+  .badge-blue  { @apply bg-info-light text-info-600; }
+  .badge-amber { @apply bg-warning-light text-warning-600; }
+  .badge-gray  { @apply bg-gray-100 text-gray-500; }
+
+  /* ── Table ── */
+  .data-table th {
+    @apply text-left text-xs font-bold text-gray-400 uppercase tracking-wider
+           px-4 py-2 border-b border-gray-100 whitespace-nowrap;
+  }
+  .data-table td {
+    @apply px-4 py-3 border-b border-gray-50 text-sm align-middle;
+  }
+  .data-table tr:last-child td {
+    @apply border-b-0;
+  }
+  .data-table tbody tr:hover td {
+    @apply bg-gray-50/50;
+  }
+
+  /* ── Progress bar ── */
+  .progress-bar {
+    @apply h-2 bg-gray-100 rounded-full overflow-hidden;
+  }
+  .progress-fill {
+    @apply h-full rounded-full transition-all duration-500;
+  }
+
+  /* ── Empty state ── */
+  .empty-state {
+    @apply flex flex-col items-center justify-content py-12 text-gray-400;
+  }
+}
+
+/* ── Bottom navigation safe area ── */
+.bottom-nav-safe {
+  padding-bottom: max(env(safe-area-inset-bottom), 0.5rem);
+}
+
+/* ── PWA install banner ── */
+@media (display-mode: standalone) {
+  .pwa-install-banner { display: none !important; }
+}
+
+/* ── Print styles ── */
+@media print {
+  .no-print { display: none !important; }
+  .print-full { width: 100% !important; }
+  .card { border: 1px solid #ccc !important; box-shadow: none !important; }
+}
