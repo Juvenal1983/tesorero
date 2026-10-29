@@ -41,6 +41,19 @@ async function buscarUsuarioLegacyPorEmail(email, authUserId){
     }
   }catch(e){}
 
+  // 3) Fallback completo: escanear todos los registros buscando el email
+  //    (cubre usuarios creados antes de la migración a Supabase Auth)
+  try{
+    const todos = await sbGet('tesorero_datos','select=usuario_id,datos');
+    if(Array.isArray(todos)){
+      for(const row of todos){
+        if(!row.datos) continue;
+        const user = (row.datos.usuarios||[]).find(u => String(u.email||'').toLowerCase() === target);
+        if(user) return { user, datos: row.datos };
+      }
+    }
+  }catch(e){}
+
   return null;
 }
 
@@ -91,6 +104,14 @@ async function loginConAuth(email, errEl){
       _finalizarLogin(u, errEl);
       return true;
     }
+
+    // Auth OK pero no se encontraron datos en ninguna búsqueda
+    // Mostrar error específico para diferenciar de contraseña incorrecta
+    if(errEl){
+      errEl.textContent = 'Autenticación correcta pero no se encontraron tus datos. Contacta al administrador. (auth-ok-no-data)';
+      errEl.style.display = '';
+    }
+    return false;
 
     return false;
   }catch(e){
