@@ -2,7 +2,6 @@
   publish = "."
   command = ""
 
-[[plugins]]
-  package = "@netlify/plugin-nextjs"
-  [plugins.inputs]
-    enabled = false
+[build.environment]
+  NETLIFY_NEXT_PLUGIN_SKIP = "true"
+  NODE_ENV = "production"
