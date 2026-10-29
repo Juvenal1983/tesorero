@@ -1296,18 +1296,25 @@ function limpiarSesionApoderado(){
 }
 
 function logoutLector(){
-  // Cierra sesión del apoderado SIN borrar credenciales guardadas
-  // Usamos una bandera para que en esta sesión no haga auto-login
-  // pero la próxima vez que abra la app SÍ lo haga
+  // Cierra sesión del apoderado SIN borrar credenciales guardadas.
+  // ── v9: invalidar epochs ANTES de limpiar el estado, igual que logout().
+  //        Descarta fetches en vuelo que pudieran escribir en DB tras salir.
+  if (typeof _v9SessionId !== 'undefined')     { _v9SessionId++; }
+  if (typeof _selectCursoEpoch !== 'undefined') { _selectCursoEpoch++; }
+
+  // Limpiar estado de sesión v9 (token, cuentaId, sesión)
+  if (typeof _authToken !== 'undefined') { _authToken = null; }
+  S._v9CuentaId = null;
+
   window._skipApAutoLogin = true;
   S.session=null; S.cursoId=null; S.route='login';
-  // Limpiar datos locales del tesorero pero conservar credenciales del apoderado
+
+  // Conservar credenciales del apoderado para el próximo auto-login
   const apRecordar = previewStorage.getItem('tesorero_ap_recordar');
   const apCursoId  = previewStorage.getItem('tesorero_ap_cursoId');
   const apAluId    = previewStorage.getItem('tesorero_ap_aluId');
   const apPin      = previewStorage.getItem('tesorero_ap_pin');
   DB={}; initDB();
-  // Restaurar credenciales del apoderado por si initDB las borró
   if(apRecordar==='1'){
     previewStorage.setItem('tesorero_ap_recordar','1');
     previewStorage.setItem('tesorero_ap_cursoId', apCursoId||'');
@@ -1315,8 +1322,6 @@ function logoutLector(){
     previewStorage.setItem('tesorero_ap_pin',      apPin||'');
   }
   render();
-  // La bandera se mantiene solo durante esta sesión en el navegador
-  // La próxima vez que abran la app (nueva carga) no existe y el auto-login funciona
 }
 
 async function logout(){

@@ -19,10 +19,14 @@
   },
   "notes": [
     "Después de npm install, ejecutar: npx playwright install chromium",
-    "Variables de entorno requeridas para los tests de UI (05):",
+    "Variables de entorno comunes (03, 04, 05, 06):",
     "  STAGING_APP_URL, STAGING_SUPABASE_URL, STAGING_SUPABASE_ANON_KEY,",
     "  STAGING_USER_A_EMAIL, STAGING_USER_A_PASSWORD",
     "Para 03_rls_cliente.js añadir también:",
-    "  STAGING_USER_B_EMAIL, STAGING_USER_B_PASSWORD"
+    "  STAGING_USER_B_EMAIL, STAGING_USER_B_PASSWORD",
+    "Para 06_acceso_delegado.js añadir:",
+    "  STAGING_USER_C_EMAIL, STAGING_USER_C_PASSWORD, STAGING_USER_C_ROL (default: visor)",
+    "  Usuario C es el delegado; Usuario B es propietario de Cuenta B y NO debe usarse como delegado.",
+    "Códigos de salida de 06: 0=APROBADO, 1=FALLO, 2=PENDIENTE (setup incompleto)"
   ]
 }

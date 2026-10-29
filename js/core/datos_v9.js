@@ -44,9 +44,9 @@ async function _v9Fetch(path, opts = {}, accessToken) {
 
   const res = await fetch(url, { ...opts, headers });
 
-  // Si la sesión cambió mientras esperábamos la respuesta, descartarla.
+  // Guard 1 — sesión cambiada mientras esperábamos la respuesta HTTP.
   if (typeof _v9SessionId !== 'undefined' && _snapSession !== _v9SessionId) {
-    const stale = new Error('[datos_v9] Sesión cambiada durante el fetch — respuesta descartada.');
+    const stale = new Error('[datos_v9] Sesión cambiada durante el fetch — respuesta descartada (post-HTTP).');
     stale._staleSession = true;
     throw stale;
   }
@@ -63,7 +63,18 @@ async function _v9Fetch(path, opts = {}, accessToken) {
   // DELETE y respuestas vacías
   if (res.status === 204 || res.headers.get('content-length') === '0') return null;
 
-  return res.json();
+  const json = await res.json();
+
+  // Guard 2 — sesión cambiada mientras el motor deserializaba el JSON.
+  // Este segundo chequeo cubre el caso en que logout() se llama entre
+  // la llegada de los headers HTTP y el fin del parseo del cuerpo.
+  if (typeof _v9SessionId !== 'undefined' && _snapSession !== _v9SessionId) {
+    const stale = new Error('[datos_v9] Sesión cambiada durante la lectura del cuerpo — datos descartados (post-JSON).');
+    stale._staleSession = true;
+    throw stale;
+  }
+
+  return json;
 }
 
 // ─── API pública ─────────────────────────────────────────────────────────────
@@ -269,24 +280,25 @@ function _mapPago(row) {
 /**
  * Carga las membresías de un usuario en usuarios_cuenta.
  * Un usuario invitado tiene filas aquí pero NO es propietario en tesorero_cuentas.
- * Devuelve array de membresías activas, o [] si no hay.
+ * Devuelve array de membresías no desactivadas, o lanza error con detalle del esquema.
  *
- * Columnas esperadas en usuarios_cuenta:
- *   id, cuenta_id, user_auth_id, rol, curso_id (nullable), activo
+ * Columnas reales en usuarios_cuenta (esquema de producción):
+ *   id, cuenta_id, auth_id, rol, curso_id (nullable), desactivado
+ *
+ * ⚠️  Esta función NO silencia errores de esquema (columna incorrecta, RLS bloqueante,
+ *     tabla inexistente). Los errores de configuración deben ser visibles en los logs
+ *     y deben propagarse al llamador para que el login muestre un mensaje claro.
  */
 async function cargarMembresiasUsuario(authId, accessToken) {
-  try {
-    const rows = await _v9Fetch(
-      `/usuarios_cuenta?user_auth_id=eq.${encodeURIComponent(authId)}&activo=eq.true&select=*`,
-      {}, accessToken
-    );
-    return Array.isArray(rows) ? rows : [];
-  } catch (e) {
-    if (e._staleSession) throw e;
-    // La tabla puede no existir aún en staging; devolver [] para no bloquear el login.
-    console.warn('[datos_v9] cargarMembresiasUsuario falló (¿tabla no creada?):', e.message);
-    return [];
+  // Columna real: auth_id (no user_auth_id); filtro: desactivado=false (no activo=true)
+  const rows = await _v9Fetch(
+    `/usuarios_cuenta?auth_id=eq.${encodeURIComponent(authId)}&desactivado=eq.false&select=*`,
+    {}, accessToken
+  );
+  if (!Array.isArray(rows)) {
+    throw new Error('[datos_v9] cargarMembresiasUsuario: respuesta inesperada (no es array). Verifica el esquema de usuarios_cuenta.');
   }
+  return rows;
 }
 
 /**
@@ -326,7 +338,8 @@ async function cargarSesionV9(authId, accessToken, cursoId) {
     const membresia = membresias[0];
     cuentaId = membresia.cuenta_id;
     esDelegado = true;
-    rolEfectivo = membresia.rol || 'lector';
+    // Rol real del esquema: 'visor' | 'editor' | 'tesorero' (no 'lector')
+    rolEfectivo = membresia.rol || 'visor';
 
     // La RLS de tesorero_cuentas debe permitir SELECT al delegado para leer el nombre/email.
     // Si no lo permite, usamos un placeholder y continuamos.
