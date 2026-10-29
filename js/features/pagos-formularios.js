@@ -355,13 +355,13 @@ function savePago(aluId,cuotaId,modo){
   const nuevos = [];
   periodos.forEach(periodo=>{
     const pagoExistente = (DB.pagos||[]).find(p=>
-      p.alumnoId===aluId && p.cuotaId===cuotaId && p.periodo===periodo && p.estado==='pagado'
+      (p.alumnoId||p.aluId)===aluId && p.cuotaId===cuotaId && p.periodo===periodo && p.estado==='pagado'
     );
     if(pagoExistente){
       duplicados.push(periodo);
     } else {
       nuevos.push(periodo);
-      DB.pagos.push({id:uid(),cuotaId,alumnoId:aluId,periodo,monto,fecha,estado:'pagado',medio,obs,creadoPor:S.session.id});
+      DB.pagos.push({id:uid(),cuotaId,alumnoId:aluId,aluId,periodo,monto,fecha,estado:'pagado',medio,obs,creadoPor:S.session.id});
     }
   });
 
@@ -370,7 +370,56 @@ function savePago(aluId,cuotaId,modo){
   }
   if(!nuevos.length) return;
 
-  saveDB();
+  // ── FLUJO RELACIONAL v9 ──────────────────────────────────────────────────
+  // Si V9_RELACIONAL está activo, persistir en la tabla `pagos` en lugar de
+  // (o además de) actualizar el blob tesorero_datos.
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    const cuentaId = (typeof S !== 'undefined' && S._v9CuentaId) || null;
+    if (!cuentaId) {
+      console.error('[v9] savePago: S._v9CuentaId no disponible — no se pudo persistir en tabla pagos.');
+    } else {
+      // registrarPagoV9 para cada período nuevo
+      // Los pagos ya fueron añadidos a DB.pagos con id generado por uid()
+      // Usamos el mismo id para que la búsqueda posterior sea consistente
+      const pagosNuevos = DB.pagos.filter(p =>
+        nuevos.includes(p.periodo) &&
+        (p.alumnoId || p.aluId) === aluId &&
+        p.cuotaId === cuotaId
+      ).slice(-nuevos.length); // tomar los últimos añadidos
+
+      Promise.all(pagosNuevos.map(pago =>
+        registrarPagoV9({
+          id:         pago.id,
+          alumno_id:  aluId,
+          cuota_id:   cuotaId,
+          monto:      monto,
+          fecha:      fecha,
+          medio:      medio,
+          estado:     'pagado',
+          periodo:    pago.periodo || null,
+          obs:        obs || null,
+          creado_por: (S && S.session && S.session.id) || null,
+        }, cuentaId, _authToken)
+        .then(registrado => {
+          // Actualizar id en DB.pagos con el id devuelto por Supabase (puede diferir)
+          if (registrado && registrado.id !== pago.id) {
+            const idx = DB.pagos.findIndex(p => p.id === pago.id);
+            if (idx !== -1) DB.pagos[idx].id = registrado.id;
+          }
+        })
+        .catch(err => console.error('[v9] Error al registrar pago en tabla:', err))
+      )).then(() => {
+        // Re-renderizar para mostrar el id definitivo si cambió
+        if (typeof renderPage === 'function') renderPage();
+      });
+    }
+    // En modo v9 NO llamamos saveDB() (evita escribir en tesorero_datos)
+    // La UI se actualiza porque DB.pagos ya tiene los nuevos registros en memoria
+  } else {
+    // ── FLUJO LEGADO: persiste en el blob tesorero_datos ────────────────
+    saveDB();
+  }
+  // ── FIN FLUJO RELACIONAL v9 ─────────────────────────────────────────────
 
   // Para notificación usar el primer período o resumen
   const periodo = nuevos.length===1 ? nuevos[0] : nuevos.join(', ');

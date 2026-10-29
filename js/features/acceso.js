@@ -524,6 +524,29 @@ function _finalizarLogin(u,errEl){
   else{go('selector');}
 }
 
+/**
+ * Finaliza el login en el flujo relacional v9.
+ * NO llama a loadFromCloud(); los datos ya están en DB (cargados por cargarSesionV9).
+ */
+function _finalizarLoginV9(u, errEl, cursoIds) {
+  if (errEl) errEl.style.display = 'none';
+  S.session = u;
+  S._v9CuentaId = u.id;  // UUID de tesorero_cuentas
+  // setUserKey espera un id de usuario legacy — en v9 usamos cuentaId directamente
+  if (typeof setUserKey === 'function') {
+    try { setUserKey(u.id); } catch(_) {}
+  }
+  // Navegar al dashboard o al selector de cursos
+  if (cursoIds && cursoIds.length === 1) {
+    S.cursoId = cursoIds[0];
+    go('dashboard');
+  } else if (cursoIds && cursoIds.length > 1) {
+    go('selector');
+  } else {
+    go('dashboard');
+  }
+}
+
 async function respaldoAutomatico(userId){
   if(!userId || userId==='ap_lector') return;
   if(!_authToken) return; // sin token de auth no podemos subir al bucket privado

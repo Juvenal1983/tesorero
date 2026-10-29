@@ -1,6 +1,24 @@
 // js/core/config.js
-const SUPA_URL = 'https://tmjqzaakzhecbldebyeg.supabase.co';
-const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRtanF6YWFremhlY2JsZGVieWVnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM4OTMxMDAsImV4cCI6MjA4OTQ2OTEwMH0.ExaezLKUAkq63MHbdhYiMH6kvK98zl41S2BuHGHziZc';
+// ────────────────────────────────────────────────────────────────────────────
+// ⚠️  RAMA gran-cambio-v9-relacional — configuración de STAGING
+// ────────────────────────────────────────────────────────────────────────────
+// Reemplaza SUPA_URL y SUPA_KEY con los valores del proyecto de STAGING
+// antes de ejecutar las pruebas.  NUNCA use las credenciales de producción:
+//   Producción (NO TOCAR): https://tmjqzaakzhecbldebyeg.supabase.co
+//
+// V9_RELACIONAL activa la capa de datos relacional (datos_v9.js).
+// Poner en false para volver al flujo blob legado.
+
+const V9_RELACIONAL = true;
+
+// TODO(staging): reemplazar con URL y anon key del proyecto de staging.
+//   Ejemplo: const SUPA_URL = 'https://XXXXXXXXXXXXXXXXXXXX.supabase.co';
+const SUPA_URL = (typeof STAGING_SUPA_URL !== 'undefined' && STAGING_SUPA_URL)
+  || 'https://STAGING_URL_PENDIENTE.supabase.co';
+
+// TODO(staging): reemplazar con la anon key del proyecto de staging.
+const SUPA_KEY = (typeof STAGING_SUPA_KEY !== 'undefined' && STAGING_SUPA_KEY)
+  || 'STAGING_ANON_KEY_PENDIENTE';
 
 // previewStorage → en producción usa localStorage directamente
 const previewStorage = {

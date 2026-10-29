@@ -76,6 +76,37 @@ async function loginConAuth(email, errEl){
     // Guardar token JWT para usarlo en todas las peticiones a Supabase
     _authToken = authData.session?.access_token || null;
 
+    // ── FLUJO RELACIONAL v9 ──────────────────────────────────────────────
+    // Si V9_RELACIONAL está activo, cargar datos desde las tablas relacionales
+    // y omitir completamente el blob tesorero_datos.
+    if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+      try {
+        const { cuenta, cuentaId, cursoIds } = await cargarSesionV9(
+          authData.user.id,
+          _authToken
+        );
+        const usuarioV9 = {
+          id:       cuentaId,          // PK de tesorero_cuentas (UUID)
+          authId:   authData.user.id,
+          email:    cuenta.email || email,
+          nombre:   cuenta.nombre || email,
+          rol:      'tesorero',
+          cursoIds: cursoIds,
+          _v9:      true,
+        };
+        _finalizarLoginV9(usuarioV9, errEl, cursoIds);
+        return true;
+      } catch (errV9) {
+        if (errEl) {
+          errEl.textContent = 'Error cargando datos relacionales: ' + errV9.message;
+          errEl.style.display = '';
+        }
+        console.error('[v9] cargarSesionV9 falló:', errV9);
+        return false;
+      }
+    }
+    // ── FIN FLUJO RELACIONAL v9 ──────────────────────────────────────────
+
     // Buscar datos legacy del usuario por email + authId (evita descarga masiva)
     const legacy = await buscarUsuarioLegacyPorEmail(authData.user.email || email, authData.user.id);
     if(legacy && legacy.datos){
