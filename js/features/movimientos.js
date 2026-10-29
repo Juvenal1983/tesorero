@@ -125,7 +125,7 @@ async function subirPendientes(btnEl){
 function modalEditMov(data){
   const m=(DB.movimientos||[]).find(x=>x.id===data.id);
   if(!m) return `<div class="modal"><div class="modal-hdr"><div class="modal-title">Error</div><button class="close-btn" onclick="closeModal()">×</button></div><p style="padding:16px">Movimiento no encontrado.</p></div>`;
-  const cats=DB.categorias||DEMO.categorias;
+  const cats=DB.categorias||[];
   const archs=getArchivos(m);
   return `<div class="modal" style="max-width:540px">
     <div class="modal-hdr"><div class="modal-title">✏️ Editar movimiento</div><button class="close-btn" onclick="closeModal()">×</button></div>

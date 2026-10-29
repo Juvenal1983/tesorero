@@ -7,7 +7,7 @@ function modalMov(){
     <div class="fg"><label class="fl">Descripción</label><input class="fi" id="mv-desc" placeholder="Descripción del movimiento..."></div>
     <div class="fg-row">
       <div class="fg"><label class="fl">Monto (CLP)</label><input class="fi" id="mv-monto" type="number" placeholder="0"></div>
-      <div class="fg"><label class="fl">Categoría</label><select class="fs" id="mv-cat">${(DB.categorias||DEMO.categorias).map(c=>`<option>${c}</option>`).join('')}</select></div>
+      <div class="fg"><label class="fl">Categoría</label><select class="fs" id="mv-cat">${(DB.categorias||[]).map(c=>`<option>${c}</option>`).join('')}</select></div>
     </div>
     <div class="fg-row">
       <div class="fg"><label class="fl">Fecha</label><input class="fi" id="mv-fecha" type="date" value="${isoToday()}"></div>

@@ -19,6 +19,14 @@ Object.defineProperty(previewStorage, Symbol.iterator, {
 });
 
 let _authToken = null; // Token JWT de Supabase Auth — se actualiza al login
+
+// DEMO vacío: en producción no existe data/demo.json
+// Se usa solo como fallback seguro cuando la DB local está vacía
+const DEMO = {
+  usuarios:[], colegios:[], cursos:[], alumnos:[], apoderados:[],
+  cuotas:[], pagos:[], movimientos:[], categorias:[], planesPago:[],
+  config:{}
+};
 const APP_VERSION = '3.5';
 
 // ─────────────────────────────────────────────
