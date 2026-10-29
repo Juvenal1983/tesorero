@@ -1,0 +1,250 @@
+{
+  "usuarios": [
+    {
+      "id": "u1",
+      "email": "demo@example.invalid",
+      "nombre": "Equipo de tesorería",
+      "rol": "tesorero",
+      "cursoIds": [
+        "c1"
+      ]
+    }
+  ],
+  "colegios": [
+    {
+      "id": "col1",
+      "nombre": "Colegio de demostración",
+      "ciudad": "Santiago",
+      "activo": true
+    }
+  ],
+  "cursos": [
+    {
+      "id": "c1",
+      "colegioId": "col1",
+      "nombre": "5° Básico B",
+      "anio": 2026,
+      "tesoreraId": "u1",
+      "tesorero": "Tesorero/a del Curso",
+      "codigo": "5BB-2026-SSCC",
+      "activo": true,
+      "cuotaMensual": 5000,
+      "cuotaAnual": 0,
+      "meta": 300000
+    }
+  ],
+  "alumnos": [
+    {
+      "id": "demo-a0",
+      "cursoId": "c1",
+      "nombres": "Sofía",
+      "apellidos": "Muñoz",
+      "estado": "activo",
+      "obs": "Datos ficticios para demostración",
+      "pin": "",
+      "eximido": false
+    },
+    {
+      "id": "demo-a1",
+      "cursoId": "c1",
+      "nombres": "Mateo",
+      "apellidos": "Rojas",
+      "estado": "activo",
+      "obs": "Datos ficticios para demostración",
+      "pin": "",
+      "eximido": false
+    },
+    {
+      "id": "demo-a2",
+      "cursoId": "c1",
+      "nombres": "Emma",
+      "apellidos": "Silva",
+      "estado": "activo",
+      "obs": "Datos ficticios para demostración",
+      "pin": "",
+      "eximido": false
+    },
+    {
+      "id": "demo-a3",
+      "cursoId": "c1",
+      "nombres": "Lucas",
+      "apellidos": "Torres",
+      "estado": "activo",
+      "obs": "Datos ficticios para demostración",
+      "pin": "",
+      "eximido": false
+    },
+    {
+      "id": "demo-a4",
+      "cursoId": "c1",
+      "nombres": "Isabella",
+      "apellidos": "Pérez",
+      "estado": "activo",
+      "obs": "Datos ficticios para demostración",
+      "pin": "",
+      "eximido": false
+    },
+    {
+      "id": "demo-a5",
+      "cursoId": "c1",
+      "nombres": "Benjamín",
+      "apellidos": "Díaz",
+      "estado": "activo",
+      "obs": "Datos ficticios para demostración",
+      "pin": "",
+      "eximido": false
+    },
+    {
+      "id": "demo-a6",
+      "cursoId": "c1",
+      "nombres": "Valentina",
+      "apellidos": "Soto",
+      "estado": "activo",
+      "obs": "Datos ficticios para demostración",
+      "pin": "",
+      "eximido": false
+    },
+    {
+      "id": "demo-a7",
+      "cursoId": "c1",
+      "nombres": "Agustín",
+      "apellidos": "Vargas",
+      "estado": "activo",
+      "obs": "Datos ficticios para demostración",
+      "pin": "",
+      "eximido": false
+    }
+  ],
+  "apoderados": [],
+  "cuotas": [
+    {
+      "id": "q1",
+      "cursoId": "c1",
+      "tipo": "mensual",
+      "nombre": "Cuota Mensual 2026",
+      "monto": 5000,
+      "activa": true,
+      "anio": 2026,
+      "obs": "Vence el día 10 de cada mes"
+    }
+  ],
+  "pagos": [
+    {
+      "id": "demo-p0",
+      "alumnoId": "demo-a0",
+      "cuotaId": "q1",
+      "cursoId": "c1",
+      "periodo": "Marzo",
+      "monto": 5000,
+      "fecha": "2026-03-05",
+      "estado": "pagado",
+      "medio": "Transferencia",
+      "obs": "Pago de ejemplo"
+    },
+    {
+      "id": "demo-p1",
+      "alumnoId": "demo-a1",
+      "cuotaId": "q1",
+      "cursoId": "c1",
+      "periodo": "Marzo",
+      "monto": 5000,
+      "fecha": "2026-03-05",
+      "estado": "pagado",
+      "medio": "Transferencia",
+      "obs": "Pago de ejemplo"
+    },
+    {
+      "id": "demo-p2",
+      "alumnoId": "demo-a2",
+      "cuotaId": "q1",
+      "cursoId": "c1",
+      "periodo": "Marzo",
+      "monto": 5000,
+      "fecha": "2026-03-05",
+      "estado": "pagado",
+      "medio": "Transferencia",
+      "obs": "Pago de ejemplo"
+    },
+    {
+      "id": "demo-p3",
+      "alumnoId": "demo-a3",
+      "cuotaId": "q1",
+      "cursoId": "c1",
+      "periodo": "Marzo",
+      "monto": 5000,
+      "fecha": "2026-03-05",
+      "estado": "pagado",
+      "medio": "Transferencia",
+      "obs": "Pago de ejemplo"
+    },
+    {
+      "id": "demo-p4",
+      "alumnoId": "demo-a4",
+      "cuotaId": "q1",
+      "cursoId": "c1",
+      "periodo": "Marzo",
+      "monto": 5000,
+      "fecha": "2026-03-05",
+      "estado": "pagado",
+      "medio": "Transferencia",
+      "obs": "Pago de ejemplo"
+    },
+    {
+      "id": "demo-p5",
+      "alumnoId": "demo-a5",
+      "cuotaId": "q1",
+      "cursoId": "c1",
+      "periodo": "Marzo",
+      "monto": 5000,
+      "fecha": "2026-03-05",
+      "estado": "pagado",
+      "medio": "Transferencia",
+      "obs": "Pago de ejemplo"
+    }
+  ],
+  "movimientos": [
+    {
+      "id": "demo-m1",
+      "cursoId": "c1",
+      "tipo": "ingreso",
+      "monto": 45000,
+      "fecha": "2026-03-06",
+      "desc": "Actividad de bienvenida",
+      "categoria": "Evento",
+      "visible": true
+    },
+    {
+      "id": "demo-m2",
+      "cursoId": "c1",
+      "tipo": "gasto",
+      "monto": 18000,
+      "fecha": "2026-03-07",
+      "desc": "Materiales del curso",
+      "categoria": "Materiales",
+      "visible": true
+    }
+  ],
+  "categorias": [
+    "Cuota de curso",
+    "Convivencia",
+    "Paseo",
+    "Materiales",
+    "Regalo profesor",
+    "Rifa",
+    "Donación",
+    "Imprevistos",
+    "Evento",
+    "Transporte",
+    "Alimentación",
+    "Otro"
+  ],
+  "notas": [
+    {
+      "id": "demo-n1",
+      "texto": "Revisar los pagos del mes y preparar el informe para la próxima reunión.",
+      "color": "#E1F5EE",
+      "fecha": "2026-10-28T21:21:10.820Z",
+      "fijada": true
+    }
+  ]
+}

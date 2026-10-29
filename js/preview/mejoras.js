@@ -1,0 +1,6 @@
+let previewChartTimer;
+afterRender=function(){clearTimeout(previewChartTimer);previewChartTimer=setTimeout(()=>{killCharts();if(S.route==='dashboard')drawDashboardCharts();if(S.route==='reportes')drawReporteCharts();},60)};
+const originalDashboard=renderDashboard;
+renderDashboard=function(){return `<section class="pro-intro"><div><div class="pro-eyebrow">Panel financiero · ${new Date().getFullYear()}</div><h1>Tu curso, en orden.</h1><p>Consulta el saldo, registra movimientos y mantén las cuentas al día.</p></div><div><div class="pro-actions"><button class="btn bp" onclick="go('pagos')">+ Registrar pago</button><button class="btn" onclick="showModal('addMov')">+ Movimiento</button></div><div class="pro-saved" style="margin-top:10px"><span class="pro-dot"></span> Guardado local · Datos de ejemplo</div></div></section>`+originalDashboard();};
+const originalSavePago=savePago;
+savePago=function(...args){const monto=Number(document.getElementById('p-monto')?.value);const fecha=document.getElementById('p-fecha')?.value;if(!Number.isSafeInteger(monto)||monto<=0){alert('Ingresa un monto entero mayor que cero.');return}if(!fecha||!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){alert('Selecciona una fecha válida.');return}return originalSavePago(...args)};

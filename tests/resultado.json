@@ -1,0 +1,24 @@
+{
+  "resultado": "OK",
+  "seccionesPorPantalla": 10,
+  "pantallas": [
+    {
+      "width": 390,
+      "height": 844
+    },
+    {
+      "width": 1440,
+      "height": 1000
+    }
+  ],
+  "persistencia": true,
+  "pagoPositivo": true,
+  "pagoNegativoRechazado": true,
+  "duplicadoRechazado": true,
+  "saldoVerificado": true,
+  "aislamientoLocal": true,
+  "datosDanadosRecuperables": true,
+  "erroresJavaScript": [],
+  "solicitudesExternas": [],
+  "recursosFallidos": []
+}
