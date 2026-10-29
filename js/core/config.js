@@ -1,7 +1,23 @@
-// js/core/config.js — extraído de la copia de demostración.
-let DEMO;
+// js/core/config.js
 const SUPA_URL = 'https://tmjqzaakzhecbldebyeg.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRtanF6YWFremhlY2JsZGVieWVnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM4OTMxMDAsImV4cCI6MjA4OTQ2OTEwMH0.ExaezLKUAkq63MHbdhYiMH6kvK98zl41S2BuHGHziZc';
+
+// previewStorage → en producción usa localStorage directamente
+const previewStorage = {
+  getItem:    name  => { try { return localStorage.getItem(name); } catch(e) { return null; } },
+  setItem:    (name, value) => { try { localStorage.setItem(name, value); } catch(e) {} },
+  removeItem: name  => { try { localStorage.removeItem(name); } catch(e) {} },
+  clear:      ()    => { try { localStorage.clear(); } catch(e) {} },
+  get length()      { try { return localStorage.length; } catch(e) { return 0; } },
+  key:        i     => { try { return localStorage.key(i); } catch(e) { return null; } }
+};
+// Hacer iterable con Object.keys()
+Object.defineProperty(previewStorage, Symbol.iterator, {
+  value: function*() {
+    try { for(let i=0;i<localStorage.length;i++) yield localStorage.key(i); } catch(e){}
+  }
+});
+
 let _authToken = null; // Token JWT de Supabase Auth — se actualiza al login
 const APP_VERSION = '3.5';
 
