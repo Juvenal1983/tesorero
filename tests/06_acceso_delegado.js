@@ -20,8 +20,17 @@
  *   - Tabla usuarios_cuenta creada con columnas: auth_id, desactivado, rol, curso_id.
  *   - Usuario C creado en Supabase Auth con STAGING_USER_C_EMAIL / STAGING_USER_C_PASSWORD.
  *   - Fila en usuarios_cuenta con desactivado = false, apuntando a la cuenta de Usuario A:
- *       INSERT INTO public.usuarios_cuenta (cuenta_id, auth_id, rol, desactivado)
- *       VALUES ('<cuenta_id_de_usuario_A>', '<auth_uid_de_usuario_C>', 'visor', false);
+ *       INSERT INTO public.usuarios_cuenta
+ *           (id, cuenta_id, auth_id, email, rol, desactivado)
+ *       VALUES (
+ *           gen_random_uuid(),
+ *           '<cuenta_id_de_usuario_A>',
+ *           '<auth_uid_de_usuario_C>',
+ *           '<email_de_usuario_C>',
+ *           'visor',
+ *           false
+ *       );
+ *       -- Si la tabla no tiene columna email, omite ese campo.
  *   - RLS en usuarios_cuenta: SELECT permitido cuando auth.uid() = auth_id.
  *
  * VARIABLES DE ENTORNO:
@@ -56,6 +65,10 @@ const USER_C_PASSWORD = process.env.STAGING_USER_C_PASSWORD   || '';
 const USER_C_ROL      = process.env.STAGING_USER_C_ROL        || 'visor';
 const TIMEOUT = 25_000;
 
+// URLs de producción — ningún fetch de Node ni de Playwright debe llegar aquí.
+const PROD_APP_URL   = 'https://www.eltesorero.cl';
+const PROD_SUPA_URL  = 'https://tmjqzaakzhecbldebyeg.supabase.co';
+
 // ── Salida PENDIENTE (≠ aprobado; la CI lo distingue de 0) ──────────────────
 function salirPendiente(razon) {
   console.error('\n[PENDIENTE] ' + razon);
@@ -64,12 +77,36 @@ function salirPendiente(razon) {
   process.exit(2);
 }
 
+// ── Guardia de producción para llamadas directas de Node ────────────────────
+// El bloqueo de Playwright sólo protege los fetches del navegador.
+// Los fetch() de Node (autenticación, pre-vuelo) no pasan por Playwright
+// y deben validarse aquí, antes de cualquier llamada de red.
+function bloquearProduccionNode() {
+  const appNorm  = (APP_URL  || '').replace(/\/$/, '').toLowerCase();
+  const supaNorm = (SUPA_URL || '').replace(/\/$/, '').toLowerCase();
+  const prodApp  = PROD_APP_URL.replace(/\/$/, '').toLowerCase();
+  const prodSupa = PROD_SUPA_URL.replace(/\/$/, '').toLowerCase();
+
+  if (appNorm === prodApp || appNorm.includes('eltesorero.cl')) {
+    console.error('[FALLO] STAGING_APP_URL apunta a producción. Abortando.');
+    process.exit(1);
+  }
+  if (supaNorm === prodSupa || supaNorm.includes('tmjqzaakzhecbldebyeg')) {
+    console.error('[FALLO] STAGING_SUPABASE_URL apunta al proyecto de producción. Abortando.');
+    process.exit(1);
+  }
+  console.log('  [ok] URLs validadas — no apuntan a producción');
+}
+
 // ── Validar variables base ───────────────────────────────────────────────────
 if (!APP_URL || !SUPA_URL || !SUPA_KEY) {
   console.error('[FALLO] Faltan variables de entorno base:\n' +
     '  STAGING_APP_URL, STAGING_SUPABASE_URL, STAGING_SUPABASE_ANON_KEY');
   process.exit(1);
 }
+
+// Ejecutar ANTES de cualquier fetch de Node (incluyendo autenticación).
+bloquearProduccionNode();
 
 if (!USER_C_EMAIL || !USER_C_PASSWORD) {
   salirPendiente(
@@ -132,10 +169,19 @@ async function verificarPrerequisitosStaging(jwtC, uidC) {
   const rows = await res.json();
   if (!Array.isArray(rows) || rows.length === 0) {
     salirPendiente(
-      `usuarios_cuenta existe pero Usuario C (${USER_C_EMAIL} / uid=${uidC}) no tiene membresías activas.\n` +
-      '  Ejecuta:\n' +
-      '    INSERT INTO public.usuarios_cuenta (cuenta_id, auth_id, rol, desactivado)\n' +
-      "    VALUES ('<cuenta_id_de_usuario_A>', '" + uidC + "', 'visor', false);"
+      `usuarios_cuenta existe pero Usuario C (${USER_C_EMAIL} / uid=${uidC}) no tiene membresías activas (desactivado=false).\n` +
+      '  Ejecuta en el proyecto de staging (reemplaza los valores entre <>):\n\n' +
+      '    INSERT INTO public.usuarios_cuenta\n' +
+      '        (id, cuenta_id, auth_id, email, rol, desactivado)\n' +
+      "    VALUES (\n" +
+      "        gen_random_uuid(),\n" +
+      "        '<cuenta_id_de_usuario_A>',\n" +
+      "        '" + uidC + "',\n" +
+      "        '" + USER_C_EMAIL + "',\n" +
+      "        'visor',\n" +
+      "        false\n" +
+      '    );\n\n' +
+      '  Si la tabla no tiene columna email, omite ese campo.'
     );
   }
 

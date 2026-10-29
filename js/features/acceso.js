@@ -1314,6 +1314,12 @@ function logoutLector(){
   const apCursoId  = previewStorage.getItem('tesorero_ap_cursoId');
   const apAluId    = previewStorage.getItem('tesorero_ap_aluId');
   const apPin      = previewStorage.getItem('tesorero_ap_pin');
+
+  // ⚠️  Resetear KEY a la clave anónima ANTES de initDB().
+  //     Sin esto, initDB() leería previewStorage[KEY] con la clave del usuario
+  //     anterior y repoblaría DB con sus datos.
+  if (typeof KEY !== 'undefined') { KEY = 'tesorero_5bsscc_2026'; }
+
   DB={}; initDB();
   if(apRecordar==='1'){
     previewStorage.setItem('tesorero_ap_recordar','1');
@@ -1350,6 +1356,12 @@ async function logout(){
   previewStorage.removeItem('tesorero_ap_cursoId');
   previewStorage.removeItem('tesorero_ap_aluId');
   previewStorage.removeItem('tesorero_ap_pin');
+
+  // ⚠️  Resetear KEY a la clave anónima ANTES de initDB().
+  //     Sin esto, initDB() leería previewStorage[KEY] con la clave del usuario
+  //     anterior y repoblaría DB con sus datos tras el DB={}.
+  if (typeof KEY !== 'undefined') { KEY = 'tesorero_5bsscc_2026'; }
+
   DB={}; initDB(); render();
 }
 
