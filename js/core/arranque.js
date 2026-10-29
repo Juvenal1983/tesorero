@@ -52,7 +52,9 @@ document.addEventListener('DOMContentLoaded', async function iniciarApp() {
             };
             S.session     = usuarioV9;
             S._v9CuentaId = cuentaId;
-            if (typeof setUserKey === 'function') { try { setUserKey(cuentaId); } catch(_) {} }
+            // En v9 sólo actualizamos KEY sin leer localStorage ni sobreescribir DB,
+            // porque cargarSesionV9() ya pobló DB desde las tablas relacionales.
+            if (typeof _setUserKeyV9 === 'function') { try { _setUserKeyV9(cuentaId); } catch(_) {} }
             if (cursoIds.length === 1) { S.cursoId = cursoIds[0]; go('dashboard'); }
             else { go(cursoIds.length > 1 ? 'selector' : 'dashboard'); }
             return;

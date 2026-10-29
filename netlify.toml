@@ -1,6 +1,6 @@
 [build]
   publish = "."
-  command = ""
+  command = "sh generate_env.sh"
 
 [build.environment]
   NETLIFY_NEXT_PLUGIN_SKIP = "true"

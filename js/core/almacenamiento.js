@@ -18,6 +18,21 @@ function setUserKey(userId){
   previewStorage.removeItem('tesorero_5bsscc_2026');
 }
 
+/**
+ * Versión v9 de setUserKey: sólo actualiza KEY para futuros saveDB(),
+ * sin leer localStorage ni sobreescribir DB.
+ * Usar en lugar de setUserKey() cuando cargarSesionV9() ya pobló DB
+ * desde las tablas relacionales de Supabase.
+ */
+function _setUserKeyV9(userId) {
+  if (!userId) return;
+  const newKey = 'tesorero_u_' + userId;
+  if (newKey === KEY) return;
+  KEY = newKey;
+  // ⚠️  NO leer previewStorage aquí — DB ya viene de Supabase, no del blob legado.
+  //     Sólo actualizamos la clave para que futuros saveDB() usen el espacio correcto.
+}
+
 function showToast(msg, color){
   const existing = document.getElementById('app-toast');
   if(existing) existing.remove();

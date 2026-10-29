@@ -10,6 +10,7 @@
     "test:all":  "node tests/03_rls_cliente.js && node tests/04_verifica_no_produccion.js && node tests/05_prueba_funcional_ui.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
     "playwright": "^1.48.0"
   },
   "engines": {

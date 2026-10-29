@@ -532,9 +532,10 @@ function _finalizarLoginV9(u, errEl, cursoIds) {
   if (errEl) errEl.style.display = 'none';
   S.session = u;
   S._v9CuentaId = u.id;  // UUID de tesorero_cuentas
-  // setUserKey espera un id de usuario legacy — en v9 usamos cuentaId directamente
-  if (typeof setUserKey === 'function') {
-    try { setUserKey(u.id); } catch(_) {}
+  // En v9 sólo actualizamos KEY (para futuros saveDB) sin tocar DB,
+  // porque cargarSesionV9() ya pobló DB desde las tablas relacionales.
+  if (typeof _setUserKeyV9 === 'function') {
+    try { _setUserKeyV9(u.id); } catch(_) {}
   }
   // Navegar al dashboard o al selector de cursos
   if (cursoIds && cursoIds.length === 1) {

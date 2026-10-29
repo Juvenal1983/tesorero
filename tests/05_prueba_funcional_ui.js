@@ -298,19 +298,32 @@ async function navegarAPagos(page) {
     await page.locator('#p-monto').fill(String(montoEsperado));
     await page.locator('#p-obs').fill(`${OBS_UNICA}-rechazado`);
 
-    // Guardar el JWT real y reemplazarlo con uno inválido
-    const tokenOriginal = await page.evaluate(() =>
-      typeof _authToken !== 'undefined' ? _authToken : null
-    );
-    if (!tokenOriginal) throw new Error('[FALLO] _authToken no disponible en la página');
-
     const pagosEnMemoriaAntes = await page.evaluate(() => (DB.pagos || []).length);
-    await page.evaluate(() => { window._authToken = 'eyJinvalido.para.test'; });
 
-    // Pulsar guardar (el servidor debe rechazar con 401/403)
+    // Interceptar POST a /rest/v1/pagos y forzar 401.
+    // Nota: asignar window._authToken NO modifica la variable `let _authToken`
+    // interna del script de la app (scoping de módulo/script), por eso usamos
+    // page.route() para inyectar el fallo a nivel de red.
+    const urlPagos = /\/rest\/v1\/pagos/;
+    const interceptar401 = route => route.fulfill({
+      status: 401,
+      contentType: 'application/json',
+      body: JSON.stringify({ message: 'JWT expired', error: 'unauthorized' }),
+    });
+    await page.route(urlPagos, interceptar401);
+
+    // Capturar el alert() que muestra la app cuando el guardado falla
+    let mensajeErrorCapturado = null;
+    const onDialog = async (dialog) => {
+      mensajeErrorCapturado = dialog.message();
+      await dialog.dismiss();
+    };
+    page.on('dialog', onDialog);
+
+    // Pulsar guardar — el interceptor devolverá 401 al fetch interno
     await page.locator('button[onclick*="savePago"]').click();
 
-    // Esperar a que el botón se rehabilite (indica que el Promise.allSettled terminó)
+    // Esperar a que el botón se rehabilite (Promise.allSettled terminó)
     await page.waitForFunction(
       () => {
         const btn = document.querySelector('button[onclick*="savePago"]');
@@ -319,7 +332,17 @@ async function navegarAPagos(page) {
       { timeout: 15_000 }
     );
 
-    // Verificar 1: DB.pagos NO creció en memoria
+    // Quitar el interceptor antes del flujo exitoso
+    await page.unroute(urlPagos, interceptar401);
+    page.off('dialog', onDialog);
+
+    // Verificar 1: error fue visible al usuario (alert de la app)
+    if (!mensajeErrorCapturado) {
+      throw new Error('[FALLO] El guardado rechazado no mostró ningún error al usuario (alert no disparado)');
+    }
+    console.log(`  [ok] Error visible al usuario: "${mensajeErrorCapturado.slice(0, 80)}"`);
+
+    // Verificar 2: DB.pagos NO creció en memoria
     const pagosEnMemoriaDespues = await page.evaluate(() => (DB.pagos || []).length);
     if (pagosEnMemoriaDespues > pagosEnMemoriaAntes) {
       throw new Error(
@@ -328,7 +351,7 @@ async function navegarAPagos(page) {
     }
     console.log('  [ok] DB.pagos no creció con guardado rechazado');
 
-    // Verificar 2: 0 filas llegaron al servidor
+    // Verificar 3: 0 filas llegaron al servidor
     const pagosRechazados = await supaRest(
       `/pagos?obs=eq.${OBS_UNICA}-rechazado&select=id`,
       { _token: jwt }
@@ -338,8 +361,7 @@ async function navegarAPagos(page) {
     }
     console.log('  [ok] 0 filas en public.pagos con obs rechazado');
 
-    // Restaurar token original y cerrar el modal
-    await page.evaluate((t) => { window._authToken = t; }, tokenOriginal);
+    // Cerrar el modal si sigue abierto
     await page.keyboard.press('Escape');
     await page.locator('.modal').waitFor({ state: 'hidden', timeout: 3000 }).catch(() => {});
 
