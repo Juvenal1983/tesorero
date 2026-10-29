@@ -23,14 +23,14 @@
  *       INSERT INTO public.usuarios_cuenta
  *           (id, cuenta_id, auth_id, email, rol, desactivado)
  *       VALUES (
- *           gen_random_uuid(),
+ *           'uc-c-staging',
  *           '<cuenta_id_de_usuario_A>',
  *           '<auth_uid_de_usuario_C>',
  *           '<email_de_usuario_C>',
  *           'visor',
  *           false
  *       );
- *       -- Si la tabla no tiene columna email, omite ese campo.
+ *       -- email es obligatorio en el esquema v9.
  *   - RLS en usuarios_cuenta: SELECT permitido cuando auth.uid() = auth_id.
  *
  * VARIABLES DE ENTORNO:
@@ -174,14 +174,14 @@ async function verificarPrerequisitosStaging(jwtC, uidC) {
       '    INSERT INTO public.usuarios_cuenta\n' +
       '        (id, cuenta_id, auth_id, email, rol, desactivado)\n' +
       "    VALUES (\n" +
-      "        gen_random_uuid(),\n" +
+      "        'uc-c-staging',\n" +
       "        '<cuenta_id_de_usuario_A>',\n" +
       "        '" + uidC + "',\n" +
       "        '" + USER_C_EMAIL + "',\n" +
       "        'visor',\n" +
       "        false\n" +
       '    );\n\n' +
-      '  Si la tabla no tiene columna email, omite ese campo.'
+      '  Nota: id usa el literal \'uc-c-staging\'. email es obligatorio en el esquema v9.'
     );
   }
 

@@ -1315,10 +1315,15 @@ function logoutLector(){
   const apAluId    = previewStorage.getItem('tesorero_ap_aluId');
   const apPin      = previewStorage.getItem('tesorero_ap_pin');
 
-  // ⚠️  Resetear KEY a la clave anónima ANTES de initDB().
-  //     Sin esto, initDB() leería previewStorage[KEY] con la clave del usuario
-  //     anterior y repoblaría DB con sus datos.
-  if (typeof KEY !== 'undefined') { KEY = 'tesorero_5bsscc_2026'; }
+  // ⚠️  Resetear KEY a la clave anónima y vaciarla ANTES de initDB().
+  //     Paso 1: KEY debe apuntar a la clave neutral, no a 'tesorero_u_<userId>'.
+  //     Paso 2: borrar esa clave del storage — puede tener datos antiguos de la demo
+  //             o de una sesión previa. No basta con apuntar a ella; hay que asegurar
+  //             que initDB() no encuentre nada que recuperar.
+  if (typeof KEY !== 'undefined') {
+    KEY = 'tesorero_5bsscc_2026';
+    previewStorage.removeItem(KEY);   // garantiza slate limpio independientemente del contenido previo
+  }
 
   DB={}; initDB();
   if(apRecordar==='1'){
@@ -1357,10 +1362,15 @@ async function logout(){
   previewStorage.removeItem('tesorero_ap_aluId');
   previewStorage.removeItem('tesorero_ap_pin');
 
-  // ⚠️  Resetear KEY a la clave anónima ANTES de initDB().
-  //     Sin esto, initDB() leería previewStorage[KEY] con la clave del usuario
-  //     anterior y repoblaría DB con sus datos tras el DB={}.
-  if (typeof KEY !== 'undefined') { KEY = 'tesorero_5bsscc_2026'; }
+  // ⚠️  Resetear KEY a la clave anónima y vaciarla ANTES de initDB().
+  //     Paso 1: KEY debe apuntar a la clave neutral, no a 'tesorero_u_<userId>'.
+  //     Paso 2: borrar esa clave del storage — puede tener datos antiguos de la demo
+  //             o de una sesión previa. No basta con apuntar a ella; hay que asegurar
+  //             que initDB() no encuentre nada que recuperar.
+  if (typeof KEY !== 'undefined') {
+    KEY = 'tesorero_5bsscc_2026';
+    previewStorage.removeItem(KEY);   // garantiza slate limpio independientemente del contenido previo
+  }
 
   DB={}; initDB(); render();
 }

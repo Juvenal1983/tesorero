@@ -70,8 +70,11 @@ function logout() {
   S.cursoId    = null;
   S.route      = 'login';
   S._v9CuentaId = null;
-  // ⚠️  Resetear KEY ANTES de initDB() para que no lea datos del usuario anterior.
+  // Paso 1: KEY a la clave neutral.
+  // Paso 2: borrar esa clave del storage — puede tener datos previos.
+  //         No basta apuntar a ella; hay que garantizar que initDB() no recupere nada.
   KEY = 'tesorero_5bsscc_2026';
+  previewStorage.removeItem(KEY);
   DB = {};
   initDB();
   // render() → omitido
@@ -189,6 +192,61 @@ console.log('\n── TEST C: initDB() no lee datos de otro usuario si KEY cambi
 
   assert(!DB.cursos || DB.cursos.length === 0,
     'initDB() no trajo datos de usuario A al loguear usuario B (keys distintos)');
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TEST D: logout no recupera datos aunque la clave neutral tenga datos previos
+// (el caso que invalidaba la solución anterior de sólo resetear KEY)
+// ────────────────────────────────────────────────────────────────────────────
+console.log('\n── TEST D: logout limpia DB aunque tesorero_5bsscc_2026 tenga datos previos ──');
+{
+  // Resetear
+  _storage.clear();
+  DB = {}; KEY = 'tesorero_5bsscc_2026'; _v9SessionId = 0; _authToken = null;
+  S = { session: null, cursoId: null, route: 'login', _v9CuentaId: null };
+
+  // Pre-poblar la clave neutral con datos financieros antiguos (demo o sesión previa)
+  const datosAntiguos = JSON.stringify({
+    cursos:  [{ id: 'curso-antiguo', nombre: 'Curso 2023' }],
+    alumnos: [{ id: 'alu-antiguo',   nombre: 'Alumno antiguo' }],
+    pagos:   [{ id: 'pago-antiguo',  monto: 99999 }],
+  });
+  previewStorage.setItem('tesorero_5bsscc_2026', datosAntiguos);
+
+  // Simular login de un usuario nuevo
+  const userId = 'nuevo-usuario-789';
+  _setUserKeyV9(userId);
+  S.session = { id: userId };
+  S._v9CuentaId = userId;
+  _v9SessionId = 5;
+  DB = { cursos: [{ id: 'curso-nuevo' }], alumnos: [], pagos: [] };
+
+  assert(DB.cursos?.length === 1, 'Setup: usuario nuevo logueado con datos en DB');
+  assert(previewStorage.getItem('tesorero_5bsscc_2026') !== null,
+    'Setup: clave neutral tiene datos previos (financieros)');
+
+  // Cerrar sesión
+  logout();
+
+  // Verificaciones post-logout
+  assert(S.session === null,     'logout(): S.session === null');
+  assert(_authToken === null,    'logout(): _authToken === null');
+
+  // La clave neutral debe haber sido borrada del storage
+  assert(previewStorage.getItem('tesorero_5bsscc_2026') === null,
+    'logout(): clave neutral borrada del storage');
+
+  // DB no debe tener datos financieros de ninguna fuente
+  const dbTieneDatos = (DB.cursos?.length > 0) || (DB.alumnos?.length > 0) || (DB.pagos?.length > 0);
+  assert(!dbTieneDatos,
+    'DB vacía tras logout() — no se recuperaron datos de la clave neutral');
+
+  if (dbTieneDatos) {
+    console.error('  DB.cursos:', DB.cursos?.length,
+                  '| DB.alumnos:', DB.alumnos?.length,
+                  '| DB.pagos:', DB.pagos?.length);
+    console.error('  initDB() recuperó datos de la clave neutral sin limpiarla primero.');
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
