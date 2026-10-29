@@ -6,7 +6,28 @@ document.addEventListener('DOMContentLoaded', async function iniciarApp() {
   // 1. Cargar datos locales (localStorage vía previewStorage)
   try { initDB(); } catch(e) { console.warn('initDB falló:', e); }
 
-  // 2. Si hay sesión activa en Supabase Auth, reanudar sin pasar por login
+  // 2. Detectar link de recuperación de contraseña en la URL
+  //    Supabase añade #access_token=...&type=recovery cuando el usuario
+  //    llega desde el email de recuperación
+  if (authClient) {
+    const hash = window.location.hash;
+    if (hash.includes('type=recovery') || hash.includes('type=invite')) {
+      try {
+        // Supabase intercambia automáticamente el token del hash por una sesión
+        const { data, error } = await authClient.auth.getSession();
+        if (data?.session) {
+          _authToken = data.session.access_token;
+          mostrarPantallaResetPassword();
+          return;
+        }
+      } catch(e) {}
+      // Si falla, mostrar login normal
+      render();
+      return;
+    }
+  }
+
+  // 3. Si hay sesión activa en Supabase Auth, reanudar sin pasar por login
   if (authClient) {
     try {
       const { data } = await authClient.auth.getSession();

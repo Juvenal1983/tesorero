@@ -20,7 +20,7 @@ function renderLogin(){
       <!-- PANEL LOGIN -->
       <div id="panel-login">
         <div class="fg"><label class="fl">Correo electrónico</label><input class="fi" id="l-email" type="email" placeholder="correo@mail.cl" autocomplete="email"></div>
-        <div class="fg"><label class="fl">Contraseña</label><input class="fi" id="l-pass" type="password" placeholder="••••••••" autocomplete="current-password"></div>
+        <div class="fg"><label class="fl">Contraseña</label><div style="position:relative"><input class="fi" id="l-pass" type="password" placeholder="••••••••" autocomplete="current-password" style="padding-right:44px"><button type="button" onclick="toggleVerPass('l-pass',this)" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:18px;color:var(--t3);padding:0;line-height:1" title="Mostrar contraseña">👁</button></div></div>
         <div style="display:flex;align-items:center;gap:8px;margin:6px 0 2px">
           <input type="checkbox" id="l-recordar" style="width:16px;height:16px;cursor:pointer;accent-color:var(--gm)">
           <label for="l-recordar" style="font-size:13px;color:var(--t2);cursor:pointer;user-select:none">Recordar mis credenciales</label>
@@ -1324,6 +1324,95 @@ function resetearYEntrar(){
   initDB();
   S.session = null; S.cursoId = null; S.route = 'login';
   render();
+}
+
+// ─────────────────────────────────────────────
+// UTILIDADES DE LOGIN
+// ─────────────────────────────────────────────
+
+function toggleVerPass(inputId, btn) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  if (input.type === 'password') {
+    input.type = 'text';
+    btn.textContent = '🙈';
+    btn.title = 'Ocultar contraseña';
+  } else {
+    input.type = 'password';
+    btn.textContent = '👁';
+    btn.title = 'Mostrar contraseña';
+  }
+}
+
+function mostrarPantallaResetPassword() {
+  const app = document.getElementById('app');
+  if (!app) return;
+  app.innerHTML = `
+  <div class="login-wrap">
+    <div class="login-card">
+      <div class="login-logo">🔐</div>
+      <div style="text-align:center;font-size:18px;font-weight:700;margin-bottom:4px">Nueva contraseña</div>
+      <div style="text-align:center;font-size:13px;color:var(--t2);margin-bottom:20px">Elige una contraseña para tu cuenta</div>
+      <div class="fg">
+        <label class="fl">Nueva contraseña</label>
+        <div style="position:relative">
+          <input class="fi" id="reset-pass1" type="password" placeholder="Mínimo 8 caracteres" autocomplete="new-password" style="padding-right:44px">
+          <button type="button" onclick="toggleVerPass('reset-pass1',this)" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:18px;color:var(--t3);padding:0;line-height:1" title="Mostrar contraseña">👁</button>
+        </div>
+      </div>
+      <div class="fg">
+        <label class="fl">Confirmar contraseña</label>
+        <div style="position:relative">
+          <input class="fi" id="reset-pass2" type="password" placeholder="Repite la contraseña" autocomplete="new-password" style="padding-right:44px">
+          <button type="button" onclick="toggleVerPass('reset-pass2',this)" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:18px;color:var(--t3);padding:0;line-height:1" title="Mostrar contraseña">👁</button>
+        </div>
+      </div>
+      <div id="reset-err" class="alert ar" style="display:none"></div>
+      <button class="btn bp" style="width:100%;justify-content:center;margin-top:8px" onclick="guardarResetPassword()">💾 Guardar contraseña</button>
+    </div>
+  </div>`;
+  setTimeout(() => document.getElementById('reset-pass1')?.focus(), 100);
+}
+
+async function guardarResetPassword() {
+  const p1  = document.getElementById('reset-pass1')?.value || '';
+  const p2  = document.getElementById('reset-pass2')?.value || '';
+  const err = document.getElementById('reset-err');
+  const btn = document.querySelector('[onclick="guardarResetPassword()"]');
+
+  if (p1.length < 8) { err.textContent = 'La contraseña debe tener al menos 8 caracteres.'; err.style.display = ''; return; }
+  if (p1 !== p2)     { err.textContent = 'Las contraseñas no coinciden.'; err.style.display = ''; return; }
+
+  if (btn) { btn.disabled = true; btn.textContent = 'Guardando...'; }
+  try {
+    const { error } = await authClient.auth.updateUser({ password: p1 });
+    if (error) { err.textContent = 'Error: ' + error.message; err.style.display = ''; if(btn){btn.disabled=false;btn.textContent='💾 Guardar contraseña';} return; }
+    showToast('✅ Contraseña guardada. Iniciando sesión...');
+    // Limpiar hash de la URL sin recargar
+    history.replaceState(null, '', window.location.pathname);
+    // Iniciar sesión automáticamente con la sesión activa
+    setTimeout(async () => {
+      const { data } = await authClient.auth.getSession();
+      if (data?.session?.user) {
+        _authToken = data.session.access_token;
+        const legacy = await buscarUsuarioLegacyPorEmail(data.session.user.email, data.session.user.id);
+        if (legacy && legacy.datos) {
+          DB = legacy.datos;
+          previewStorage.setItem(KEY, JSON.stringify(DB));
+          const u = { ...legacy.user, authId: data.session.user.id };
+          S.session = u; setUserKey(u.id);
+          if (u.cursoIds && u.cursoIds.length === 1) { S.cursoId = u.cursoIds[0]; go('dashboard'); }
+          else { go('selector'); }
+          return;
+        }
+      }
+      render(); // fallback: mostrar login
+    }, 1000);
+  } catch(e) {
+    err.textContent = 'No se pudo guardar la contraseña.';
+    err.style.display = '';
+    if (btn) { btn.disabled = false; btn.textContent = '💾 Guardar contraseña'; }
+  }
 }
 
 // ─────────────────────────────────────────────
