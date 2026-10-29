@@ -1,55 +1,84 @@
 /**
  * 05_prueba_funcional_ui.js — Prueba funcional UI v9 (Playwright)
  *
- * Flujo completo:
- *   login → V9_RELACIONAL activo → registrar pago → reload → pago visible
+ * Flujo:
+ *   login → V9_RELACIONAL activo → guardado rechazado (OBLIGATORIO) →
+ *   pago válido → verificar en public.pagos → recarga → pago visible
  *
- * Comprobaciones:
- *   A. Guardado rechazado por el servidor → error visible al usuario, pago NO en DB.pagos
- *   B. Guardado exitoso → pago en public.pagos, visible tras recarga
- *   C. Verificación exacta: id, alumno_id, cuota_id, monto, periodo
- *
- * CURSO FIJO: cur-a-01
- * 0 filas en public.pagos tras el flujo = FALLO
+ * Selectores reales de la app:
+ *   Login:   #l-email, #l-pass, button[onclick="doLogin()"]
+ *   Error:   #login-err
+ *   Modal:   showModal('addPago', ...) → button[onclick*="showModal('addPago'"]
+ *   Guardar: button[onclick*="savePago"]
+ *   Meses:   .p-mes-check
+ *   Obs:     #p-obs
  *
  * Variables de entorno requeridas:
- *   STAGING_APP_URL          — URL de la app de staging desplegada
- *   STAGING_SUPABASE_URL     — URL del proyecto Supabase de staging
- *   STAGING_SUPABASE_ANON_KEY
+ *   STAGING_APP_URL            — URL de la app de staging
+ *   STAGING_SUPABASE_URL       — URL del proyecto Supabase de staging
+ *   STAGING_SUPABASE_ANON_KEY  — anon key (no service_role)
  *   STAGING_USER_A_EMAIL
  *   STAGING_USER_A_PASSWORD
+ *
+ * Restricciones:
+ *   - Ninguna llamada de Node.js puede apuntar a producción
+ *   - 0 filas en public.pagos tras el flujo = FALLO
+ *   - La prueba de rechazo es OBLIGATORIA; omitirla es FALLO
  */
 
 'use strict';
 
 const { chromium } = require('playwright');
-const { instalarBloqueoProduccion, verificarSinIntentos } = require('./helpers/bloqueo_produccion');
+const {
+  instalarBloqueoProduccion,
+  verificarSinIntentos,
+  HOSTS_PRODUCCION,
+} = require('./helpers/bloqueo_produccion');
 
 // ── Configuración ────────────────────────────────────────────────────────────
-const APP_URL        = process.env.STAGING_APP_URL;
-const SUPA_URL       = process.env.STAGING_SUPABASE_URL;
-const SUPA_KEY       = process.env.STAGING_SUPABASE_ANON_KEY;
-const USER_EMAIL     = process.env.STAGING_USER_A_EMAIL;
-const USER_PASSWORD  = process.env.STAGING_USER_A_PASSWORD;
+const APP_URL       = process.env.STAGING_APP_URL        || '';
+const SUPA_URL      = process.env.STAGING_SUPABASE_URL   || '';
+const SUPA_KEY      = process.env.STAGING_SUPABASE_ANON_KEY || '';
+const USER_EMAIL    = process.env.STAGING_USER_A_EMAIL   || '';
+const USER_PASSWORD = process.env.STAGING_USER_A_PASSWORD || '';
 
-const CURSO_A        = 'cur-a-01';
-const TIMEOUT        = 20_000;
+const CURSO_A       = 'cur-a-01';
+const TIMEOUT       = 25_000;
+const OBS_UNICA     = `test-05-${Date.now()}`;
 
-// Observación única para identificar el pago exacto en la tabla
-const OBS_UNICA      = `test-05-${Date.now()}`;
-
+// ── Validación de variables ──────────────────────────────────────────────────
 if (!APP_URL || !SUPA_URL || !SUPA_KEY || !USER_EMAIL || !USER_PASSWORD) {
-  console.error('[FALLO] Faltan variables de entorno. Define:\n' +
+  console.error('[FALLO] Faltan variables de entorno:\n' +
     '  STAGING_APP_URL, STAGING_SUPABASE_URL, STAGING_SUPABASE_ANON_KEY,\n' +
     '  STAGING_USER_A_EMAIL, STAGING_USER_A_PASSWORD');
   process.exit(1);
 }
 
-// ── Helper REST Supabase (sin SDK) ───────────────────────────────────────────
+// ── Protección: ninguna URL de Node puede apuntar a producción ───────────────
+function validarUrlNode(url, contexto) {
+  let hostname;
+  try { hostname = new URL(url).hostname; } catch (_) { return; }
+  const esProduccion = HOSTS_PRODUCCION.some(h => hostname === h || hostname.endsWith('.' + h));
+  if (esProduccion) {
+    throw new Error(
+      `[FALLO] ${contexto}: URL de producción detectada en llamada Node.js: ${url}\n` +
+      'Las llamadas de Node deben usar STAGING_SUPABASE_URL, nunca producción.'
+    );
+  }
+}
+
+// Validar las URLs de configuración antes de cualquier fetch
+validarUrlNode(SUPA_URL, 'STAGING_SUPABASE_URL');
+validarUrlNode(APP_URL,  'STAGING_APP_URL');
+
+// ── Helper REST Supabase (Node, sin SDK) ─────────────────────────────────────
 async function supaRest(path, opts = {}) {
   const url = `${SUPA_URL}/rest/v1${path}`;
+  validarUrlNode(url, `supaRest(${path})`);
+
   const res = await fetch(url, {
-    ...opts,
+    method: opts.method || 'GET',
+    body:   opts.body   || undefined,
     headers: {
       'apikey':        SUPA_KEY,
       'Authorization': `Bearer ${opts._token || SUPA_KEY}`,
@@ -58,42 +87,71 @@ async function supaRest(path, opts = {}) {
       ...(opts.headers || {}),
     },
   });
+
   const text = await res.text();
-  if (!res.ok) throw new Error(`Supabase REST ${opts.method || 'GET'} ${path} → ${res.status}: ${text}`);
+
+  if (!res.ok) {
+    throw new Error(
+      `supaRest ${opts.method || 'GET'} ${path} → HTTP ${res.status}: ${text}`
+    );
+  }
+
   return text ? JSON.parse(text) : null;
 }
 
 // ── Autenticar usuario A y obtener JWT ───────────────────────────────────────
 async function obtenerJWT() {
-  const res = await fetch(`${SUPA_URL}/auth/v1/token?grant_type=password`, {
+  const authUrl = `${SUPA_URL}/auth/v1/token?grant_type=password`;
+  validarUrlNode(authUrl, 'obtenerJWT');
+
+  const res = await fetch(authUrl, {
     method: 'POST',
     headers: { 'apikey': SUPA_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({ email: USER_EMAIL, password: USER_PASSWORD }),
   });
   const data = await res.json();
-  if (!res.ok || !data.access_token) throw new Error('Auth falló: ' + JSON.stringify(data));
+  if (!res.ok || !data.access_token) {
+    throw new Error(`Auth falló (HTTP ${res.status}): ${JSON.stringify(data)}`);
+  }
   return data.access_token;
 }
 
-// ── Limpieza: eliminar pagos de test previos ─────────────────────────────────
+// ── Limpieza: eliminar pagos de test previos de esta sesión ──────────────────
 async function limpiarPagosPrevios(jwt) {
-  const pagos = await supaRest(`/pagos?obs=like.test-05-%&select=id,cuenta_id`, { _token: jwt });
+  // Obtener cuenta_id del usuario para cumplir RLS en DELETE
+  const cuentas = await supaRest('/tesorero_cuentas?select=id', { _token: jwt });
+  if (!cuentas || !cuentas.length) return;
+  const cuentaId = cuentas[0].id;
+
+  const pagos = await supaRest(
+    `/pagos?obs=like.test-05-%&cuenta_id=eq.${cuentaId}&select=id`,
+    { _token: jwt }
+  );
   if (!pagos || !pagos.length) return;
+
   for (const p of pagos) {
-    await supaRest(`/pagos?id=eq.${p.id}&cuenta_id=eq.${p.cuenta_id}`, {
-      method: 'DELETE', _token: jwt,
-    }).catch(e => console.warn('[limpieza] No se pudo eliminar pago', p.id, e.message));
+    await supaRest(
+      `/pagos?id=eq.${p.id}&cuenta_id=eq.${cuentaId}`,
+      { method: 'DELETE', _token: jwt }
+    ).catch(e => console.warn(`  [limpieza] No se pudo eliminar ${p.id}: ${e.message}`));
   }
   console.log(`  [limpieza] ${pagos.length} pago(s) de test previo(s) eliminado(s)`);
 }
 
-// ── Verificar que el selector de curso está disponible ───────────────────────
-async function esperarSelectorCurso(page) {
-  // La app muestra el selector o el dashboard; esperar cualquiera
-  await Promise.race([
-    page.waitForSelector('[onclick*="selectCurso"]', { timeout: TIMEOUT }),
-    page.waitForSelector('#app [data-route="dashboard"]', { timeout: TIMEOUT }),
-  ]);
+// ── Esperar a que la app navegue al dashboard o al selector ─────────────────
+async function esperarLoginCompletado(page) {
+  await page.waitForFunction(
+    () => typeof S !== 'undefined' && S.session && (S.route === 'dashboard' || S.route === 'selector'),
+    { timeout: TIMEOUT }
+  );
+}
+
+// ── Ir a la vista de pagos del alumno del curso ──────────────────────────────
+async function navegarAPagos(page) {
+  // Navegar a la sección pagos usando la función go() de la app
+  await page.evaluate(() => { if (typeof go === 'function') go('pagos'); });
+  // Esperar a que aparezca la vista de pagos con algún alumno
+  await page.waitForSelector('[onclick*="showModal(\'addPago\'"]', { timeout: TIMEOUT });
 }
 
 // ── MAIN ─────────────────────────────────────────────────────────────────────
@@ -103,179 +161,240 @@ async function esperarSelectorCurso(page) {
   let bloqueo;
   let pagoIdCreado = null;
   let jwt;
+  let aluIdEsperado    = null;
+  let cuotaIdEsperado  = null;
+  let periodoEsperado  = null;
+  const montoEsperado  = 5000;
 
   try {
-    // ── Pre-vuelo ──────────────────────────────────────────────────────────
     console.log('\n=== 05_prueba_funcional_ui.js ===');
-    console.log(`APP: ${APP_URL}`);
-    console.log(`OBS_UNICA: ${OBS_UNICA}`);
+    console.log(`APP:       ${APP_URL}`);
+    console.log(`SUPA:      ${SUPA_URL}`);
+    console.log(`OBS:       ${OBS_UNICA}`);
 
+    // ── Pre-vuelo ────────────────────────────────────────────────────────────
     jwt = await obtenerJWT();
     console.log('  [ok] JWT obtenido para usuario A');
 
     await limpiarPagosPrevios(jwt);
 
-    // ── Iniciar navegador ──────────────────────────────────────────────────
+    // ── Navegador ────────────────────────────────────────────────────────────
     browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({
-      baseURL: APP_URL,
-      locale: 'es-CL',
-    });
+    const context = await browser.newContext({ baseURL: APP_URL, locale: 'es-CL' });
     const page = await context.newPage();
 
     bloqueo = await instalarBloqueoProduccion(context, page);
-    console.log(`  [ok] Bloqueo instalado — HTTP: ${bloqueo.httpInstalado}, WS: ${bloqueo.wsInstalado}`);
+    console.log(`  [ok] Bloqueo — HTTP: ${bloqueo.httpInstalado}, WS: ${bloqueo.wsInstalado}`);
 
-    // ── Paso 1: Login ──────────────────────────────────────────────────────
-    console.log('\n[Paso 1] Navegando a la app…');
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASO 1 — Login
+    // ══════════════════════════════════════════════════════════════════════════
+    console.log('\n[Paso 1] Login…');
     await page.goto('/', { waitUntil: 'networkidle', timeout: TIMEOUT });
 
-    await page.fill('#email', USER_EMAIL);
-    await page.fill('#password', USER_PASSWORD);
-    await page.click('button[type="submit"], button[onclick*="login"]');
-    console.log('  [ok] Credenciales enviadas');
+    // Selectores reales de acceso.js
+    await page.locator('#l-email').fill(USER_EMAIL);
+    await page.locator('#l-pass').fill(USER_PASSWORD);
+    await page.locator('button[onclick="doLogin()"]').click();
 
-    await esperarSelectorCurso(page);
-    console.log('  [ok] Login completado');
+    await esperarLoginCompletado(page);
+    console.log('  [ok] Login completado — ruta:', await page.evaluate(() => S.route));
 
-    // ── Paso 2: Verificar V9_RELACIONAL activo ────────────────────────────
-    console.log('\n[Paso 2] Verificando V9_RELACIONAL…');
-    const v9Activo = await page.evaluate(() => {
-      return typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL === true;
-    });
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASO 2 — Verificar V9_RELACIONAL
+    // ══════════════════════════════════════════════════════════════════════════
+    console.log('\n[Paso 2] V9_RELACIONAL…');
+    const v9Activo = await page.evaluate(() =>
+      typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL === true
+    );
     if (!v9Activo) throw new Error('[FALLO] V9_RELACIONAL no está activo en la app');
     console.log('  [ok] V9_RELACIONAL === true');
 
-    // ── Paso 3: Verificar cursos cargados desde tablas ────────────────────
-    console.log('\n[Paso 3] Verificando DB.cursos desde tablas relacionales…');
-    const cursosLen = await page.evaluate(() => (typeof DB !== 'undefined' ? (DB.cursos || []).length : -1));
-    if (cursosLen < 1) throw new Error(`[FALLO] DB.cursos vacío (${cursosLen}) — V9 no cargó datos`);
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASO 3 — Verificar cursos cargados
+    // ══════════════════════════════════════════════════════════════════════════
+    console.log('\n[Paso 3] DB.cursos desde tablas…');
+    const cursosLen = await page.evaluate(() =>
+      typeof DB !== 'undefined' ? (DB.cursos || []).length : -1
+    );
+    if (cursosLen < 1) throw new Error(`[FALLO] DB.cursos vacío (${cursosLen})`);
     console.log(`  [ok] DB.cursos tiene ${cursosLen} elemento(s)`);
 
-    // ── Paso 4: Seleccionar curso fijo cur-a-01 ───────────────────────────
-    console.log('\n[Paso 4] Seleccionando curso cur-a-01…');
-    const selectorVisible = await page.locator(`[onclick*="selectCurso('${CURSO_A}')"]`).isVisible().catch(() => false);
-    if (selectorVisible) {
-      await page.click(`[onclick*="selectCurso('${CURSO_A}')"]`);
-      await page.waitForSelector('[data-route="dashboard"], #app .dashboard', { timeout: TIMEOUT });
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASO 4 — Seleccionar curso cur-a-01
+    // ══════════════════════════════════════════════════════════════════════════
+    console.log('\n[Paso 4] Seleccionando cur-a-01…');
+    const enSelector = await page.evaluate(() => S.route === 'selector');
+    if (enSelector) {
+      // Hacer clic en el div del selector de curso (rutas.js → selectCurso)
+      await page.locator(`[onclick="selectCurso('${CURSO_A}')"]`).click();
+      // Esperar que recargarCursoV9 resuelva y navegue a dashboard
+      await page.waitForFunction(
+        () => typeof S !== 'undefined' && S.route === 'dashboard' && S.cursoId,
+        { timeout: TIMEOUT }
+      );
     }
-    // Si ya está en dashboard con ese curso, continuar
+
     const cursoActivo = await page.evaluate(() => typeof S !== 'undefined' ? S.cursoId : null);
     if (cursoActivo !== CURSO_A) {
       throw new Error(`[FALLO] S.cursoId = '${cursoActivo}', se esperaba '${CURSO_A}'`);
     }
     console.log(`  [ok] Curso activo: ${CURSO_A}`);
 
-    // ── Paso 5: Anotar estado de pagos ANTES ──────────────────────────────
-    console.log('\n[Paso 5] Contando pagos en public.pagos antes del test…');
-    const pagosAntes = await supaRest(`/pagos?obs=eq.${OBS_UNICA}&select=id,alumno_id,cuota_id,monto,periodo,obs`, { _token: jwt });
-    if (pagosAntes.length !== 0) throw new Error(`[FALLO] Ya existen ${pagosAntes.length} pagos con OBS_UNICA antes del test`);
-    console.log('  [ok] 0 pagos previos con esta observación');
-
-    // ── Paso 5B: PRUEBA DE GUARDADO RECHAZADO ─────────────────────────────
-    // Simular error del servidor revocando temporalmente el JWT en la página
-    console.log('\n[Paso 5B] Prueba de guardado rechazado por el servidor…');
-    await page.goto('/pagos', { waitUntil: 'networkidle', timeout: TIMEOUT }).catch(() => {});
-
-    // Abrir modal de pago para el primer alumno del curso
-    const btnPago = page.locator('button[onclick*="modalPago"]').first();
-    if (await btnPago.isVisible().catch(() => false)) {
-      await btnPago.click();
-      await page.waitForSelector('#p-monto', { timeout: 5000 }).catch(() => {});
-
-      // Inyectar token inválido para forzar error del servidor
-      const tokenOriginal = await page.evaluate(() => typeof _authToken !== 'undefined' ? _authToken : null);
-      if (tokenOriginal) {
-        await page.evaluate(() => { window._authToken = 'token-invalido-para-test'; });
-
-        await page.fill('#p-obs', OBS_UNICA + '-rechazado');
-        // Anotar longitud de DB.pagos antes
-        const pagosEnMemoriaAntes = await page.evaluate(() => (DB.pagos || []).length);
-
-        await page.click('button[onclick*="savePago"]');
-
-        // Esperar que aparezca un alert de error (el modal de savePago lo hace con alert())
-        // o esperar que el botón se rehabilite
-        await page.waitForFunction(() => {
-          const btn = document.querySelector('button[onclick*="savePago"]');
-          return !btn || !btn.disabled;
-        }, { timeout: 10_000 }).catch(() => {});
-
-        // Verificar que NO se añadió pago en memoria
-        const pagosEnMemoriaDespues = await page.evaluate(() => (DB.pagos || []).length);
-        if (pagosEnMemoriaDespues > pagosEnMemoriaAntes) {
-          throw new Error('[FALLO] El guardado rechazado añadió pagos a DB.pagos en memoria');
-        }
-        console.log('  [ok] Guardado rechazado: DB.pagos no se modificó');
-
-        // Verificar que no llegó nada al servidor
-        const pagosRechazados = await supaRest(
-          `/pagos?obs=eq.${OBS_UNICA + '-rechazado'}&select=id`,
-          { _token: jwt }
-        ).catch(() => []);
-        if (pagosRechazados.length > 0) {
-          throw new Error('[FALLO] Un pago con token inválido llegó al servidor');
-        }
-        console.log('  [ok] Guardado rechazado: 0 filas en public.pagos');
-
-        // Restaurar token original
-        await page.evaluate((t) => { window._authToken = t; }, tokenOriginal);
-        await page.keyboard.press('Escape'); // cerrar modal/alert
-      } else {
-        console.warn('  [aviso] No se pudo obtener _authToken para el test de rechazo');
-      }
-    } else {
-      console.warn('  [aviso] No hay botón de pago visible — omitiendo prueba de rechazo');
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASO 5 — Verificar estado limpio en public.pagos
+    // ══════════════════════════════════════════════════════════════════════════
+    console.log('\n[Paso 5] Estado inicial de public.pagos…');
+    const pagosAntes = await supaRest(
+      `/pagos?obs=eq.${OBS_UNICA}&select=id`,
+      { _token: jwt }
+    );
+    if (pagosAntes.length !== 0) {
+      throw new Error(`[FALLO] Ya existen ${pagosAntes.length} pagos con OBS_UNICA antes del test`);
     }
+    console.log('  [ok] 0 filas previas con OBS_UNICA');
 
-    // ── Paso 6: Registrar pago exitoso ────────────────────────────────────
-    console.log('\n[Paso 6] Registrando pago exitoso…');
-    const btnPago2 = page.locator('button[onclick*="modalPago"]').first();
-    await btnPago2.click();
-    await page.waitForSelector('#p-monto', { timeout: TIMEOUT });
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASO 5B — Guardado rechazado (OBLIGATORIO)
+    // Si este paso no puede ejecutarse, es un FALLO del test, no una omisión.
+    // ══════════════════════════════════════════════════════════════════════════
+    console.log('\n[Paso 5B] Prueba de guardado rechazado — OBLIGATORIA…');
 
-    const montoEsperado = 5000;
-    await page.fill('#p-monto', String(montoEsperado));
-    await page.fill('#p-obs', OBS_UNICA);
+    // Ir a vista de pagos y localizar el primer botón de registrar pago
+    await navegarAPagos(page);
 
-    // Seleccionar el primer mes disponible (si es cuota mensual)
+    // Registrar qué alumno y cuota usaremos (mismos para el flujo exitoso)
+    const btnAddPago = page.locator('[onclick*="showModal(\'addPago\'"]').first();
+    // Si no existe el botón, el test falla (no se puede omitir)
+    await btnAddPago.waitFor({ timeout: TIMEOUT });
+
+    const onclickAddPago = await btnAddPago.getAttribute('onclick');
+    // onclick = "showModal('addPago',{aluId:'xxx',cuotaId:'yyy'})"
+    const mAlu  = onclickAddPago?.match(/aluId:'([^']+)'/);
+    const mCuota = onclickAddPago?.match(/cuotaId:'([^']+)'/);
+    aluIdEsperado   = mAlu?.[1]   || null;
+    cuotaIdEsperado = mCuota?.[1] || null;
+    if (!aluIdEsperado || !cuotaIdEsperado) {
+      throw new Error(`[FALLO] No se pudo extraer aluId/cuotaId del botón: ${onclickAddPago}`);
+    }
+    console.log(`  aluId=${aluIdEsperado}  cuotaId=${cuotaIdEsperado}`);
+
+    // Abrir modal de pago
+    await btnAddPago.click();
+    await page.locator('#p-monto').waitFor({ timeout: TIMEOUT });
+
+    // Seleccionar primer mes disponible y anotar el período
     const primerCheck = page.locator('.p-mes-check:not([disabled])').first();
-    if (await primerCheck.isVisible().catch(() => false)) {
+    const hayMeses = await primerCheck.isVisible({ timeout: 2000 }).catch(() => false);
+    if (hayMeses) {
       await primerCheck.check();
+      periodoEsperado = await primerCheck.inputValue();
+    } else {
+      // cuota anual — leer el select
+      periodoEsperado = await page.locator('#p-periodo').inputValue().catch(() => null);
+    }
+    console.log(`  periodo=${periodoEsperado}`);
+
+    await page.locator('#p-monto').fill(String(montoEsperado));
+    await page.locator('#p-obs').fill(`${OBS_UNICA}-rechazado`);
+
+    // Guardar el JWT real y reemplazarlo con uno inválido
+    const tokenOriginal = await page.evaluate(() =>
+      typeof _authToken !== 'undefined' ? _authToken : null
+    );
+    if (!tokenOriginal) throw new Error('[FALLO] _authToken no disponible en la página');
+
+    const pagosEnMemoriaAntes = await page.evaluate(() => (DB.pagos || []).length);
+    await page.evaluate(() => { window._authToken = 'eyJinvalido.para.test'; });
+
+    // Pulsar guardar (el servidor debe rechazar con 401/403)
+    await page.locator('button[onclick*="savePago"]').click();
+
+    // Esperar a que el botón se rehabilite (indica que el Promise.allSettled terminó)
+    await page.waitForFunction(
+      () => {
+        const btn = document.querySelector('button[onclick*="savePago"]');
+        return !btn || !btn.disabled;
+      },
+      { timeout: 15_000 }
+    );
+
+    // Verificar 1: DB.pagos NO creció en memoria
+    const pagosEnMemoriaDespues = await page.evaluate(() => (DB.pagos || []).length);
+    if (pagosEnMemoriaDespues > pagosEnMemoriaAntes) {
+      throw new Error(
+        `[FALLO] El guardado rechazado añadió ${pagosEnMemoriaDespues - pagosEnMemoriaAntes} pago(s) a DB.pagos`
+      );
+    }
+    console.log('  [ok] DB.pagos no creció con guardado rechazado');
+
+    // Verificar 2: 0 filas llegaron al servidor
+    const pagosRechazados = await supaRest(
+      `/pagos?obs=eq.${OBS_UNICA}-rechazado&select=id`,
+      { _token: jwt }
+    );
+    if (pagosRechazados.length > 0) {
+      throw new Error('[FALLO] Un pago con token inválido llegó al servidor (RLS no funcionó)');
+    }
+    console.log('  [ok] 0 filas en public.pagos con obs rechazado');
+
+    // Restaurar token original y cerrar el modal
+    await page.evaluate((t) => { window._authToken = t; }, tokenOriginal);
+    await page.keyboard.press('Escape');
+    await page.locator('.modal').waitFor({ state: 'hidden', timeout: 3000 }).catch(() => {});
+
+    console.log('  [ok] Prueba de guardado rechazado completada');
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASO 6 — Pago válido
+    // ══════════════════════════════════════════════════════════════════════════
+    console.log('\n[Paso 6] Registrando pago válido…');
+    await navegarAPagos(page);
+
+    // Abrir modal para el mismo alumno/cuota
+    const btnPagoExacto = page.locator(
+      `[onclick*="showModal('addPago',{aluId:'${aluIdEsperado}',cuotaId:'${cuotaIdEsperado}'"]`
+    ).first();
+    await btnPagoExacto.waitFor({ timeout: TIMEOUT });
+    await btnPagoExacto.click();
+    await page.locator('#p-monto').waitFor({ timeout: TIMEOUT });
+
+    // Seleccionar mismo período
+    if (hayMeses) {
+      const check = page.locator(`.p-mes-check[value="${periodoEsperado}"]:not([disabled])`);
+      const disponible = await check.isVisible({ timeout: 2000 }).catch(() => false);
+      if (!disponible) {
+        // Ya estaba pagado — elegir otro mes disponible
+        const otroCheck = page.locator('.p-mes-check:not([disabled])').first();
+        await otroCheck.waitFor({ timeout: 5000 });
+        await otroCheck.check();
+        periodoEsperado = await otroCheck.inputValue();
+        console.log(`  [aviso] Período anterior ya pagado, usando: ${periodoEsperado}`);
+      } else {
+        await check.check();
+      }
     }
 
-    // Anotar estado antes del clic
-    const alumnoIdEsperado = await page.evaluate(() => {
-      const check = document.querySelector('.p-mes-check:not([disabled]):checked');
-      return check ? null : null; // se obtiene del parámetro del modal
-    });
-    const periodoEsperado = await page.evaluate(() => {
-      const check = document.querySelector('.p-mes-check:checked');
-      return check ? check.value : (document.querySelector('#p-periodo')?.value || null);
-    });
+    await page.locator('#p-monto').fill(String(montoEsperado));
+    await page.locator('#p-obs').fill(OBS_UNICA);
 
-    // Obtener alumnoId y cuotaId del atributo onclick del botón guardar
-    const onclickBtn = await page.locator('button[onclick*="savePago"]').getAttribute('onclick');
-    const matchSave = onclickBtn?.match(/savePago\('([^']+)','([^']+)'/);
-    const aluIdEsperado  = matchSave?.[1] || null;
-    const cuotaIdEsperado = matchSave?.[2] || null;
+    await page.locator('button[onclick*="savePago"]').click();
+    console.log('  [ok] savePago pulsado — esperando confirmación del servidor…');
 
-    await page.click('button[onclick*="savePago"]');
-    console.log('  [ok] Botón savePago pulsado');
-
-    // Esperar confirmación — el modal de notificación aparece tras el await del servidor
-    await page.waitForSelector('.modal-title', { timeout: TIMEOUT });
+    // Esperar modal de éxito — sólo aparece tras confirmación del servidor
+    await page.locator('.modal-title').waitFor({ timeout: TIMEOUT });
     const tituloModal = await page.locator('.modal-title').first().textContent();
-    if (!tituloModal.includes('Pago registrado') && !tituloModal.includes('registrado')) {
+    if (!tituloModal.includes('Pago registrado')) {
       throw new Error(`[FALLO] Modal inesperado: '${tituloModal}'`);
     }
-    console.log('  [ok] Modal de confirmación mostrado');
+    console.log('  [ok] Modal "Pago registrado" visible');
 
-    // ── Paso 7: Verificar pago en public.pagos (0 filas = FALLO) ─────────
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASO 7 — Verificar en public.pagos (0 filas = FALLO)
+    // ══════════════════════════════════════════════════════════════════════════
     console.log('\n[Paso 7] Verificando pago en public.pagos…');
-    // Esperar hasta 5 s a que el INSERT se propague
     let pagosConfirmados = [];
-    for (let i = 0; i < 5; i++) {
+    for (let intento = 0; intento < 6; intento++) {
       pagosConfirmados = await supaRest(
         `/pagos?obs=eq.${OBS_UNICA}&select=id,cuenta_id,alumno_id,cuota_id,monto,periodo,obs,estado`,
         { _token: jwt }
@@ -285,78 +404,94 @@ async function esperarSelectorCurso(page) {
     }
 
     if (pagosConfirmados.length === 0) {
-      throw new Error('[FALLO] 0 filas en public.pagos con OBS_UNICA — el INSERT no llegó al servidor');
+      throw new Error('[FALLO] 0 filas en public.pagos — el INSERT no llegó al servidor');
     }
 
     const p = pagosConfirmados[0];
     pagoIdCreado = p.id;
-    console.log(`  [ok] ${pagosConfirmados.length} fila(s) en public.pagos. id=${p.id}`);
+    console.log(`  [ok] ${pagosConfirmados.length} fila(s). id=${p.id}`);
 
-    // Verificación exacta de campos
+    // Verificación exacta campo a campo
     const errores = [];
-    if (p.monto     !== montoEsperado)  errores.push(`monto: ${p.monto} ≠ ${montoEsperado}`);
-    if (p.estado    !== 'pagado')       errores.push(`estado: ${p.estado} ≠ pagado`);
-    if (aluIdEsperado  && p.alumno_id  !== aluIdEsperado)  errores.push(`alumno_id: ${p.alumno_id} ≠ ${aluIdEsperado}`);
+    if (p.monto  !== montoEsperado)                   errores.push(`monto: ${p.monto} ≠ ${montoEsperado}`);
+    if (p.estado !== 'pagado')                         errores.push(`estado: ${p.estado}`);
+    if (aluIdEsperado   && p.alumno_id !== aluIdEsperado)   errores.push(`alumno_id: ${p.alumno_id} ≠ ${aluIdEsperado}`);
     if (cuotaIdEsperado && p.cuota_id  !== cuotaIdEsperado) errores.push(`cuota_id: ${p.cuota_id} ≠ ${cuotaIdEsperado}`);
-    if (periodoEsperado && p.periodo   !== periodoEsperado) errores.push(`periodo: ${p.periodo} ≠ ${periodoEsperado}`);
-    if (errores.length) throw new Error('[FALLO] Campos incorrectos en public.pagos:\n' + errores.join('\n'));
-    console.log('  [ok] Verificación exacta: id, alumno_id, cuota_id, monto, periodo, estado — todos correctos');
+    if (periodoEsperado && p.periodo   !== periodoEsperado)  errores.push(`periodo: ${p.periodo} ≠ ${periodoEsperado}`);
+    if (errores.length) throw new Error('[FALLO] Campos incorrectos en public.pagos:\n  ' + errores.join('\n  '));
 
-    // ── Paso 8: Recarga de página — pago debe seguir visible ─────────────
-    console.log('\n[Paso 8] Verificando pago visible tras recarga…');
+    console.log('  [ok] Campos exactos: id, alumno_id, cuota_id, monto, periodo, estado ✓');
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASO 8 — Recarga: pago visible en DB.pagos
+    // ══════════════════════════════════════════════════════════════════════════
+    console.log('\n[Paso 8] Recarga de página…');
+
+    // Cerrar modal antes de recargar
+    await page.keyboard.press('Escape');
     await page.reload({ waitUntil: 'networkidle', timeout: TIMEOUT });
 
-    // Esperar que la sesión se restaure (arranque.js → cargarSesionV9)
+    // Esperar restauración de sesión vía cargarSesionV9 (arranque.js)
     await page.waitForFunction(
       () => typeof S !== 'undefined' && S.session && S._v9CuentaId,
       { timeout: TIMEOUT }
     );
-    console.log('  [ok] Sesión restaurada tras recarga');
+    console.log('  [ok] Sesión restaurada');
 
-    // Verificar que el pago está en DB.pagos en memoria
-    const pagoEnMemoria = await page.evaluate((obsUnica) => {
-      return (DB.pagos || []).find(p => p.obs === obsUnica) || null;
+    // Verificar pago en DB.pagos con campos exactos
+    const pagoEnMemoria = await page.evaluate((obs) => {
+      return (typeof DB !== 'undefined' ? DB.pagos || [] : []).find(p => p.obs === obs) || null;
     }, OBS_UNICA);
 
     if (!pagoEnMemoria) {
-      throw new Error('[FALLO] El pago no aparece en DB.pagos tras recarga');
+      throw new Error('[FALLO] Pago no encontrado en DB.pagos tras recarga');
     }
 
-    // Verificación exacta de campos en memoria tras recarga
-    const erroresMemoria = [];
-    if (pagoEnMemoria.monto !== montoEsperado)            erroresMemoria.push(`monto: ${pagoEnMemoria.monto} ≠ ${montoEsperado}`);
-    if ((pagoEnMemoria.alumnoId || pagoEnMemoria.aluId) !== aluIdEsperado && aluIdEsperado)
-      erroresMemoria.push(`alumnoId: ${pagoEnMemoria.alumnoId||pagoEnMemoria.aluId} ≠ ${aluIdEsperado}`);
-    if (pagoEnMemoria.cuotaId !== cuotaIdEsperado && cuotaIdEsperado)
-      erroresMemoria.push(`cuotaId: ${pagoEnMemoria.cuotaId} ≠ ${cuotaIdEsperado}`);
-    if (pagoEnMemoria.estado !== 'pagado')                erroresMemoria.push(`estado: ${pagoEnMemoria.estado} ≠ pagado`);
-    if (erroresMemoria.length) throw new Error('[FALLO] Campos incorrectos en DB.pagos tras recarga:\n' + erroresMemoria.join('\n'));
+    const erroresRecarga = [];
+    const aluMemoria = pagoEnMemoria.alumnoId || pagoEnMemoria.aluId;
+    if (pagoEnMemoria.monto !== montoEsperado)                  erroresRecarga.push(`monto: ${pagoEnMemoria.monto} ≠ ${montoEsperado}`);
+    if (pagoEnMemoria.estado !== 'pagado')                       erroresRecarga.push(`estado: ${pagoEnMemoria.estado}`);
+    if (aluIdEsperado   && aluMemoria !== aluIdEsperado)         erroresRecarga.push(`alumnoId: ${aluMemoria} ≠ ${aluIdEsperado}`);
+    if (cuotaIdEsperado && pagoEnMemoria.cuotaId !== cuotaIdEsperado) erroresRecarga.push(`cuotaId: ${pagoEnMemoria.cuotaId} ≠ ${cuotaIdEsperado}`);
+    if (periodoEsperado && pagoEnMemoria.periodo !== periodoEsperado) erroresRecarga.push(`periodo: ${pagoEnMemoria.periodo} ≠ ${periodoEsperado}`);
+    if (erroresRecarga.length) {
+      throw new Error('[FALLO] Campos incorrectos en DB.pagos tras recarga:\n  ' + erroresRecarga.join('\n  '));
+    }
+    console.log('  [ok] Pago en DB.pagos con campos exactos ✓');
 
-    console.log('  [ok] Pago visible en DB.pagos tras recarga — id, alumnoId, cuotaId, monto, estado correctos');
-
-    // ── Paso 9: Verificar sin intentos a producción ───────────────────────
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASO 9 — Aislamiento de producción
+    // ══════════════════════════════════════════════════════════════════════════
     console.log('\n[Paso 9] Verificando aislamiento de producción…');
     verificarSinIntentos(bloqueo);
-    console.log('  [ok] Ningún intento a producción detectado');
+    console.log('  [ok] Ningún intento a producción');
 
     console.log('\n✅ TODAS LAS PRUEBAS PASARON\n');
 
   } catch (err) {
-    console.error('\n❌ FALLO:', err.message, '\n');
+    console.error('\n❌ FALLO:', err.message);
     exitCode = 1;
   } finally {
-    // ── Limpieza del pago de test ──────────────────────────────────────────
-    if (pagoIdCreado && jwt) {
+    // Limpieza del pago creado
+    if (jwt) {
       try {
-        await supaRest(`/pagos?obs=like.test-05-%&select=id,cuenta_id`, { _token: jwt })
-          .then(rows => Promise.all(
-            (rows || []).map(r =>
-              supaRest(`/pagos?id=eq.${r.id}&cuenta_id=eq.${r.cuenta_id}`, { method: 'DELETE', _token: jwt })
-            )
-          ));
-        console.log('[limpieza] Pago(s) de test eliminado(s)');
+        const cuentas = await supaRest('/tesorero_cuentas?select=id', { _token: jwt }).catch(() => []);
+        const cuentaId = cuentas?.[0]?.id;
+        if (cuentaId) {
+          const aLimpiar = await supaRest(
+            `/pagos?obs=like.test-05-%&cuenta_id=eq.${cuentaId}&select=id`,
+            { _token: jwt }
+          ).catch(() => []);
+          for (const r of (aLimpiar || [])) {
+            await supaRest(
+              `/pagos?id=eq.${r.id}&cuenta_id=eq.${cuentaId}`,
+              { method: 'DELETE', _token: jwt }
+            ).catch(() => {});
+          }
+          if (aLimpiar?.length) console.log(`[limpieza] ${aLimpiar.length} pago(s) de test eliminado(s)`);
+        }
       } catch (e) {
-        console.warn('[limpieza] No se pudo eliminar pago de test:', e.message);
+        console.warn('[limpieza] Error:', e.message);
       }
     }
     if (browser) await browser.close();

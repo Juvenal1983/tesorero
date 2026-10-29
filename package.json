@@ -1,0 +1,26 @@
+{
+  "name": "el-tesorero-tests",
+  "version": "0.0.1",
+  "description": "Tests de staging para El Tesorero — rama gran-cambio-v9-relacional",
+  "private": true,
+  "scripts": {
+    "test:rls":  "node tests/03_rls_cliente.js",
+    "test:noprod": "node tests/04_verifica_no_produccion.js",
+    "test:ui":   "node tests/05_prueba_funcional_ui.js",
+    "test:all":  "node tests/03_rls_cliente.js && node tests/04_verifica_no_produccion.js && node tests/05_prueba_funcional_ui.js"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "notes": [
+    "Después de npm install, ejecutar: npx playwright install chromium",
+    "Variables de entorno requeridas para los tests de UI (05):",
+    "  STAGING_APP_URL, STAGING_SUPABASE_URL, STAGING_SUPABASE_ANON_KEY,",
+    "  STAGING_USER_A_EMAIL, STAGING_USER_A_PASSWORD",
+    "Para 03_rls_cliente.js añadir también:",
+    "  STAGING_USER_B_EMAIL, STAGING_USER_B_PASSWORD"
+  ]
+}

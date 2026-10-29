@@ -311,12 +311,18 @@ async function cargarSesionV9(authId, accessToken, cursoId) {
 }
 
 /**
- * Recarga los alumnos, cuotas y pagos cuando el usuario cambia de curso.
- * Se llama desde selectCurso() cuando V9_RELACIONAL === true.
+ * Recarga los alumnos, cuotas y pagos para un curso dado.
+ * IMPORTANTE: esta función NO modifica DB directamente.
+ * Devuelve los datos mapeados para que el llamador (selectCurso en rutas.js)
+ * pueda comprobar el epoch vigente antes de aplicarlos atómicamente.
+ *
+ * @param {string} cursoId
+ * @param {string} accessToken
+ * @returns {Promise<{ alumnos: object[], cuotas: object[], pagos: object[] }>}
  */
 async function recargarCursoV9(cursoId, accessToken) {
   const cuentaId = (typeof S !== 'undefined' && S._v9CuentaId);
-  if (!cuentaId) return;
+  if (!cuentaId) throw new Error('[v9] recargarCursoV9: S._v9CuentaId no disponible');
 
   const [alumnosRaw, cuotasRaw, pagosRaw] = await Promise.all([
     cargarAlumnos(cuentaId, cursoId, accessToken),
@@ -324,7 +330,11 @@ async function recargarCursoV9(cursoId, accessToken) {
     cargarPagos(cuentaId, accessToken),
   ]);
 
-  DB.alumnos = alumnosRaw.map(_mapAlumno);
-  DB.cuotas  = cuotasRaw.map(_mapCuota);
-  DB.pagos   = pagosRaw.map(_mapPago);
+  // Devolver los datos mapeados sin escribir en DB.
+  // El llamador es responsable de verificar el epoch y aplicar los datos.
+  return {
+    alumnos: alumnosRaw.map(_mapAlumno),
+    cuotas:  cuotasRaw.map(_mapCuota),
+    pagos:   pagosRaw.map(_mapPago),
+  };
 }

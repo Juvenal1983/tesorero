@@ -1,1 +1,4 @@
 __env.js
+_headers
+node_modules/
+npm-debug.log

@@ -40,23 +40,29 @@ function selectCurso(id){
     if (appEl) appEl.innerHTML = '<div style="padding:32px;color:var(--t3)">Cargando curso…</div>';
 
     recargarCursoV9(id, _authToken)
-      .then(() => {
-        // Descartar si el usuario seleccionó otro curso mientras esperábamos
+      .then(datos => {
+        // Descartar respuesta si el usuario seleccionó otro curso mientras esperábamos
         if (miEpoch !== _selectCursoEpoch) {
-          console.warn('[v9] selectCurso: respuesta tardía descartada (epoch obsoleto)');
+          console.warn('[v9] selectCurso: respuesta tardía descartada (epoch obsoleto, curso cambiado)');
           return;
         }
-        S.cursoId = id;
+        // Aplicar datos y cursoId atómicamente: nunca DB sin cursoId ni cursoId sin datos
+        DB.alumnos = datos.alumnos;
+        DB.cuotas  = datos.cuotas;
+        DB.pagos   = datos.pagos;
+        S.cursoId  = id;
         go('dashboard');
       })
       .catch(err => {
         if (miEpoch !== _selectCursoEpoch) return;
         console.error('[v9] recargarCursoV9 falló:', err);
-        // No navegar al dashboard con datos del curso anterior.
-        // Volver al selector para que el usuario pueda reintentar.
+        // No navegar al dashboard: el usuario vería datos del curso anterior.
         if (appEl) {
-          appEl.innerHTML = '<div style="padding:32px"><div style="color:var(--r);margin-bottom:12px">⚠️ No se pudieron cargar los datos del curso. Inténtalo de nuevo.</div>'
-            + '<button class="btn" onclick="go(\'selector\')">← Volver al selector</button></div>';
+          appEl.innerHTML =
+            '<div style="padding:32px">' +
+              '<div style="color:var(--r);margin-bottom:12px">⚠️ No se pudieron cargar los datos del curso. Inténtalo de nuevo.</div>' +
+              '<button class="btn" onclick="go(\'selector\')">← Volver al selector</button>' +
+            '</div>';
         }
       });
     return;
