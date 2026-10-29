@@ -34,10 +34,37 @@ document.addEventListener('DOMContentLoaded', async function iniciarApp() {
       const session = data?.session;
       if (session?.user) {
         _authToken = session.access_token || null;
-        const email    = session.user.email || '';
-        const authId   = session.user.id;
+        const email  = session.user.email || '';
+        const authId = session.user.id;
 
-        // Intentar cargar datos del usuario desde Supabase
+        // ── FLUJO RELACIONAL v9 ──────────────────────────────────────────
+        if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+          try {
+            const { cuenta, cuentaId, cursoIds } = await cargarSesionV9(authId, _authToken);
+            const usuarioV9 = {
+              id:       cuentaId,
+              authId,
+              email:    cuenta.email || email,
+              nombre:   cuenta.nombre || email,
+              rol:      'tesorero',
+              cursoIds,
+              _v9:      true,
+            };
+            S.session     = usuarioV9;
+            S._v9CuentaId = cuentaId;
+            if (typeof setUserKey === 'function') { try { setUserKey(cuentaId); } catch(_) {} }
+            if (cursoIds.length === 1) { S.cursoId = cursoIds[0]; go('dashboard'); }
+            else { go(cursoIds.length > 1 ? 'selector' : 'dashboard'); }
+            return;
+          } catch (errV9) {
+            console.error('[v9] arranque: cargarSesionV9 falló, mostrando login:', errV9);
+            render();
+            return;
+          }
+        }
+        // ── FIN FLUJO RELACIONAL v9 ──────────────────────────────────────
+
+        // Intentar cargar datos del usuario desde Supabase (blob legado)
         const legacy = await buscarUsuarioLegacyPorEmail(email, authId);
         if (legacy && legacy.datos) {
           DB = legacy.datos;

@@ -22,7 +22,24 @@ function renderSelector(){
   </div>`;
 }
 function bindSelector(){}
-function selectCurso(id){S.cursoId=id;go('dashboard');}
+function selectCurso(id){
+  S.cursoId = id;
+  // ── FLUJO RELACIONAL v9 ────────────────────────────────────────────────
+  // Si V9_RELACIONAL está activo, recargar alumnos/cuotas/pagos del nuevo
+  // curso desde las tablas relacionales antes de renderizar.
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL &&
+      typeof recargarCursoV9 === 'function' && typeof _authToken !== 'undefined' && _authToken) {
+    recargarCursoV9(id, _authToken)
+      .then(() => go('dashboard'))
+      .catch(err => {
+        console.error('[v9] recargarCursoV9 falló:', err);
+        go('dashboard');  // navegar de todas formas con los datos en memoria
+      });
+    return;
+  }
+  // ── FIN FLUJO RELACIONAL v9 ───────────────────────────────────────────
+  go('dashboard');
+}
 
 // ─────────────────────────────────────────────
 // RUTAS

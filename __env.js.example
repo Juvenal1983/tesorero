@@ -1,0 +1,21 @@
+/**
+ * __env.js.example — Plantilla de configuración de staging.
+ *
+ * INSTRUCCIONES:
+ *   1. Copia este archivo como __env.js en la raíz del proyecto de staging.
+ *   2. Reemplaza los valores por las credenciales reales del proyecto de staging.
+ *   3. NUNCA commitas __env.js con credenciales reales al repositorio.
+ *      El archivo está en .gitignore de esta rama.
+ *   4. Para Netlify/Vercel: usa las funciones de "generate file" o un script
+ *      de build que escriba __env.js desde las variables de entorno del hosting.
+ *      Ver generate_env.sh en esta misma carpeta.
+ *
+ * PRODUCCIÓN — NUNCA USAR ESTAS VARIABLES EN PRODUCCIÓN:
+ *   La URL de producción es https://tmjqzaakzhecbldebyeg.supabase.co
+ *   Producción tiene su propia config hardcodeada en config.js (rama produccion).
+ *   Esta rama (gran-cambio-v9-relacional) apunta SOLO a staging.
+ */
+
+// Reemplazar con los valores reales del proyecto de staging:
+window.STAGING_SUPA_URL = 'https://XXXXXXXXXXXXXXXXXXXX.supabase.co';
+window.STAGING_SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.REEMPLAZAR_CON_ANON_KEY_STAGING';

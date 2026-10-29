@@ -1,7 +1,10 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src data: blob:; font-src 'self'; connect-src 'self' https://tmjqzaakzhecbldebyeg.supabase.co wss://tmjqzaakzhecbldebyeg.supabase.co; worker-src 'none'; manifest-src 'self'; base-uri 'none'; form-action 'none'">
+<!-- CSP: connect-src se actualiza vía __env.js inyectado por el hosting de staging.
+     En producción el archivo __env.js no existe y el bloque inline de config.js
+     usa las constantes hardcodeadas de producción (sin cambios). -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src data: blob:; font-src 'self'; connect-src 'self' https://tmjqzaakzhecbldebyeg.supabase.co wss://tmjqzaakzhecbldebyeg.supabase.co https://*.supabase.co wss://*.supabase.co; worker-src 'none'; manifest-src 'self'; base-uri 'none'; form-action 'none'">
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="styles/base.css">
 <link rel="stylesheet" href="styles/profesional.css">
@@ -19,6 +22,13 @@
 <script defer src="vendor/supabase.min.js"></script>
 <script defer src="vendor/chart.umd.js"></script>
 <script defer src="vendor/xlsx.full.min.js"></script>
+<!-- __env.js: inyectado por el hosting de staging con STAGING_SUPA_URL y STAGING_SUPA_KEY.
+     En producción este archivo NO existe; el script carga sin error porque es async.
+     En staging el hosting genera: window.STAGING_SUPA_URL="https://xxx.supabase.co"
+                                    window.STAGING_SUPA_KEY="eyJ..."
+     config.js lee estas variables con: (typeof STAGING_SUPA_URL !== 'undefined' && STAGING_SUPA_URL)
+     Ver sección "Inyección de configuración de staging" en DEPLOY_STAGING.md -->
+<script src="__env.js" onerror="/* archivo opcional — solo existe en staging */"></script>
 <script defer src="js/core/config.js"></script>
 <!-- datos_v9.js: capa de datos relacional. Solo activa cuando V9_RELACIONAL === true. -->
 <script defer src="js/core/datos_v9.js"></script>
