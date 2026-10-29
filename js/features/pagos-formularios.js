@@ -329,6 +329,9 @@ function eliminarPlanPago(planId){
 }
 
 
+// ── Bandera anti-doble-envío para el flujo v9 ───────────────────────────────
+let _savePagoEnCurso = false;
+
 function savePago(aluId,cuotaId,modo){
   const monto=parseInt(document.getElementById('p-monto').value);
   if(!monto){alert('Ingresa el monto.');return;}
@@ -350,19 +353,15 @@ function savePago(aluId,cuotaId,modo){
 
   if(!DB.pagos) DB.pagos=[];
 
-  // Registrar un pago por cada período seleccionado
+  // Filtrar duplicados en memoria
   const duplicados = [];
   const nuevos = [];
   periodos.forEach(periodo=>{
-    const pagoExistente = (DB.pagos||[]).find(p=>
+    const existe = (DB.pagos||[]).find(p=>
       (p.alumnoId||p.aluId)===aluId && p.cuotaId===cuotaId && p.periodo===periodo && p.estado==='pagado'
     );
-    if(pagoExistente){
-      duplicados.push(periodo);
-    } else {
-      nuevos.push(periodo);
-      DB.pagos.push({id:uid(),cuotaId,alumnoId:aluId,aluId,periodo,monto,fecha,estado:'pagado',medio,obs,creadoPor:S.session.id});
-    }
+    if(existe) duplicados.push(periodo);
+    else nuevos.push(periodo);
   });
 
   if(duplicados.length){
@@ -371,59 +370,123 @@ function savePago(aluId,cuotaId,modo){
   if(!nuevos.length) return;
 
   // ── FLUJO RELACIONAL v9 ──────────────────────────────────────────────────
-  // Si V9_RELACIONAL está activo, persistir en la tabla `pagos` en lugar de
-  // (o además de) actualizar el blob tesorero_datos.
   if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    // Bloquear doble envío mientras la petición al servidor está en curso
+    if (_savePagoEnCurso) { return; }
+    _savePagoEnCurso = true;
+    const btnGuardar = document.querySelector('button[onclick*="savePago"]');
+    if (btnGuardar) { btnGuardar.disabled = true; btnGuardar.textContent = 'Guardando…'; }
+
     const cuentaId = (typeof S !== 'undefined' && S._v9CuentaId) || null;
     if (!cuentaId) {
-      console.error('[v9] savePago: S._v9CuentaId no disponible — no se pudo persistir en tabla pagos.');
-    } else {
-      // registrarPagoV9 para cada período nuevo
-      // Los pagos ya fueron añadidos a DB.pagos con id generado por uid()
-      // Usamos el mismo id para que la búsqueda posterior sea consistente
-      const pagosNuevos = DB.pagos.filter(p =>
-        nuevos.includes(p.periodo) &&
-        (p.alumnoId || p.aluId) === aluId &&
-        p.cuotaId === cuotaId
-      ).slice(-nuevos.length); // tomar los últimos añadidos
-
-      Promise.all(pagosNuevos.map(pago =>
-        registrarPagoV9({
-          id:         pago.id,
-          alumno_id:  aluId,
-          cuota_id:   cuotaId,
-          monto:      monto,
-          fecha:      fecha,
-          medio:      medio,
-          estado:     'pagado',
-          periodo:    pago.periodo || null,
-          obs:        obs || null,
-          creado_por: (S && S.session && S.session.id) || null,
-        }, cuentaId, _authToken)
-        .then(registrado => {
-          // Actualizar id en DB.pagos con el id devuelto por Supabase (puede diferir)
-          if (registrado && registrado.id !== pago.id) {
-            const idx = DB.pagos.findIndex(p => p.id === pago.id);
-            if (idx !== -1) DB.pagos[idx].id = registrado.id;
-          }
-        })
-        .catch(err => console.error('[v9] Error al registrar pago en tabla:', err))
-      )).then(() => {
-        // Re-renderizar para mostrar el id definitivo si cambió
-        if (typeof renderPage === 'function') renderPage();
-      });
+      _savePagoEnCurso = false;
+      if (btnGuardar) { btnGuardar.disabled = false; btnGuardar.textContent = 'Registrar y notificar →'; }
+      alert('Error: sesión v9 sin cuentaId — vuelve a iniciar sesión.');
+      return;
     }
-    // En modo v9 NO llamamos saveDB() (evita escribir en tesorero_datos)
-    // La UI se actualiza porque DB.pagos ya tiene los nuevos registros en memoria
-  } else {
-    // ── FLUJO LEGADO: persiste en el blob tesorero_datos ────────────────
-    saveDB();
+
+    // Construir payload por período (sin añadir a DB.pagos aún)
+    const payloads = nuevos.map(periodo => ({
+      _periodo: periodo,
+      id:         'p-' + Date.now() + '-' + Math.random().toString(36).slice(2,7),
+      alumno_id:  aluId,
+      cuota_id:   cuotaId,
+      monto,
+      fecha,
+      medio,
+      estado:     'pagado',
+      periodo:    periodo || null,
+      obs:        obs || null,
+      creado_por: (S && S.session && S.session.id) || null,
+    }));
+
+    // Enviar todos al servidor y esperar confirmación antes de tocar DB.pagos
+    Promise.allSettled(
+      payloads.map(payload =>
+        registrarPagoV9(payload, cuentaId, _authToken)
+          .then(registrado => ({ ok: true, periodo: payload._periodo, registro: registrado }))
+          .catch(err         => ({ ok: false, periodo: payload._periodo, err }))
+      )
+    ).then(resultados => {
+      _savePagoEnCurso = false;
+      if (btnGuardar) { btnGuardar.disabled = false; btnGuardar.textContent = 'Registrar y notificar →'; }
+
+      const exitosos = resultados.filter(r => r.value?.ok).map(r => r.value);
+      const fallidos  = resultados.filter(r => !r.value?.ok).map(r => r.value);
+
+      // Sólo añadir a DB.pagos los que el servidor confirmó
+      exitosos.forEach(({ registro }) => {
+        DB.pagos.push({
+          id:        registro.id,
+          alumnoId:  aluId,
+          aluId,
+          cuotaId,
+          periodo:   registro.periodo,
+          monto:     registro.monto,
+          fecha:     registro.fecha,
+          estado:    'pagado',
+          medio:     registro.medio,
+          obs:       registro.obs,
+          creadoPor: registro.creado_por,
+          _v9:       true,
+          _cuentaId: cuentaId,
+        });
+      });
+
+      if (fallidos.length) {
+        const msgs = fallidos.map(f => `• ${f.periodo}: ${f.err?.message || 'error del servidor'}`).join('\n');
+        const aviso = exitosos.length
+          ? `⚠️ ${exitosos.length} período(s) guardado(s), pero ${fallidos.length} falló:\n${msgs}\n\nLos fallidos NO se registraron.`
+          : `❌ No se pudo guardar ningún período:\n${msgs}`;
+        alert(aviso);
+        if (!exitosos.length) return; // No mostrar éxito si todo falló
+      }
+
+      if (!exitosos.length) return;
+
+      // ── A partir de aquí sólo para períodos exitosos ──────────────────
+      const periodoExitosos = exitosos.map(e => e.registro.periodo);
+      const periodo = periodoExitosos.length===1 ? periodoExitosos[0] : periodoExitosos.join(', ');
+
+      const ap=apId?(DB.apoderados||[]).find(x=>x.id===apId):null;
+      const alu=(DB.alumnos||[]).find(a=>a.id===aluId);
+      const cuota=(DB.cuotas||[]).find(q=>q.id===cuotaId);
+      const cur=getCurso();
+      const alumNombre=((alu?.nombres||'')+' '+(alu?.apellidos||'')).trim();
+      const curNombre=cur?.nombre||'el curso';
+      const colegioNombre=(DB.colegios||[]).find(c=>c.id===cur?.colegioId)?.nombre||'';
+      const fechaFmt=fmtDate(fecha);
+      const montoFmt=clp(monto);
+
+      const plantilla=DB.config?.plantillaPago||PLANTILLA_PAGO_DEFAULT;
+      const tieneVariables = plantilla && /\{alumno\}|\{monto\}|\{periodo\}|\{cuota\}/.test(plantilla);
+      const msgDefault = tieneVariables
+        ? plantilla
+            .replace(/\{alumno\}/g,alumNombre)
+            .replace(/\{cuota\}/g,cuota?.nombre||'cuota')
+            .replace(/\{periodo\}/g,periodo)
+            .replace(/\{monto\}/g,montoFmt)
+            .replace(/\{fecha\}/g,fechaFmt)
+            .replace(/\{medio\}/g,medio)
+            .replace(/\{curso\}/g,curNombre)
+            .replace(/\{colegio\}/g,colegioNombre)
+        : buildMsgDefault({alumNombre,cuota,periodo,montoFmt,fechaFmt,medio,curNombre,colegioNombre});
+
+      S.modal={type:'notificacion',data:{ap,alu,cuota,periodo,monto,fecha,medio,cur,aluId,msgDefault}};
+      render();
+    });
+
+    return; // la UI se actualiza dentro del .then()
   }
-  // ── FIN FLUJO RELACIONAL v9 ─────────────────────────────────────────────
+  // ── FIN FLUJO RELACIONAL v9 ──────────────────────────────────────────────
 
-  // Para notificación usar el primer período o resumen
+  // ── FLUJO LEGADO ─────────────────────────────────────────────────────────
+  nuevos.forEach(periodo=>{
+    DB.pagos.push({id:uid(),cuotaId,alumnoId:aluId,aluId,periodo,monto,fecha,estado:'pagado',medio,obs,creadoPor:S.session.id});
+  });
+  saveDB();
+
   const periodo = nuevos.length===1 ? nuevos[0] : nuevos.join(', ');
-
   const ap=apId?(DB.apoderados||[]).find(x=>x.id===apId):null;
   const alu=(DB.alumnos||[]).find(a=>a.id===aluId);
   const cuota=(DB.cuotas||[]).find(q=>q.id===cuotaId);
@@ -434,8 +497,6 @@ function savePago(aluId,cuotaId,modo){
   const fechaFmt=fmtDate(fecha);
   const montoFmt=clp(monto);
 
-  // Siempre generar el mensaje fresco con los datos del pago actual
-  // La plantilla solo se usa si contiene variables {alumno}, {monto}, etc.
   const plantilla=DB.config?.plantillaPago||PLANTILLA_PAGO_DEFAULT;
   const tieneVariables = plantilla && /\{alumno\}|\{monto\}|\{periodo\}|\{cuota\}/.test(plantilla);
   const msgDefault = tieneVariables

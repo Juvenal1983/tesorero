@@ -1,10 +1,11 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-<!-- CSP: connect-src se actualiza vía __env.js inyectado por el hosting de staging.
-     En producción el archivo __env.js no existe y el bloque inline de config.js
-     usa las constantes hardcodeadas de producción (sin cambios). -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src data: blob:; font-src 'self'; connect-src 'self' https://tmjqzaakzhecbldebyeg.supabase.co wss://tmjqzaakzhecbldebyeg.supabase.co https://*.supabase.co wss://*.supabase.co; worker-src 'none'; manifest-src 'self'; base-uri 'none'; form-action 'none'">
+<!-- CSP de STAGING: generate_env.sh reemplaza STAGING_SUPA_HOST con el host exacto.
+     El dominio de producción (tmjqzaakzhecbldebyeg) NO figura aquí — esta rama
+     sólo debe conectarse al proyecto de staging.
+     El placeholder STAGING_SUPA_HOST es sustituido en el build por generate_env.sh. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src data: blob:; font-src 'self'; connect-src 'self' https://STAGING_SUPA_HOST wss://STAGING_SUPA_HOST; worker-src 'none'; manifest-src 'self'; base-uri 'none'; form-action 'none'">
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="styles/base.css">
 <link rel="stylesheet" href="styles/profesional.css">

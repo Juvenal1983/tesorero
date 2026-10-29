@@ -22,22 +22,47 @@ function renderSelector(){
   </div>`;
 }
 function bindSelector(){}
+// Contador de epoch para proteger contra race conditions al cambiar de curso.
+// Cada llamada a selectCurso incrementa el epoch; una respuesta tardía con
+// epoch menor que el actual se descarta silenciosamente.
+let _selectCursoEpoch = 0;
+
 function selectCurso(id){
-  S.cursoId = id;
   // ── FLUJO RELACIONAL v9 ────────────────────────────────────────────────
-  // Si V9_RELACIONAL está activo, recargar alumnos/cuotas/pagos del nuevo
-  // curso desde las tablas relacionales antes de renderizar.
   if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL &&
       typeof recargarCursoV9 === 'function' && typeof _authToken !== 'undefined' && _authToken) {
+
+    const miEpoch = ++_selectCursoEpoch;
+
+    // No cambiar S.cursoId ni navegar hasta que el servidor confirme la carga.
+    // Mostrar indicador de carga mientras espera.
+    const appEl = document.getElementById('app');
+    if (appEl) appEl.innerHTML = '<div style="padding:32px;color:var(--t3)">Cargando curso…</div>';
+
     recargarCursoV9(id, _authToken)
-      .then(() => go('dashboard'))
+      .then(() => {
+        // Descartar si el usuario seleccionó otro curso mientras esperábamos
+        if (miEpoch !== _selectCursoEpoch) {
+          console.warn('[v9] selectCurso: respuesta tardía descartada (epoch obsoleto)');
+          return;
+        }
+        S.cursoId = id;
+        go('dashboard');
+      })
       .catch(err => {
+        if (miEpoch !== _selectCursoEpoch) return;
         console.error('[v9] recargarCursoV9 falló:', err);
-        go('dashboard');  // navegar de todas formas con los datos en memoria
+        // No navegar al dashboard con datos del curso anterior.
+        // Volver al selector para que el usuario pueda reintentar.
+        if (appEl) {
+          appEl.innerHTML = '<div style="padding:32px"><div style="color:var(--r);margin-bottom:12px">⚠️ No se pudieron cargar los datos del curso. Inténtalo de nuevo.</div>'
+            + '<button class="btn" onclick="go(\'selector\')">← Volver al selector</button></div>';
+        }
       });
     return;
   }
   // ── FIN FLUJO RELACIONAL v9 ───────────────────────────────────────────
+  S.cursoId = id;
   go('dashboard');
 }
 

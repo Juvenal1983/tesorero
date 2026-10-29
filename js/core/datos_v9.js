@@ -239,6 +239,8 @@ function _mapCuota(row) {
 function _mapPago(row) {
   return {
     id:          row.id,
+    // Ambos campos: la UI legacy usa alumnoId, datos_v9 usa aluId.
+    alumnoId:    row.alumno_id,
     aluId:       row.alumno_id,
     cuotaId:     row.cuota_id,
     monto:       row.monto,
@@ -249,7 +251,7 @@ function _mapPago(row) {
     obs:         row.obs,
     creadoPor:   row.creado_por,
     _v9: true,
-    _cuentaId:   row.cuenta_id,  // guardado para operaciones de cleanup
+    _cuentaId:   row.cuenta_id,
   };
 }
 
