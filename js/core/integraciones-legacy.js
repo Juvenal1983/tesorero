@@ -42,9 +42,10 @@ async function buscarUsuarioLegacyPorEmail(email, authUserId){
   }catch(e){}
 
   // 3) Fallback completo: escanear todos los registros buscando el email
-  //    (cubre usuarios creados antes de la migración a Supabase Auth)
+  //    (cubre usuarios invitados cuyos datos viven en el registro del tesorero principal)
+  //    Usa limit=1000 y ordena por actualizado_en para priorizar registros recientes
   try{
-    const todos = await sbGet('tesorero_datos','select=usuario_id,datos');
+    const todos = await sbGet('tesorero_datos','select=usuario_id,datos&limit=1000&order=actualizado_en.desc');
     if(Array.isArray(todos)){
       for(const row of todos){
         if(!row.datos) continue;
