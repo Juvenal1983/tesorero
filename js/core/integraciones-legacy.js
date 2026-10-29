@@ -81,18 +81,19 @@ async function loginConAuth(email, errEl){
     // y omitir completamente el blob tesorero_datos.
     if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
       try {
-        const { cuenta, cuentaId, cursoIds } = await cargarSesionV9(
+        const { cuenta, cuentaId, cursoIds, esDelegado, rolEfectivo } = await cargarSesionV9(
           authData.user.id,
           _authToken
         );
         const usuarioV9 = {
-          id:       cuentaId,          // PK de tesorero_cuentas (UUID)
-          authId:   authData.user.id,
-          email:    cuenta.email || email,
-          nombre:   cuenta.nombre || email,
-          rol:      'tesorero',
-          cursoIds: cursoIds,
-          _v9:      true,
+          id:          cuentaId,          // PK de tesorero_cuentas (UUID)
+          authId:      authData.user.id,
+          email:       cuenta.email || email,
+          nombre:      cuenta.nombre || email,
+          rol:         rolEfectivo || 'tesorero',
+          cursoIds,
+          esDelegado:  !!esDelegado,
+          _v9:         true,
         };
         _finalizarLoginV9(usuarioV9, errEl, cursoIds);
         return true;

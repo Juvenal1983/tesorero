@@ -36,7 +36,9 @@ Object.defineProperty(previewStorage, Symbol.iterator, {
   }
 });
 
-let _authToken = null; // Token JWT de Supabase Auth — se actualiza al login
+let _authToken = null;    // Token JWT de Supabase Auth — se actualiza al login
+let _v9SessionId = 0;     // Epoch de sesión v9 — se incrementa al logout/nuevo-login
+                          // para descartar fetches en vuelo de sesiones anteriores
 
 // DEMO vacío: en producción no existe data/demo.json
 // Se usa solo como fallback seguro cuando la DB local está vacía

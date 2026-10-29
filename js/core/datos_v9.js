@@ -26,6 +26,10 @@ function _v9BaseUrl() {
  * El anon key sólo se usa como fallback (lectura pública con RLS restringida).
  */
 async function _v9Fetch(path, opts = {}, accessToken) {
+  // Capturar epoch de sesión antes del await; si cambia durante el fetch,
+  // la sesión fue cerrada y la respuesta debe descartarse.
+  const _snapSession = (typeof _v9SessionId !== 'undefined') ? _v9SessionId : 0;
+
   const base = _v9BaseUrl();
   const token = accessToken || (typeof _authToken !== 'undefined' && _authToken) || SUPA_KEY;
   const url = base + path;
@@ -39,6 +43,13 @@ async function _v9Fetch(path, opts = {}, accessToken) {
   };
 
   const res = await fetch(url, { ...opts, headers });
+
+  // Si la sesión cambió mientras esperábamos la respuesta, descartarla.
+  if (typeof _v9SessionId !== 'undefined' && _snapSession !== _v9SessionId) {
+    const stale = new Error('[datos_v9] Sesión cambiada durante el fetch — respuesta descartada.');
+    stale._staleSession = true;
+    throw stale;
+  }
 
   if (!res.ok) {
     let body = '';
@@ -256,26 +267,98 @@ function _mapPago(row) {
 }
 
 /**
- * Carga todos los datos necesarios para una sesión relacional y los vuelca en DB.
- * Se llama desde acceso.js en lugar de loadFromCloud() cuando V9_RELACIONAL === true.
+ * Carga las membresías de un usuario en usuarios_cuenta.
+ * Un usuario invitado tiene filas aquí pero NO es propietario en tesorero_cuentas.
+ * Devuelve array de membresías activas, o [] si no hay.
  *
- * @param {string} authId  — auth.uid() del usuario (S.session.authId)
- * @param {string} accessToken — JWT del usuario
- * @param {string} [cursoId]  — curso activo inicial (opcional, para pre-cargar)
- * @returns {{ cuenta, cursoIds }} para que _finalizarLogin pueda construir S.session
+ * Columnas esperadas en usuarios_cuenta:
+ *   id, cuenta_id, user_auth_id, rol, curso_id (nullable), activo
+ */
+async function cargarMembresiasUsuario(authId, accessToken) {
+  try {
+    const rows = await _v9Fetch(
+      `/usuarios_cuenta?user_auth_id=eq.${encodeURIComponent(authId)}&activo=eq.true&select=*`,
+      {}, accessToken
+    );
+    return Array.isArray(rows) ? rows : [];
+  } catch (e) {
+    if (e._staleSession) throw e;
+    // La tabla puede no existir aún en staging; devolver [] para no bloquear el login.
+    console.warn('[datos_v9] cargarMembresiasUsuario falló (¿tabla no creada?):', e.message);
+    return [];
+  }
+}
+
+/**
+ * Carga todos los datos necesarios para una sesión relacional y los vuelca en DB.
+ * Soporta dos roles:
+ *   - Propietario: aparece en tesorero_cuentas con auth_id = authId.
+ *   - Delegado:    aparece en usuarios_cuenta con user_auth_id = authId;
+ *                  puede tener restricción por curso (campo curso_id).
+ *
+ * @param {string} authId        — auth.uid() del usuario
+ * @param {string} accessToken   — JWT del usuario
+ * @param {string} [cursoId]     — curso activo inicial (opcional)
+ * @returns {{ cuenta, cuentaId, cursoIds, esDelegado, rolEfectivo }}
  */
 async function cargarSesionV9(authId, accessToken, cursoId) {
-  // 1. Cuenta
-  const cuenta = await cargarCuenta(authId, accessToken);
-  if (!cuenta) throw new Error('[datos_v9] Usuario sin cuenta relacional. Ejecuta el seed de staging.');
+  // 1. ¿Propietario de una cuenta?
+  let cuenta = await cargarCuenta(authId, accessToken);
+  let cuentaId;
+  let esDelegado = false;
+  let rolEfectivo = 'tesorero';
+  let cursosFiltro = null; // null = sin restricción; array = lista blanca de cursos permitidos
 
-  const cuentaId = cuenta.id;
+  if (cuenta) {
+    cuentaId = cuenta.id;
+  } else {
+    // 1b. No es propietario — buscar membresías en usuarios_cuenta
+    const membresias = await cargarMembresiasUsuario(authId, accessToken);
+    if (!membresias || membresias.length === 0) {
+      throw new Error(
+        '[datos_v9] Usuario sin cuenta relacional ni membresías activas. ' +
+        'Ejecuta el seed de staging e inserta al usuario en usuarios_cuenta.'
+      );
+    }
 
-  // 2. Cursos activos
+    // Elegir la primera membresía activa (si hubiera varias, el selector de cuenta
+    // se implementaría aquí; lo dejamos como pendiente explícito).
+    const membresia = membresias[0];
+    cuentaId = membresia.cuenta_id;
+    esDelegado = true;
+    rolEfectivo = membresia.rol || 'lector';
+
+    // La RLS de tesorero_cuentas debe permitir SELECT al delegado para leer el nombre/email.
+    // Si no lo permite, usamos un placeholder y continuamos.
+    try {
+      const cuentasRows = await _v9Fetch(
+        `/tesorero_cuentas?id=eq.${encodeURIComponent(cuentaId)}&select=id,nombre,email&limit=1`,
+        {}, accessToken
+      );
+      cuenta = Array.isArray(cuentasRows) && cuentasRows.length > 0 ? cuentasRows[0] : null;
+    } catch (e) {
+      if (e._staleSession) throw e;
+      console.warn('[datos_v9] No se pudo leer tesorero_cuentas del propietario (RLS?):', e.message);
+    }
+    if (!cuenta) cuenta = { id: cuentaId, nombre: 'Cuenta delegada', email: '' };
+
+    // Restricción de cursos: si la membresía tiene curso_id, sólo ese curso.
+    if (membresia.curso_id) {
+      cursosFiltro = membresias
+        .filter(m => m.cuenta_id === cuentaId && m.curso_id)
+        .map(m => m.curso_id);
+      if (cursosFiltro.length === 0) cursosFiltro = null;
+    }
+  }
+
+  // 2. Cursos activos (RLS ya filtra por cuenta_id vía JWT)
   const cursosRaw = await cargarCursos(cuentaId, accessToken);
-  DB.cursos = cursosRaw.map(_mapCurso);
+  const cursosFiltrados = cursosFiltro
+    ? cursosRaw.filter(c => cursosFiltro.includes(c.id))
+    : cursosRaw;
+  DB.cursos = cursosFiltrados.map(_mapCurso);
 
-  const primerCursoId = cursoId || (cursosRaw[0] && cursosRaw[0].id) || null;
+  const primerCursoId = cursoId || (cursosFiltrados[0] && cursosFiltrados[0].id) || null;
 
   // 3. Alumnos del primer curso (se recargan al cambiar de curso en selectCurso)
   if (primerCursoId) {
@@ -306,7 +389,9 @@ async function cargarSesionV9(authId, accessToken, cursoId) {
   return {
     cuenta,
     cuentaId,
-    cursoIds: cursosRaw.map(c => c.id),
+    cursoIds:    cursosFiltrados.map(c => c.id),
+    esDelegado,
+    rolEfectivo,
   };
 }
 

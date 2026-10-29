@@ -1320,9 +1320,23 @@ function logoutLector(){
 }
 
 async function logout(){
+  // ── v9: invalidar epoch ANTES del signOut para que los fetches en vuelo
+  //        detecten la sesión caducada cuando resuelvan y se descarten.
+  if (typeof _v9SessionId !== 'undefined') { _v9SessionId++; }
+  // Incrementar epoch de selectCurso para descartar respuestas en vuelo
+  if (typeof _selectCursoEpoch !== 'undefined') { _selectCursoEpoch++; }
+
   try{
     if(authClient){ await authClient.auth.signOut(); }
   }catch(e){}
+
+  // Limpiar token y estado de sesión (propietario y delegado)
+  if (typeof _authToken !== 'undefined') { _authToken = null; }
+  S.session     = null;
+  S.cursoId     = null;
+  S.route       = 'login';
+  S._v9CuentaId = null;
+
   // Cierra sesión del tesorero y borra TODO
   previewStorage.removeItem('tesorero_saved_email');
   previewStorage.removeItem('tesorero_saved_pass');
@@ -1331,7 +1345,6 @@ async function logout(){
   previewStorage.removeItem('tesorero_ap_cursoId');
   previewStorage.removeItem('tesorero_ap_aluId');
   previewStorage.removeItem('tesorero_ap_pin');
-  S.session=null; S.cursoId=null; S.route='login';
   DB={}; initDB(); render();
 }
 

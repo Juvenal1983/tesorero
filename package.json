@@ -7,7 +7,8 @@
     "test:rls":  "node tests/03_rls_cliente.js",
     "test:noprod": "node tests/04_verifica_no_produccion.js",
     "test:ui":   "node tests/05_prueba_funcional_ui.js",
-    "test:all":  "node tests/03_rls_cliente.js && node tests/04_verifica_no_produccion.js && node tests/05_prueba_funcional_ui.js"
+    "test:delegado": "node tests/06_acceso_delegado.js",
+    "test:all":  "node tests/03_rls_cliente.js && node tests/04_verifica_no_produccion.js && node tests/05_prueba_funcional_ui.js && node tests/06_acceso_delegado.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",

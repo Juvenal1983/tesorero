@@ -40,15 +40,16 @@ document.addEventListener('DOMContentLoaded', async function iniciarApp() {
         // ── FLUJO RELACIONAL v9 ──────────────────────────────────────────
         if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
           try {
-            const { cuenta, cuentaId, cursoIds } = await cargarSesionV9(authId, _authToken);
+            const { cuenta, cuentaId, cursoIds, esDelegado, rolEfectivo } = await cargarSesionV9(authId, _authToken);
             const usuarioV9 = {
-              id:       cuentaId,
+              id:         cuentaId,
               authId,
-              email:    cuenta.email || email,
-              nombre:   cuenta.nombre || email,
-              rol:      'tesorero',
+              email:      cuenta.email || email,
+              nombre:     cuenta.nombre || email,
+              rol:        rolEfectivo || 'tesorero',
               cursoIds,
-              _v9:      true,
+              esDelegado: !!esDelegado,
+              _v9:        true,
             };
             S.session     = usuarioV9;
             S._v9CuentaId = cuentaId;

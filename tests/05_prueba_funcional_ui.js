@@ -211,6 +211,27 @@ async function navegarAPagos(page) {
     console.log('  [ok] V9_RELACIONAL === true');
 
     // ══════════════════════════════════════════════════════════════════════════
+    // PASO 2B — DB relacional inmediatamente tras login (sin selectCurso aún)
+    // Confirma que cargarSesionV9 pobló DB.cursos/alumnos/pagos ANTES de que
+    // _setUserKeyV9 (o setUserKey) pudiera sobreescribirlos.
+    // ══════════════════════════════════════════════════════════════════════════
+    console.log('\n[Paso 2B] DB relacional inmediatamente tras login…');
+    const dbTrasLogin = await page.evaluate(() => ({
+      cursos:  (typeof DB !== 'undefined' ? DB.cursos  || [] : []).length,
+      alumnos: (typeof DB !== 'undefined' ? DB.alumnos || [] : []).length,
+      pagos:   (typeof DB !== 'undefined' ? DB.pagos   || [] : []).length,
+      v9CuentaId: (typeof S !== 'undefined' ? S._v9CuentaId : null),
+    }));
+    if (dbTrasLogin.cursos < 1) {
+      throw new Error(`[FALLO] DB.cursos vacío tras login (${dbTrasLogin.cursos}). ` +
+        'Indica que setUserKey sobreescribió DB o cargarSesionV9 no se ejecutó.');
+    }
+    if (!dbTrasLogin.v9CuentaId) {
+      throw new Error('[FALLO] S._v9CuentaId nulo tras login — sesión v9 incompleta.');
+    }
+    console.log(`  [ok] DB.cursos=${dbTrasLogin.cursos} alumnos=${dbTrasLogin.alumnos} pagos=${dbTrasLogin.pagos} v9CuentaId=${dbTrasLogin.v9CuentaId}`);
+
+    // ══════════════════════════════════════════════════════════════════════════
     // PASO 3 — Verificar cursos cargados
     // ══════════════════════════════════════════════════════════════════════════
     console.log('\n[Paso 3] DB.cursos desde tablas…');
@@ -464,6 +485,24 @@ async function navegarAPagos(page) {
     const pagoEnMemoria = await page.evaluate((obs) => {
       return (typeof DB !== 'undefined' ? DB.pagos || [] : []).find(p => p.obs === obs) || null;
     }, OBS_UNICA);
+
+    // Verificar también DB.cursos y DB.alumnos tras la recarga
+    const dbTrasRecarga = await page.evaluate(() => ({
+      cursos:     (typeof DB !== 'undefined' ? DB.cursos  || [] : []).length,
+      alumnos:    (typeof DB !== 'undefined' ? DB.alumnos || [] : []).length,
+      v9CuentaId: (typeof S !== 'undefined' ? S._v9CuentaId : null),
+    }));
+    if (dbTrasRecarga.cursos < 1) {
+      throw new Error(`[FALLO] DB.cursos vacío tras recarga (${dbTrasRecarga.cursos}). ` +
+        'Indica que setUserKey sobreescribió DB al restaurar sesión.');
+    }
+    if (dbTrasRecarga.alumnos < 1) {
+      throw new Error(`[FALLO] DB.alumnos vacío tras recarga (${dbTrasRecarga.alumnos}).`);
+    }
+    if (!dbTrasRecarga.v9CuentaId) {
+      throw new Error('[FALLO] S._v9CuentaId nulo tras recarga — sesión v9 no restaurada.');
+    }
+    console.log(`  [ok] DB relacional tras recarga: cursos=${dbTrasRecarga.cursos} alumnos=${dbTrasRecarga.alumnos} v9CuentaId=${dbTrasRecarga.v9CuentaId}`);
 
     if (!pagoEnMemoria) {
       throw new Error('[FALLO] Pago no encontrado en DB.pagos tras recarga');
