@@ -34,7 +34,7 @@ function renderPagos(){
         <div class="card" style="margin-bottom:14px">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px">
             <div class="card-title" style="margin:0">${escHtml(q.nombre)} <span class="badge ${q.tipo==='mensual'?'bgb':'bga'}" style="margin-left:6px">${q.tipo}</span></div>
-            <button class="btn bp bs" style="font-size:13px" onclick="showModal('addPago',{aluId:'${sel}',cuotaId:'${q.id}'})">+ Registrar pago</button>
+            ${puedeEscribir()?`<button class="btn bp bs" style="font-size:13px" onclick="showModal('addPago',{aluId:'${sel}',cuotaId:'${q.id}'})">+ Registrar pago</button>`:''}
           </div>
           <div class="tbl-wrap">
           <table>
@@ -49,7 +49,11 @@ function renderPagos(){
                   <td style="color:var(--t3);font-size:12px;white-space:nowrap">${pago?fmtDate(pago.fecha):'—'}</td>
                   <td style="color:var(--t3);font-size:12px;white-space:nowrap">${pago?escHtml(pago.medio):'—'}</td>
                   <td style="white-space:nowrap">${(()=>{
-                    if(pago) return `<div style="display:flex;gap:4px"><button class="btn bs" onclick="showModal('editPago',{pagoId:'${pago.id}'})" title="Editar pago" style="font-size:11px;padding:3px 7px">✏️</button><button class="btn bs bd" onclick="delPago('${pago.id}')" title="Eliminar pago" style="font-size:11px;padding:3px 7px">✕</button></div>`;
+                    if(pago) {
+                      if(puedeEscribir()) return `<div style="display:flex;gap:4px"><button class="btn bs" onclick="showModal('editPago',{pagoId:'${pago.id}'})" title="Editar pago" style="font-size:11px;padding:3px 7px">✏️</button><button class="btn bs bd" onclick="delPago('${pago.id}')" title="Eliminar pago" style="font-size:11px;padding:3px 7px">✕</button></div>`;
+                      return ''; // visor: pago registrado pero sin controles de edición
+                    }
+                    if(!puedeEscribir()) return ''; // visor: sin pago y sin botón de registrar
                     const plan = getPlanPago('${sel}','${q.id}','${periodo}');
                     if(plan){
                       const pagados = plan.abonos.filter(a=>a.pagado).length;

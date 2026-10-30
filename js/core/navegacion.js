@@ -158,14 +158,14 @@ function renderShell(){
             ${esActivo?'<span style="margin-left:auto;font-size:10px;color:var(--gm)">●</span>':''}
           </div>`;
         }).join('')}
-        <div class="nav-item" onclick="showModal('addCursoModal')" style="color:var(--gm);border:1px dashed var(--gm);margin-top:4px;border-radius:8px;font-size:12.5px">
+        ${puedeEscribir()?`<div class="nav-item" onclick="showModal('addCursoModal')" style="color:var(--gm);border:1px dashed var(--gm);margin-top:4px;border-radius:8px;font-size:12.5px">
           <span class="nav-icon" style="font-size:13px">＋</span>Agregar ${V('grupo').toLowerCase()}
-        </div>` : ''}
+        </div>`:''}` : ''}
       </div>
       <div class="sidebar-footer">
         <div class="user-row">
           <div class="avatar">${initials(usr.nombre)}</div>
-          <div><div class="user-name">${escHtml(usr.nombre)}</div><div class="user-role">${isLector?'Apoderado lector':usr.rol==='superadmin'?'Superadmin':'Tesorero'}</div></div>
+          <div><div class="user-name">${escHtml(usr.nombre)}</div><div class="user-role">${isLector?'Apoderado lector':usr.rol==='superadmin'?'Superadmin':usr.rol==='admin'?'Administrador':usr.rol==='editor'?'Editor':usr.rol==='visor'?'Visor':'Tesorero'}</div></div>
           <button class="btn bs" onclick="logout()" style="margin-left:auto;padding:4px 8px;font-size:11px" title="Salir">↩</button>
         </div>
       </div>

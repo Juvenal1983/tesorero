@@ -54,6 +54,23 @@ let DB = {};
 
 function getUser(){ return S.session; }
 
+/**
+ * Retorna true si el usuario activo tiene permiso de escritura
+ * (registrar pagos, editar, eliminar).
+ *
+ * Roles con escritura: 'tesorero', 'admin', 'editor', 'superadmin'.
+ * Roles de solo lectura: 'visor', 'apoderado_lector'.
+ *
+ * No refleja los permisos exactos de cada tabla en RLS — esa validación
+ * ocurre en el servidor. Esta función solo controla la visibilidad de
+ * controles en la UI para evitar operaciones que el servidor rechazaría.
+ */
+function puedeEscribir() {
+  const rol = S.session && S.session.rol;
+  if (!rol) return false;
+  return ['tesorero', 'admin', 'editor', 'superadmin'].includes(rol);
+}
+
 // ── Supabase helpers ─────────────────────────────────
 async function sbFetch(path, opts={}){
   const token = _authToken || SUPA_KEY;

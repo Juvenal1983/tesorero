@@ -206,16 +206,16 @@ ON CONFLICT (cuenta_id, id) DO NOTHING;
 -- PK: (cuenta_id, id TEXT). Columnas: curso_id, nombre, monto, anio, activa.
 -- No existen columnas descripcion ni fecha_vencimiento.
 
-INSERT INTO cuotas (cuenta_id, id, curso_id, nombre, monto, anio, activa)
+INSERT INTO cuotas (cuenta_id, id, curso_id, nombre, tipo, monto, anio, activa)
 VALUES
   ('00000000-0000-0000-aaaa-000000000001'::uuid,
-   'cuota-a-01', 'cur-a-01', 'Cuota marzo 2025',  15000, 2025, true),
+   'cuota-a-01', 'cur-a-01', 'Cuota marzo 2025',  'mensual', 15000, 2025, true),
   ('00000000-0000-0000-aaaa-000000000001'::uuid,
-   'cuota-a-02', 'cur-a-01', 'Cuota abril 2025',  15000, 2025, true),
+   'cuota-a-02', 'cur-a-01', 'Cuota abril 2025',  'mensual', 15000, 2025, true),
   ('00000000-0000-0000-aaaa-000000000001'::uuid,
-   'cuota-a-03', 'cur-a-02', 'Cuota marzo 2025',  12000, 2025, true),
+   'cuota-a-03', 'cur-a-02', 'Cuota marzo 2025',  'mensual', 12000, 2025, true),
   ('00000000-0000-0000-bbbb-000000000002'::uuid,
-   'cuota-b-01', 'cur-b-01', 'Matrícula 2025',    50000, 2025, true)
+   'cuota-b-01', 'cur-b-01', 'Matrícula 2025',    'anual',   50000, 2025, true)
 ON CONFLICT (cuenta_id, id) DO NOTHING;
 
 -- ── Pagos ─────────────────────────────────────────────────────

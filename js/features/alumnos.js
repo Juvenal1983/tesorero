@@ -13,7 +13,7 @@ function renderAlumnos(){
   return `
   <div class="page-hdr">
     <div class="page-title">${V('miembros')} del ${V('grupo').toLowerCase()}</div>
-    <button class="btn bp" onclick="showModal('addAlumno')">+ Agregar ${V('miembro')}</button>
+    ${puedeEscribir()?`<button class="btn bp" onclick="showModal('addAlumno')">+ Agregar ${V('miembro')}</button>`:''}
   </div>
   <div class="card" style="margin-bottom:14px;padding:12px 18px;display:flex;flex-wrap:wrap;gap:12px;align-items:center">
     <div><span style="font-size:22px;font-weight:800;color:var(--g)">${all.filter(a=>a.estado==='activo').length}</span><span style="font-size:13px;color:var(--t3);margin-left:6px">activos</span></div>
@@ -64,9 +64,9 @@ function renderAlumnos(){
             </td>
             <td><span style="color:var(--t3);font-size:13px">${aps.length} apoderado${aps.length!==1?'s':''}</span></td>
             <td style="white-space:nowrap">
-              <button class="btn bs" onclick="showModal('editAlumno',{id:'${a.id}'})">✏️</button>
+              ${puedeEscribir()?`<button class="btn bs" onclick="showModal('editAlumno',{id:'${a.id}'})">✏️</button>`:''}
               <button class="btn bs" onclick="showModal('apoderadosAlumno',{id:'${a.id}'})">👤</button>
-              <button class="btn bs bd" onclick="delAlumno('${a.id}')">🗑</button>
+              ${puedeEscribir()?`<button class="btn bs bd" onclick="delAlumno('${a.id}')">🗑</button>`:''}
             </td>
           </tr>`;
         }).join('')}
