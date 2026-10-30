@@ -91,7 +91,10 @@ SQL Editor del proyecto staging. Ejecutar.
   `_check_cuota_cambio_curso`, `_check_plan_cambio_titular`
 - 7 triggers sobre `pagos`, `planes_pago`, `abonos`, `alumnos`, `cuotas`
 
-Total de funciones en `public`: 46 (10 de negocio + 36 de pgcrypto).
+Total de funciones en `public` (instalación local de referencia): 46
+(10 de negocio + 36 de `pgcrypto`). En Supabase, `pgcrypto` puede
+instalarse en el schema `extensions` en lugar de `public`; el recuento
+de funciones en `public` varía según la configuración del proyecto.
 
 ### Paso 2 — Ejecutar `02_rls.sql`
 
@@ -252,50 +255,75 @@ Resultado esperado: 0 filas (todas con RLS habilitado).
 
 ---
 
-## Asimetría curso_id=NULL en membresías no-dueños
+## Asimetría curso_id=NULL y permisos reales por tabla
 
 El seed v3 crea Usuario A como tesorero en Cuenta B con `curso_id=NULL`.
-Esto produce un comportamiento **asimétrico** entre lecturas y escrituras:
 
 ### Lecturas (políticas SELECT)
 
 `get_mis_cursos(cuenta_b)` filtra `WHERE curso_id IS NOT NULL`.
-Con `curso_id=NULL`, A obtiene 0 filas de esta función para Cuenta B.
+Con `curso_id=NULL`, A obtiene 0 filas de esa función para Cuenta B.
 
 Las políticas `cursos_select`, `alumnos_select`, `cuotas_select`, etc.
-dependen de `get_mis_cursos()` para miembros no-dueños. Resultado: A
-**no ve ninguna fila** de cursos, alumnos ni cuotas de Cuenta B.
+dependen de `get_mis_cursos()` para miembros no-dueños. Resultado: **A
+no ve ninguna fila** de cursos, alumnos ni cuotas de Cuenta B.
 
-### Escrituras (políticas INSERT / UPDATE / DELETE)
+### Escrituras — los permisos dependen de cada tabla
 
-`tiene_rol_en_curso()` incluye la condición:
+Las políticas de escritura no son uniformes. `tiene_rol_en_curso()` evalúa
+`AND (curso_id = p_curso_id OR curso_id IS NULL)`, lo que amplía el alcance
+de A mientras tenga `curso_id=NULL`, pero **solo en las tablas cuya política
+ya permite el rol `tesorero`**. Cursos y cuotas no están entre ellas:
+
+| Tabla | INSERT | UPDATE | DELETE |
+|---|---|---|---|
+| `cursos` | `es_dueno` únicamente | `es_dueno` únicamente | `es_dueno` únicamente |
+| `alumnos` | `es_dueno` **o** `tiene_rol_en_curso` [admin,editor,tesorero] | igual | `es_dueno` únicamente |
+| `cuotas` | `es_dueno` únicamente | `es_dueno` únicamente | `es_dueno` únicamente |
+| `pagos` | `es_dueno` **o** `tiene_rol_en_curso` [admin,tesorero] | igual | igual |
+| `abonos` | `es_dueno` **o** `tiene_rol_en_curso` [admin,tesorero] | igual | `es_dueno` únicamente |
+| `planes_pago` | `es_dueno` **o** `tiene_rol_en_curso` [admin,tesorero] | igual | `es_dueno` únicamente |
+
+Rol **visor** (como C en Cuenta A): ninguna política de escritura incluye
+`'visor'` en su array de roles. C puede leer su curso asignado pero
+**no puede insertar, actualizar ni eliminar ningún dato**.
+
+### Con `curso_id=NULL` (seed puro, sin fixture 09c)
+
+A no ve ninguna fila por SELECT en Cuenta B. En las tablas que permiten
+`tesorero` (alumnos INSERT/UPDATE, pagos y abonos INSERT/UPDATE/DELETE),
+el `OR curso_id IS NULL` hace que A pueda operar sobre **cualquier curso
+de B**, aunque no pueda leer las filas resultantes. Cursos y cuotas
+permanecen fuera del alcance de A en todo caso.
+
+### Con `curso_id=cur-b-01` (después de fixture 09c)
+
+A ve cur-b-01 vía `get_mis_cursos()` y puede leer sus alumnos, cuotas
+y pagos. Los permisos de escritura quedan acotados a cur-b-01.
+
+### Verificar con identidad A simulada
+
+Las consultas que usan `auth.uid()` deben ejecutarse **con identidad A
+activa**, no como superuser. Como superuser, RLS no se aplica y los
+resultados no reflejan lo que ve A en producción. Estructura requerida:
+
 ```sql
-AND (curso_id = p_curso_id OR curso_id IS NULL)
+BEGIN;
+SELECT set_config('request.jwt.claims',
+  '{"sub":"<UUID_A>","role":"authenticated"}', true);
+SET LOCAL ROLE authenticated;
+-- consultas aquí
+ROLLBACK;
 ```
-El `OR curso_id IS NULL` convierte NULL en "alcance general":
-A **puede INSERT, UPDATE y DELETE en cualquier curso de Cuenta B**,
-sin importar cuál sea el `p_curso_id` evaluado.
-
-### Resumen
-
-| Operación | uc-a-en-b (curso_id=NULL) |
-|---|---|
-| SELECT cursos/alumnos/cuotas de B | ❌ 0 filas (get_mis_cursos filtra NULL) |
-| INSERT/UPDATE/DELETE en cualquier curso de B | ✅ permitido (tiene_rol_en_curso acepta NULL) |
-
-**curso_id=NULL no es ausencia total de permisos.** Es una membresía con
-alcance general de escritura y sin visibilidad de lectura. Está documentado
-en `sql/09b_nota_uc_a_en_b.sql`.
 
 ### Impacto en test:03
 
-| Estado fixture 09c | Comportamiento de A en Cuenta B |
+| Estado fixture 09c | Comportamiento de A en Cuenta B como authenticated |
 |---|---|
-| **Sin 09c** (seed puro) | 0 cursos visibles; puede escribir en cualquier curso |
-| **Con 09c** (cur-b-01 asignado) | Ve cur-b-01; puede leer y escribir en ese curso |
+| **Sin 09c** (seed puro) | SELECT: 0 filas; alumnos/pagos INSERT/UPDATE: alcance general |
+| **Con 09c** (cur-b-01 asignado) | SELECT y escritura acotados a cur-b-01 |
 
-Test:03 debe verificar el escenario apropiado según qué fixtures se hayan
-ejecutado antes de los tests.
+Documentación detallada de permisos por tabla: `sql/09b_nota_uc_a_en_b.sql`.
 
 ---
 
@@ -344,7 +372,8 @@ con UUIDs `aaa…`, `bbb…`, `ccc…`).
 | Tablas en `public` | 18 |
 | Tablas en `_staging` | 1 |
 | Índices en `public` | 26 |
-| Funciones en `public` | 46 (10 de negocio + 36 de pgcrypto) |
+| Funciones de negocio en `public` | 10 (5 SECURITY DEFINER + 5 trigger) |
+| Funciones en `public` (instalación local) | 46 (10 de negocio + 36 de pgcrypto; en Supabase puede diferir) |
 | Triggers en `public` | 7 |
 | Políticas RLS | 62 |
 
@@ -358,35 +387,60 @@ con UUIDs `aaa…`, `bbb…`, `ccc…`).
 | `08_seed_staging.sql` | `Seed OK (v3): 2 cuentas | 3 membresías | 5 alumnos | 4 cuotas | 2 pagos | 1 planes | 1 abonos` — COMMIT |
 | `09_fixture_usuario_c.sql` | `Fixture OK: C (ccc…) → visor en Cuenta A, curso cur-a-01` — COMMIT |
 | `09c_fixture_uc_a_en_b_curso.sql` | `Fixture 09c OK: uc-a-en-b ahora tiene curso_id=cur-b-01` — COMMIT |
-| RLS C — cur-a-01 | C ve `cur-a-01` ✓, no ve `cur-a-02` ✓, no ve Cuenta B ✓ |
+| RLS C — cur-a-01 (como authenticated) | C ve `cur-a-01` ✓, no ve `cur-a-02` ✓, no ve Cuenta B ✓; sin permisos de escritura |
 
-### Log RLS como Usuario C (extracto real — BEGIN/ROLLBACK)
+### Log RLS como Usuario C (extracto real — BEGIN/ROLLBACK como `authenticated`)
+
+La prueba se ejecutó con identidad C simulada dentro de una transacción.
+Las consultas sin identidad activa omiten RLS y no son representativas.
+
+```
+Comando: sudo -u postgres psql tesorero_test2
+```
 
 ```sql
 BEGIN;
+
 SELECT set_config('request.jwt.claims',
-  '{"sub":"cccccccc-cccc-cccc-cccc-cccccccccccc","role":"authenticated"}', true);
+  '{"sub":"cccccccc-cccc-cccc-cccc-cccccccccccc","role":"authenticated"}',
+  true);
+--  set_config → {"sub":"cccc...","role":"authenticated"}
+
+SELECT (NULLIF(current_setting('request.jwt.claims',true),'')::jsonb->>'sub')::uuid
+  AS uid_simulado;
+--  cccccccc-cccc-cccc-cccc-cccccccccccc
+
 SET LOCAL ROLE authenticated;
 
--- cursos visibles para C en Cuenta A:
+-- cursos visibles para C en Cuenta A (solo cur-a-01):
 SELECT id, nombre FROM cursos
 WHERE cuenta_id = '00000000-0000-0000-aaaa-000000000001';
---  cur-a-01 | 1° Básico A   ← solo este curso
+--    id    |   nombre
+--  cur-a-01 | 1° Básico A
+--  (1 row)
 
--- alumnos visibles para C:
+-- alumnos visibles para C (solo los del cur-a-01):
 SELECT id, nombres, curso_id FROM alumnos
 WHERE cuenta_id = '00000000-0000-0000-aaaa-000000000001';
---  alu-a-01 | Sofía  | cur-a-01
---  alu-a-02 | Matías | cur-a-01
+--    id    | nombres | curso_id
+--  alu-a-01 | Sofía   | cur-a-01
+--  alu-a-02 | Matías  | cur-a-01
+--  (2 rows)
 
--- cursos de Cuenta B (C no tiene membresía en B):
+-- cursos de Cuenta B — C no tiene membresía en B:
 SELECT id FROM cursos
 WHERE cuenta_id = '00000000-0000-0000-bbbb-000000000002';
 --  (0 rows)
 
 -- get_mis_cursos() para C en Cuenta A:
 SELECT * FROM get_mis_cursos('00000000-0000-0000-aaaa-000000000001');
+--  curso_id
 --  cur-a-01
+--  (1 row)
 
 ROLLBACK;
 ```
+
+C (visor) ve únicamente los alumnos de su curso asignado. Rol `visor` no
+aparece en ninguna política de escritura; no puede insertar, actualizar
+ni eliminar datos.
