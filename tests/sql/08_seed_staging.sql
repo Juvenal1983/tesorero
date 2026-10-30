@@ -1,4 +1,21 @@
 -- =============================================================================
+-- ⚠️  OBSOLETO — NO USAR
+-- Este archivo usa ON CONFLICT (id) con claves simples y no tiene aserciones
+-- de identidad ni de relaciones. Corresponde al seed del esquema simplificado
+-- (tests/sql/01_ddl_staging.sql), no al esquema v9 validado.
+--
+-- Archivo correcto (usar en lugar de este):
+--   sql/08_seed_staging.sql  — seed v3 con claves compuestas (cuenta_id, id),
+--                              validación de UUIDs en auth.users,
+--                              aserciones de recuento, identidad y relaciones.
+--
+-- Fixture adicional para Usuario C:
+--   sql/09_fixture_usuario_c.sql
+--
+-- Procedimiento de instalación: ver docs/INSTALL_STAGING.md
+-- =============================================================================
+-- CONTENIDO ORIGINAL CONSERVADO SOLO COMO REFERENCIA HISTÓRICA
+-- =============================================================================
 -- 08_seed_staging.sql — Datos ficticios para tests (STAGING ÚNICAMENTE)
 --
 -- ⚠️  NUNCA ejecutar en producción (https://tmjqzaakzhecbldebyeg.supabase.co)

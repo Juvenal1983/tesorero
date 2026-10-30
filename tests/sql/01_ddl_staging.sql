@@ -1,4 +1,19 @@
 -- =============================================================================
+-- ⚠️  OBSOLETO — NO USAR
+-- Este archivo contiene un esquema simplificado con PRIMARY KEY (id) simples
+-- y sin triggers ni funciones SECURITY DEFINER. NO corresponde al esquema
+-- v9 validado ("El Gran Cambio").
+--
+-- Archivos correctos (usar en lugar de este):
+--   sql/01_schema.sql          — esquema v9 con claves compuestas (cuenta_id, id)
+--   sql/02_rls.sql             — políticas RLS v5
+--   sql/07_grants_supabase.sql — grants con verificación automática v3
+--   sql/08_seed_staging.sql    — seed con aserciones de identidad y relaciones v3
+--
+-- Procedimiento de instalación: ver docs/INSTALL_STAGING.md
+-- =============================================================================
+-- CONTENIDO ORIGINAL CONSERVADO SOLO COMO REFERENCIA HISTÓRICA
+-- =============================================================================
 -- 01_ddl_staging.sql — Esquema v9 + RLS para El Tesorero (STAGING ÚNICAMENTE)
 --
 -- ⚠️  NUNCA ejecutar en producción (https://tmjqzaakzhecbldebyeg.supabase.co)
