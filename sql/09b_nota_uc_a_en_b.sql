@@ -1,44 +1,74 @@
 -- ============================================================
 -- El Tesorero — "El Gran Cambio" v9
--- Archivo: sql/09b_nota_uc_a_en_b.sql  (v1)
+-- Archivo: sql/09b_nota_uc_a_en_b.sql  (v2)
 -- Propósito: Documentar el comportamiento de la membresía
 --            uc-a-en-b (Usuario A como tesorero en Cuenta B,
---            curso_id=NULL) y confirmar qué ve A en Cuenta B.
+--            curso_id=NULL) y confirmar qué ve y qué puede
+--            escribir A en Cuenta B.
 --
 -- NO MODIFICA DATOS. Solo ejecuta consultas explicativas.
 -- Requiere: 08_seed_staging.sql ya ejecutado.
 --
--- ANÁLISIS:
---   En 08_seed_staging.sql, Usuario A es insertado como tesorero
---   en Cuenta B con curso_id=NULL.
+-- ============================================================
+-- ANÁLISIS DE LA ASIMETRÍA curso_id=NULL
+-- ============================================================
 --
+-- El seed v3 crea uc-a-en-b con curso_id=NULL.
+-- Esto produce un comportamiento ASIMÉTRICO entre lecturas y escrituras:
+--
+-- --- LECTURAS (política SELECT) ---
 --   get_mis_cursos(cuenta_b) filtra WHERE curso_id IS NOT NULL.
---   → A obtiene 0 cursos de Cuenta B vía get_mis_cursos().
+--   → A obtiene 0 filas de get_mis_cursos() para Cuenta B.
 --
 --   La política cursos_select verifica:
---     cuenta_id IN (get_mis_cuentas())   ← A sí tiene acceso a cuenta B
+--     cuenta_id IN (get_mis_cuentas())       ← A sí tiene acceso a Cuenta B
 --     AND (
---       es_dueno(cuenta_id)              ← A NO es dueño de B
---       OR id IN (get_mis_cursos(...))   ← vacío para A en B
+--       es_dueno(cuenta_id)                  ← A NO es dueño de B
+--       OR id IN (get_mis_cursos(cuenta_id)) ← 0 cursos para A en B
 --     )
---   → A no ve ningún curso de B.
+--   → A no ve ningún curso de B bajo RLS SELECT.
 --
--- DECISIÓN DE DISEÑO (no es un bug):
---   curso_id=NULL en un rol no-dueño significa "membresía registrada
---   sin asignación de curso". A puede aparecer en la lista de miembros
---   de B (uc_select lo permite), pero no accede a datos de cursos.
---   Para que A acceda a un curso de B, se le debe asignar curso_id
---   explícitamente (como en 09_fixture_usuario_c.sql para C en A).
+--   Lo mismo aplica a alumnos_select, cuotas_select, pagos_select, etc.:
+--   todos dependen de get_mis_cursos() para miembros no-dueños.
 --
--- IMPACTO EN TESTS:
---   test:03 verifica que A ve cursos de Cuenta B.
---   Con la membresía actual (curso_id=NULL), ese test FALLARÁ
---   para la verificación de acceso a cursos de B.
---   Opciones:
---     a) Actualizar el test para reflejar el comportamiento real.
---     b) Crear un fixture adicional que asigne un curso_id a uc-a-en-b.
---     c) Cambiar test:03 para verificar membresía, no visibilidad de cursos.
---   La decisión la toma el equipo; este archivo documenta el estado.
+-- --- ESCRITURAS (políticas INSERT / UPDATE / DELETE) ---
+--   tiene_rol_en_curso(p_cuenta_id, p_curso_id, p_roles) verifica:
+--     AND (curso_id = p_curso_id OR curso_id IS NULL)
+--   → El OR curso_id IS NULL hace que NULL sea "alcance general":
+--     A con curso_id=NULL PUEDE escribir en CUALQUIER curso de Cuenta B.
+--
+--   Resultado: A puede INSERT, UPDATE y DELETE en cursos, alumnos,
+--   cuotas, pagos de Cuenta B —en cualquier curso— pero no puede
+--   leer las filas resultantes por RLS SELECT.
+--
+-- --- RESUMEN ---
+--   curso_id=NULL NO es ausencia total de permisos.
+--   Es una membresía con alcance general de escritura y sin visibilidad
+--   de lectura (por diseño del filtro get_mis_cursos).
+--
+--   Escenario real:            SELECT  INSERT/UPDATE/DELETE
+--   uc-a-en-b (NULL)       →   0 filas   cualquier curso de B
+--   uc-c-visor-a (cur-a-01) →  cur-a-01  solo cur-a-01
+--
+-- --- SOLUCIÓN para visibilidad completa ---
+--   Asignar un curso_id explícito a uc-a-en-b.
+--   Ver: sql/09c_fixture_uc_a_en_b_curso.sql
+--   Ese fixture asigna cur-b-01 y permite a A ver y operar ese curso.
+--
+-- --- IMPACTO EN TESTS ---
+--   test:03 — dos variantes según estado del fixture 09c:
+--
+--   SIN 09c (seed puro, curso_id=NULL):
+--     - A aparece en usuarios_cuenta de B (uc_select lo permite)
+--     - get_mis_cursos(cuenta_b) → 0 filas para A
+--     - A puede escribir en cualquier curso de B (INSERT/UPDATE/DELETE pasan)
+--     - test:03 debe verificar membresía de A en B, NO visibilidad de cursos
+--
+--   CON 09c (curso_id=cur-b-01):
+--     - A ve cur-b-01 en Cuenta B (get_mis_cursos retorna la fila)
+--     - A puede leer y escribir en cur-b-01
+--     - test:03 puede verificar acceso delegado completo (lectura + escritura)
+--
 -- ============================================================
 
 -- Verificación de estado actual (solo lectura):
@@ -48,10 +78,21 @@ SELECT
   uc.auth_id,
   uc.rol,
   uc.curso_id,
-  CASE WHEN uc.curso_id IS NULL
-    THEN 'SIN CURSO ASIGNADO — A no verá cursos de B por RLS'
-    ELSE 'Con curso asignado: ' || uc.curso_id
+  CASE
+    WHEN uc.curso_id IS NULL
+      THEN 'NULL = alcance general: ESCRIBE en cualquier curso de B, no ve cursos por SELECT'
+    ELSE
+      'Curso asignado: ' || uc.curso_id || ' — ve y escribe en ese curso'
   END AS nota_rls
 FROM usuarios_cuenta uc
 WHERE uc.id = 'uc-a-en-b'
   AND uc.cuenta_id = '00000000-0000-0000-bbbb-000000000002'::uuid;
+
+-- Confirmar qué cursos ve A en Cuenta B con get_mis_cursos():
+SELECT
+  'get_mis_cursos(Cuenta B) para A' AS consulta,
+  COALESCE(
+    (SELECT string_agg(curso_id, ', ' ORDER BY curso_id)
+     FROM get_mis_cursos('00000000-0000-0000-bbbb-000000000002'::uuid)),
+    '(ninguno — curso_id IS NULL en uc-a-en-b; ejecutar 09c para asignar cur-b-01)'
+  ) AS resultado;
