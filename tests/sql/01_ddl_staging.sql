@@ -193,26 +193,53 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON public.abonos               TO authentic
 -- RLS — habilitar y crear políticas
 -- =============================================================================
 
+-- =============================================================================
+-- Función helper SECURITY DEFINER (rompe ciclo RLS 42P17)
+-- Propietario: postgres (BYPASSRLS en Supabase) → subconsulta a tesorero_cuentas
+-- se ejecuta sin evaluar las políticas de esa tabla → sin recursión.
+-- SET search_path = public evita inyección por search_path.
+-- =============================================================================
+CREATE OR REPLACE FUNCTION public.es_propietario_cuenta(p_cuenta_id uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM   public.tesorero_cuentas
+        WHERE  id      = p_cuenta_id
+          AND  auth_id = auth.uid()
+    );
+$$;
+
+REVOKE EXECUTE ON FUNCTION public.es_propietario_cuenta(uuid) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.es_propietario_cuenta(uuid) FROM anon;
+GRANT  EXECUTE ON FUNCTION public.es_propietario_cuenta(uuid) TO authenticated;
+
 -- tesorero_cuentas ────────────────────────────────────────────────────────────
 ALTER TABLE public.tesorero_cuentas ENABLE ROW LEVEL SECURITY;
 
 -- Propietario ve y edita su propia fila
 CREATE POLICY "tc_propietario_select" ON public.tesorero_cuentas
-    FOR SELECT USING (auth.uid() = auth_id);
+    FOR SELECT TO authenticated USING (auth.uid() = auth_id);
 
 CREATE POLICY "tc_propietario_insert" ON public.tesorero_cuentas
-    FOR INSERT WITH CHECK (auth.uid() = auth_id);
+    FOR INSERT TO authenticated WITH CHECK (auth.uid() = auth_id);
 
 CREATE POLICY "tc_propietario_update" ON public.tesorero_cuentas
-    FOR UPDATE USING (auth.uid() = auth_id) WITH CHECK (auth.uid() = auth_id);
+    FOR UPDATE TO authenticated USING (auth.uid() = auth_id) WITH CHECK (auth.uid() = auth_id);
 
--- Delegado puede leer la fila del propietario (para obtener nombre/email de la cuenta)
+-- Delegado puede leer la fila del propietario (para obtener nombre/email de la cuenta).
+-- Esta política consulta usuarios_cuenta; uc_propietario_select ya usa
+-- es_propietario_cuenta() (SECURITY DEFINER) → sin recursión 42P17.
 CREATE POLICY "tc_delegado_select" ON public.tesorero_cuentas
-    FOR SELECT USING (
+    FOR SELECT TO authenticated USING (
         EXISTS (
             SELECT 1 FROM public.usuarios_cuenta uc
-            WHERE uc.cuenta_id = tesorero_cuentas.id
-              AND uc.auth_id   = auth.uid()
+            WHERE uc.cuenta_id   = tesorero_cuentas.id
+              AND uc.auth_id     = auth.uid()
               AND uc.desactivado = false
         )
     );
@@ -222,43 +249,28 @@ ALTER TABLE public.usuarios_cuenta ENABLE ROW LEVEL SECURITY;
 
 -- Cada delegado ve sólo sus propias filas
 CREATE POLICY "uc_delegado_select" ON public.usuarios_cuenta
-    FOR SELECT USING (auth.uid() = auth_id);
+    FOR SELECT TO authenticated USING (auth.uid() = auth_id);
 
--- El propietario ve todas las membresías de su cuenta
+-- El propietario ve / gestiona todas las membresías de su cuenta.
+-- Usan es_propietario_cuenta() — sin subconsulta directa a tesorero_cuentas
+-- → sin ciclo. Garantía: un delegado (auth_id ≠ propietario) NO satisface
+-- la función y no puede añadir ni modificar membresías.
 CREATE POLICY "uc_propietario_select" ON public.usuarios_cuenta
-    FOR SELECT USING (
-        EXISTS (
-            SELECT 1 FROM public.tesorero_cuentas tc
-            WHERE tc.id      = usuarios_cuenta.cuenta_id
-              AND tc.auth_id = auth.uid()
-        )
-    );
+    FOR SELECT TO authenticated
+    USING (public.es_propietario_cuenta(cuenta_id));
 
--- Propietario puede insertar / actualizar / borrar membresías de su cuenta
 CREATE POLICY "uc_propietario_insert" ON public.usuarios_cuenta
-    FOR INSERT WITH CHECK (
-        EXISTS (
-            SELECT 1 FROM public.tesorero_cuentas tc
-            WHERE tc.id      = usuarios_cuenta.cuenta_id
-              AND tc.auth_id = auth.uid()
-        )
-    );
+    FOR INSERT TO authenticated
+    WITH CHECK (public.es_propietario_cuenta(cuenta_id));
 
 CREATE POLICY "uc_propietario_update" ON public.usuarios_cuenta
-    FOR UPDATE
-    USING (EXISTS (SELECT 1 FROM public.tesorero_cuentas tc
-                   WHERE tc.id = usuarios_cuenta.cuenta_id AND tc.auth_id = auth.uid()))
-    WITH CHECK (EXISTS (SELECT 1 FROM public.tesorero_cuentas tc
-                        WHERE tc.id = usuarios_cuenta.cuenta_id AND tc.auth_id = auth.uid()));
+    FOR UPDATE TO authenticated
+    USING     (public.es_propietario_cuenta(cuenta_id))
+    WITH CHECK (public.es_propietario_cuenta(cuenta_id));
 
 CREATE POLICY "uc_propietario_delete" ON public.usuarios_cuenta
-    FOR DELETE USING (
-        EXISTS (
-            SELECT 1 FROM public.tesorero_cuentas tc
-            WHERE tc.id      = usuarios_cuenta.cuenta_id
-              AND tc.auth_id = auth.uid()
-        )
-    );
+    FOR DELETE TO authenticated
+    USING (public.es_propietario_cuenta(cuenta_id));
 
 -- Macro: política genérica para tablas operativas (cursos, alumnos, cuotas, pagos, abonos, …)
 -- La app filtra siempre por cuenta_id; RLS verifica que ese cuenta_id pertenece al JWT.
