@@ -27,6 +27,7 @@ function renderCuotas(){
   </div>`;
 }
 function delCuota(id){
+  if(!puedeEscribir()){ showToast('⛔ Sin permisos para eliminar cuotas','#E24B4A'); return; }
   if(!confirm('¿Eliminar esta cuota? Los pagos asociados también serán eliminados.')) return;
   DB.cuotas=(DB.cuotas||[]).filter(q=>q.id!==id);
   DB.pagos=(DB.pagos||[]).filter(p=>p.cuotaId!==id);

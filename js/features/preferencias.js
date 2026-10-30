@@ -77,6 +77,7 @@ function copiarCodigoCompartido(){
 }
 
 function generarCodigoCompartido(){
+  if(!puedeConfigurar()){ showToast('⛔ Sin permisos para gestionar códigos de acceso','#E24B4A'); return; }
   if(!confirm('¿Generar código de acceso compartido? Quien lo tenga verá TODA la información del curso.')) return;
   const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
   const seg = ()=>{ let s=''; for(let i=0;i<4;i++) s+=chars[Math.floor(Math.random()*chars.length)]; return s; };
@@ -91,6 +92,7 @@ function generarCodigoCompartido(){
 }
 
 function desactivarCodigoCompartido(){
+  if(!puedeConfigurar()){ showToast('⛔ Sin permisos para gestionar códigos de acceso','#E24B4A'); return; }
   if(!confirm('¿Desactivar el código compartido? Nadie más podrá entrar con él.')) return;
   const ci = (DB.cursos||[]).findIndex(c=>c.id===S.cursoId);
   if(ci>=0){

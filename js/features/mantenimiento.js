@@ -1,5 +1,6 @@
 // js/features/mantenimiento.js — extraído de la copia de demostración.
 function savePlantillaCfg(){
+  if(!puedeConfigurar()){ showToast('⛔ Sin permisos para modificar plantillas','#E24B4A'); return; }
   if(!DB.config) DB.config={};
   DB.config.plantillaPago = document.getElementById('cfg-plantilla').value.trim();
   saveDB();
@@ -7,6 +8,7 @@ function savePlantillaCfg(){
   go('config');
 }
 function resetPlantillaCfg(){
+  if(!puedeConfigurar()){ showToast('⛔ Sin permisos para modificar plantillas','#E24B4A'); return; }
   if(!confirm('¿Eliminar la plantilla personalizada y volver al mensaje original?')) return;
   if(DB.config) delete DB.config.plantillaPago;
   saveDB();
@@ -52,6 +54,7 @@ function intentarMigracion(){
 }
 
 function migrarNuevoAnio(){
+  if(!puedeConfigurar()){ showToast('⛔ Sin permisos para esta operación','#E24B4A'); return; }
   const cur = getCurso();
   if(!cur){ alert('No hay curso activo.'); return; }
   const anioActual = cur.anio || new Date().getFullYear();

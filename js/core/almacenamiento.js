@@ -71,6 +71,47 @@ function puedeEscribir() {
   return ['tesorero', 'admin', 'editor', 'superadmin'].includes(rol);
 }
 
+/** true si el usuario activo es visor */
+function esVisor() {
+  return !!(S.session && S.session.rol === 'visor');
+}
+
+/** true si el usuario es de solo lectura (visor o apoderado_lector) */
+function esSoloLectura() {
+  return !puedeEscribir();
+}
+
+/**
+ * true si puede acceder a configuración de cuenta/curso.
+ * Roles habilitados: tesorero, admin, superadmin.
+ * El editor puede editar datos pero no la configuración de cuenta.
+ */
+function puedeConfigurar() {
+  const rol = S.session && S.session.rol;
+  if (!rol) return false;
+  return ['tesorero', 'admin', 'superadmin'].includes(rol);
+}
+
+/**
+ * true si puede exportar respaldos completos de la cuenta.
+ * Deshabilitado para visor mientras se define el alcance de exportación autorizada.
+ */
+function puedeExportarDatos() {
+  const rol = S.session && S.session.rol;
+  if (!rol) return false;
+  return ['tesorero', 'admin', 'superadmin'].includes(rol);
+}
+
+/** true si puede registrar/editar/eliminar movimientos (ingresos y gastos) */
+function puedeGestionarMovimientos() {
+  return puedeEscribir();
+}
+
+/** true si puede iniciar envíos de cobranza (WhatsApp, masivo) */
+function puedeEnviarCobranza() {
+  return puedeEscribir();
+}
+
 // ── Supabase helpers ─────────────────────────────────
 async function sbFetch(path, opts={}){
   const token = _authToken || SUPA_KEY;

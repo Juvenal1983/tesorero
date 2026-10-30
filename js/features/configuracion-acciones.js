@@ -1,5 +1,6 @@
 // js/features/configuracion-acciones.js — extraído de la copia de demostración.
 function saveDatosBancarios(){
+  if(!puedeConfigurar()){ showToast('⛔ Sin permisos para modificar los datos bancarios','#E24B4A'); return; }
   const ci = (DB.cursos||[]).findIndex(c=>c.id===S.cursoId);
   if(ci<0) return;
   DB.cursos[ci].banco = {

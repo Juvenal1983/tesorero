@@ -21,6 +21,7 @@ function getCobranzaEstados(){
 }
 
 function setCobranzaEstado(alumnoId, estado, nota){
+  if(!puedeEnviarCobranza()){ showToast('⛔ Sin permisos para actualizar estado de cobranza','#E24B4A'); return; }
   if(!DB.config) DB.config = {};
   if(!DB.config.cobranzaEstados) DB.config.cobranzaEstados = {};
   DB.config.cobranzaEstados[alumnoId] = {

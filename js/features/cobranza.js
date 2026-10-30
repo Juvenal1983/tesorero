@@ -61,10 +61,10 @@ function renderCobranza(){
             ${d.ultimoContacto?`<span style="font-size:11px;color:var(--t3)">Último contacto: ${fmtDate(d.ultimoContacto)}</span>`:''}
           </div>
           <div style="display:flex;gap:6px;flex-wrap:wrap">
-            <a href="${wsUrl}" target="_blank" class="btn bp" style="font-size:12px;padding:6px 10px;text-decoration:none;border:none">💬 WhatsApp</a>
+            ${puedeEnviarCobranza()?`<a href="${wsUrl}" target="_blank" class="btn bp" style="font-size:12px;padding:6px 10px;text-decoration:none;border:none">💬 WhatsApp</a>`:''}
             ${tel?`<a href="tel:+56${tel.replace(/^56/,'')}" class="btn bs" style="font-size:12px;padding:6px 10px;text-decoration:none">📞 Llamar</a>`:''}
-            <button class="btn bs" onclick="copiarMsgCobranza('${d.alu.id}','${plantillaActiva}')" style="font-size:12px;padding:6px 10px">📋 Copiar</button>
-            <button class="btn bs" onclick="showModal('accionCobranza',{alumnoId:'${d.alu.id}'})" style="font-size:12px;padding:6px 10px">⚙️ Acción</button>
+            ${puedeEnviarCobranza()?`<button class="btn bs" onclick="copiarMsgCobranza('${d.alu.id}','${plantillaActiva}')" style="font-size:12px;padding:6px 10px">📋 Copiar</button>`:''}
+            ${puedeEnviarCobranza()?`<button class="btn bs" onclick="showModal('accionCobranza',{alumnoId:'${d.alu.id}'})" style="font-size:12px;padding:6px 10px">⚙️ Acción</button>`:''}
           </div>
         </div>`;
       }).join('');
@@ -74,7 +74,7 @@ function renderCobranza(){
     <div class="page-title">💬 Cobranza</div>
     <div style="display:flex;gap:6px">
       <button class="btn bs" onclick="actualizarCobranza(this)" style="font-size:12px">↻ Actualizar</button>
-      <button class="btn bp" onclick="recordatorioMasivo('${plantillaActiva}')" style="background:#D97706;border:none">📢 Masivo</button>
+      ${puedeEnviarCobranza()?`<button class="btn bp" onclick="recordatorioMasivo('${plantillaActiva}')" style="background:#D97706;border:none">📢 Masivo</button>`:''}
     </div>
   </div>
 
@@ -151,6 +151,7 @@ function copiarMsgCobranza(alumnoId, tipoPlantilla){
 }
 
 function recordatorioMasivo(tipoPlantilla){
+  if(!puedeEnviarCobranza()){ showToast('⛔ Sin permisos para enviar cobranza','#E24B4A'); return; }
   const deudores = getDeudores().filter(d=>d.estado==='pendiente'||d.estado==='pospuesto');
   if(!deudores.length){ alert('No hay deudores pendientes de contactar.'); return; }
   // Abrir panel paso a paso en vez de bucle automático

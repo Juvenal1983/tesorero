@@ -2,6 +2,27 @@
 function renderConfig(){
   const cur = getCurso();
   const usr = S.session;
+
+  // ── Visor: acceso restringido ────────────────────────────────────────────
+  if (esVisor()) {
+    const col = (DB.colegios||[]).find(c=>c.id===cur.colegioId);
+    return `
+    <div class="page-hdr"><div class="page-title">Configuración</div></div>
+    <div class="card" style="text-align:center;padding:36px 24px">
+      <div style="font-size:48px;margin-bottom:12px">🔒</div>
+      <div style="font-size:17px;font-weight:800;color:var(--t1);margin-bottom:8px">Acceso restringido</div>
+      <div style="font-size:14px;color:var(--t3);margin-bottom:20px;max-width:320px;margin-left:auto;margin-right:auto">
+        El rol <strong>Visor</strong> tiene acceso de solo lectura. La configuración de la cuenta y del curso está reservada al administrador.
+      </div>
+      <div style="background:var(--gl);border-radius:12px;padding:16px 20px;display:inline-block;text-align:left;margin:0 auto">
+        <div style="font-size:12px;color:var(--t3);font-weight:700;margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">Curso activo</div>
+        <div style="font-size:15px;font-weight:700;color:var(--t1)">${escHtml(cur.nombre||'')} · ${cur.anio||''}</div>
+        ${col?`<div style="font-size:13px;color:var(--t3);margin-top:2px">${escHtml(col.nombre||'')}</div>`:''}
+      </div>
+    </div>`;
+  }
+  // ────────────────────────────────────────────────────────────────────────
+
   const misCursos = (DB.cursos||[]).filter(c=>(usr.cursoIds||[]).includes(c.id));
   const colegiosMap = {};
   (DB.colegios||[]).forEach(c=>colegiosMap[c.id]=c);

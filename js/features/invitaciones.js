@@ -4,6 +4,7 @@ function copyCodigo(){
   navigator.clipboard?.writeText(cur.codigo||'').then(()=>alert('Código copiado: '+cur.codigo)).catch(()=>alert('Código: '+cur.codigo));
 }
 function regenCodigo(){
+  if(!puedeConfigurar()){ showToast('⛔ Sin permisos para regenerar el código de acceso','#E24B4A'); return; }
   if(!confirm('¿Regenerar el código? El anterior dejará de funcionar.')) return;
   const ci=(DB.cursos||[]).findIndex(c=>c.id===S.cursoId);
   if(ci>=0){ const rnd=Math.random().toString(36).slice(2,6).toUpperCase(); DB.cursos[ci].codigo=`${DB.cursos[ci].nombre.slice(0,2).toUpperCase().replace(/\s/,'')}${DB.cursos[ci].anio}-${rnd}`; }

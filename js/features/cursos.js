@@ -124,6 +124,7 @@ function confirmarQuitarCurso(cursoId){
 }
 
 function cambiarTipoOrg(tipo){
+  if(!puedeConfigurar()){ showToast('⛔ Sin permisos para modificar la configuración','#E24B4A'); return; }
   if(!DB.config) DB.config={};
   DB.config.tipoOrg = tipo;
   // Aplicar meses por defecto del vocabulario al curso activo
@@ -141,6 +142,7 @@ function cambiarTipoOrg(tipo){
 }
 
 function saveAppUrl(){
+  if(!puedeConfigurar()){ showToast('⛔ Sin permisos para modificar la configuración','#E24B4A'); return; }
   const url = document.getElementById('cfg-app-url').value.trim().replace(/\/$/, '');
   if(!url){ alert('Ingresa la URL de tu app en Netlify.'); return; }
   if(!url.startsWith('http')){ alert('La URL debe comenzar con https://'); return; }
@@ -152,6 +154,7 @@ function saveAppUrl(){
 }
 
 function saveCfg(){
+  if(!puedeConfigurar()){ showToast('⛔ Sin permisos para modificar la configuración','#E24B4A'); return; }
   const cur=getCurso();
   const col=(DB.colegios||[]).find(c=>c.id===cur.colegioId);
   if(col) col.nombre=document.getElementById('cfg-colegio').value||col.nombre;

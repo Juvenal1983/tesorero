@@ -60,11 +60,19 @@ function renderShell(){
   const cur = getCurso();
   const usr = S.session;
   const isLector = usr.rol === 'apoderado_lector';
+  const isVisor  = usr.rol === 'visor';
   const navItems = isLector ? [
     {r:'dashboard',icon:'📊',label:'Resumen'},
     {r:'movimientos',icon:'💸',label:'Movimientos'},
     {r:'reportes',icon:'📄',label:'Reportes'},
     {r:'mis-datos',icon:'👤',label:'Mis datos'}
+  ] : isVisor ? [
+    {r:'dashboard',icon:'📊',label:'Resumen'},
+    {r:'alumnos',icon:'👥',label:V('miembros')},
+    {r:'cuotas',icon:'💳',label:'Cuotas'},
+    {r:'pagos',icon:'✅',label:'Pagos'},
+    {r:'movimientos',icon:'💸',label:'Movimientos'},
+    {r:'reportes',icon:'📄',label:'Reportes'}
   ] : [
     {r:'dashboard',icon:'📊',label:'Resumen'},
     {r:'alumnos',icon:'👥',label:V('miembros')},
@@ -113,11 +121,11 @@ function renderShell(){
             ${esActivo?'<span style="margin-left:auto;color:var(--gm)">●</span>':''}
           </div>`;
         }).join('')}
-        <div onclick="showModal('addCursoModal');closeMasMenu()"
+        ${puedeEscribir()?`<div onclick="showModal('addCursoModal');closeMasMenu()"
           style="display:flex;align-items:center;gap:14px;padding:12px 22px;cursor:pointer;border-bottom:1px solid #f0efea;color:var(--gm)">
           <span style="font-size:18px">➕</span>
           <div style="font-size:14px;font-weight:600">Agregar ${V('grupo').toLowerCase()}</div>
-        </div>` : ''}
+        </div>`:''}` : ''}
       <div onclick="${isLector?'logoutLector':'logout'}();closeMasMenu()"
         style="display:flex;align-items:center;gap:14px;padding:14px 22px;cursor:pointer;color:var(--r);font-weight:600;border-top:2px solid var(--brd);margin-top:4px">
         <span style="font-size:20px">↩</span>
@@ -174,7 +182,7 @@ function renderShell(){
       <div class="topbar">
         <div class="topbar-title">${routeLabels[S.route]||''}</div>
         <div class="topbar-right">
-          ${isLector?'<span class="badge bgt">Solo lectura</span>':''}
+          ${(isLector||isVisor)?'<span class="badge bgt">Solo lectura</span>':''}
           ${isLector?'<button onclick="logoutLector()" style="background:var(--r);border:none;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:700;color:#fff;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 8px rgba(226,75,74,0.3)">↩ Salir</button>':''}
           <span class="badge bgg" style="display:none" id="install-badge" onclick="doInstall()" style="cursor:pointer">📲 Instalar app</span>
         </div>

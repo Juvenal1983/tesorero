@@ -1,5 +1,6 @@
 // js/features/respaldos.js — extraído de la copia de demostración.
 function exportarDatosConFecha(){
+  if(!puedeExportarDatos()){ showToast('⛔ Exportación de respaldos no disponible para este rol','#E24B4A'); return; }
   exportarDatos();
   previewStorage.setItem('tesorero_ultimo_respaldo', new Date().toISOString());
   const msg = document.getElementById('export-msg');
@@ -11,6 +12,7 @@ function exportarDatosConFecha(){
 }
 
 function exportarDatos(){
+  if(!puedeExportarDatos()){ showToast('⛔ Exportación de respaldos no disponible para este rol','#E24B4A'); return; }
   const userId = getUsuarioId();
   const datos = datosDelUsuario(userId);
   const json = JSON.stringify(datos, null, 2);
@@ -24,6 +26,7 @@ function exportarDatos(){
 }
 
 function importarDatos(e){
+  if(!puedeExportarDatos()){ showToast('⛔ Importación de datos no disponible para este rol','#E24B4A'); return; }
   const file = e.target.files[0];
   if(!file) return;
   const reader = new FileReader();
@@ -62,6 +65,7 @@ function importarDatos(e){
 }
 
 function saveCuenta(){
+  if(!puedeConfigurar()){ showToast('⛔ Sin permisos para modificar datos de cuenta','#E24B4A'); return; }
   const nombre = document.getElementById('cfg-usr-nombre').value.trim();
   const email  = document.getElementById('cfg-usr-email').value.trim().toLowerCase();
   const pass   = document.getElementById('cfg-usr-pass').value;

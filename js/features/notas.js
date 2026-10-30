@@ -73,6 +73,7 @@ function mostrarFormNota(){
 }
 
 function guardarNota(){
+  if(!puedeEscribir()){ showToast('⛔ El rol Visor no puede crear notas','#E24B4A'); return; }
   DB.notas = DB.notas || [];
   const texto = (document.getElementById('nota-texto')?.value||'').trim();
   if(!texto){ alert('Escribe algo antes de guardar.'); return; }
@@ -83,6 +84,7 @@ function guardarNota(){
 }
 
 function eliminarNota(id){
+  if(!puedeEscribir()){ showToast('⛔ El rol Visor no puede eliminar notas','#E24B4A'); return; }
   if(!confirm('¿Eliminar esta nota?')) return;
   DB.notas = (DB.notas||[]).filter(n=>n.id!==id);
   saveDB();
@@ -90,6 +92,7 @@ function eliminarNota(id){
 }
 
 function fijarNota(id){
+  if(!puedeEscribir()){ showToast('⛔ El rol Visor no puede fijar notas','#E24B4A'); return; }
   DB.notas = (DB.notas||[]).map(n=> n.id===id ? {...n, fijada:!n.fijada} : n);
   saveDB();
   renderPage();
@@ -119,6 +122,7 @@ function cancelarEdicionNota(id){
 }
 
 function guardarEdicionNota(id){
+  if(!puedeEscribir()){ showToast('⛔ El rol Visor no puede editar notas','#E24B4A'); return; }
   const nuevoTexto = (document.getElementById('edit-'+id)?.value||'').trim();
   if(!nuevoTexto){ alert('La nota no puede estar vacía.'); return; }
   DB.notas = (DB.notas||[]).map(n=> n.id===id ? {...n, texto:nuevoTexto} : n);

@@ -1,6 +1,7 @@
 // js/features/movimientos.js — extraído de la copia de demostración.
 function renderMovimientos(){
-  const isLector = S.session.rol==='apoderado_lector';
+  // isLector: rol apoderado_lector o visor → solo lectura en movimientos
+  const isLector = !puedeGestionarMovimientos();
   const busq = (S.params.busqMov||'').toLowerCase().trim();
   const filtroTipo = S.params.filtroMov || 'todos';
   let movs = getMovs(isLector);
@@ -97,6 +98,7 @@ function renderMovimientos(){
   </div>`;
 }
 function delMov(id){
+  if(!puedeGestionarMovimientos()){ showToast('⛔ Sin permisos para eliminar movimientos','#E24B4A'); return; }
   if(!confirm('¿Eliminar este movimiento?')) return;
   DB.movimientos=(DB.movimientos||[]).filter(m=>m.id!==id);
   saveDB(); go('movimientos');
@@ -183,6 +185,7 @@ function modalEditMov(data){
 }
 
 function saveEditMov(id){
+  if(!puedeGestionarMovimientos()){ showToast('⛔ Sin permisos para editar movimientos','#E24B4A'); return; }
   const m=(DB.movimientos||[]).find(x=>x.id===id);
   if(!m) return;
   const desc=document.getElementById('em-desc').value.trim();
