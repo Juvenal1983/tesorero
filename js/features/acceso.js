@@ -1603,7 +1603,7 @@ function _v9RenderAlumnosSelector(busq) {
   }
 
   cont.innerHTML = lista.map(f => `
-    <div class="ap-alumno-card" onclick="_v9SeleccionarAlumno('${f.alumno_id}',${JSON.stringify(f.nombre||'')},this)"
+    <div class="ap-alumno-card" onclick="_v9SeleccionarAlumno('${f.alumno_id}','${(f.nombre||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'")}',this)"
       style="display:flex;align-items:center;gap:12px;padding:12px 14px;border:1.5px solid var(--brd);border-radius:10px;cursor:pointer;transition:.15s"
       onmouseover="this.style.borderColor='var(--gm)'"
       onmouseout="if(!this.classList.contains('selected'))this.style.borderColor='var(--brd)'">
