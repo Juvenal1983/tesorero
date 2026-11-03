@@ -966,26 +966,15 @@ function doVerificarCodigo(){
     return;
   }
 
-  // Buscar primero en DB local
-  const cursoLocal = (DB.cursos||[]).find(c=>c.codigo===code&&c.activo);
-  if(cursoLocal){
-    errEl.style.display='none';
-    _cursoTempId = cursoLocal.id;
-    document.getElementById('paso-codigo').style.display='none';
-    document.getElementById('paso-alumno').style.display='';
-    document.getElementById('paso2-curso-nombre').textContent = cursoLocal.nombre+' · '+cursoLocal.anio;
-    const lbl = document.getElementById('label-busq-miembro');
-    if(lbl) lbl.textContent = 'Buscar '+V('miembro').toLowerCase()+'/a';
-    renderAlumnosSelector('');
-    return;
-  }
-
-  // No encontrado localmente — buscar en Supabase
+  // Siempre buscar en Supabase para obtener datos frescos (PINs actualizados, alumnos nuevos).
+  // El código compartido ya fue validado arriba; aquí solo llegan códigos de curso con PIN.
   errEl.style.display='none';
   const btn = document.querySelector('#paso-codigo .btn.bp');
   if(btn){ btn.textContent='Buscando...'; btn.disabled=true; }
 
   // Usar siempre la anon key para apoderados (no necesitan auth)
+  // Se busca en Supabase siempre — incluso si el curso está en caché local —
+  // para garantizar que los PINs y datos de alumnos estén actualizados.
   fetch(SUPA_URL+'/rest/v1/tesorero_datos?select=datos&usuario_id=neq.landing_visitas&usuario_id=neq.colegios_chile&usuario_id=neq.global&usuario_id=neq.ap_lector',{
     headers:{'apikey':SUPA_KEY,'Authorization':'Bearer '+SUPA_KEY}
   }).then(r=>r.json()).then(rows=>{
@@ -1012,13 +1001,15 @@ function doVerificarCodigo(){
       }
       const c = d.cursos.find(x=>x.codigo===code&&x.activo);
       if(!c) continue;
-      // Encontrado — cargar datos del tesorero en DB
+      // Encontrado — cargar datos frescos del tesorero en DB (incluye PINs actualizados)
       mergeDB(d);
       _cursoTempId = c.id;
       errEl.style.display='none';
       document.getElementById('paso-codigo').style.display='none';
       document.getElementById('paso-alumno').style.display='';
       document.getElementById('paso2-curso-nombre').textContent = c.nombre+' · '+c.anio;
+      const lbl = document.getElementById('label-busq-miembro');
+      if(lbl) lbl.textContent = 'Buscar '+V('miembro').toLowerCase()+'/a';
       renderAlumnosSelector('');
       return;
     }
