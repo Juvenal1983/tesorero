@@ -15,17 +15,28 @@
 --   pgcrypto disponible (instalado en 01_schema.sql)
 --
 -- REVOCACIÓN DE ACCESO:
---   a) Cambiar cursos.codigo → las nuevas sesiones no encuentran el curso;
---      las sesiones en memoria del tab siguen activas hasta reload.
---      Para revocación inmediata: desactivar el curso (cursos.activo=FALSE).
---   b) Desactivar curso (cursos.activo=FALSE) → todos los RPC que validan
---      vigencia retornan error inmediatamente en la siguiente llamada.
---      Diferencia con cambiar codigo: la desactivación afecta a TODOS
---      los flujos del curso (tesorero, editor, etc.), no solo a apoderados.
---   c) Eliminar/cambiar pin_hash en alumnos_credenciales → el RPC rechaza
+--   El flujo privado usa código-de-curso SOLO para el selector inicial
+--   (apoderado_alumnos_curso); una vez que el apoderado obtuvo cuenta_id +
+--   alumno_id puede llamar a los RPC restantes directamente, sin pasar por
+--   el selector. Por eso cambiar el código NO revoca sesiones activas.
+--
+--   a) Cambiar cursos.codigo → los nuevos ingresos no encuentran el curso
+--      en el selector. Las sesiones que ya tienen cuenta_id+alumno_id+PIN
+--      en memoria del navegador siguen activas indefinidamente (incluso si
+--      el apoderado recarga la página y reescribe el PIN a mano).
+--      NO es un mecanismo de revocación confiable.
+--   b) Desactivar curso (cursos.activo=FALSE) → TODOS los RPC (acceso,
+--      editar, agregar, situación) verifican vigencia del curso en cada
+--      llamada y retornan 'alumno_inactivo' de inmediato.
+--      Revocación inmediata. Afecta a TODOS los flujos del curso.
+--   c) Eliminar o cambiar pin_hash en alumnos_credenciales → el RPC rechaza
 --      el PIN antiguo en la siguiente llamada. Revocación inmediata.
---   d) Cambiar alumnos.estado a 'inactivo' → el RPC valida estado en cada
---      llamada y rechaza acceso. Revocación inmediata.
+--      Solo afecta al alumno específico.
+--   d) Cambiar alumnos.estado a 'inactivo' → el RPC rechaza en la siguiente
+--      llamada. Revocación inmediata. Solo afecta al alumno específico.
+--
+--   RESUMEN: para revocar un alumno específico usar (c) o (d);
+--   para revocar un curso completo usar (b).
 --
 -- CONCURRENCIA EN INTENTOS:
 --   El incremento de intentos_fallo es atómico: INSERT ... ON CONFLICT DO UPDATE
@@ -68,6 +79,11 @@ CREATE TABLE IF NOT EXISTS apoderado_intentos (
 -- Los RPCs de abajo tienen SECURITY DEFINER y escriben directamente.
 REVOKE ALL ON apoderado_intentos FROM PUBLIC, anon, authenticated;
 GRANT ALL ON apoderado_intentos TO service_role;
+
+-- RLS habilitado como defensa en profundidad: ninguna política → acceso denegado
+-- por defecto para todos los roles que no sean propietario.
+-- Las funciones SECURITY DEFINER pasan como propietario y no están sujetas a RLS.
+ALTER TABLE apoderado_intentos ENABLE ROW LEVEL SECURITY;
 
 
 -- ══════════════════════════════════════════════════════════════
@@ -217,12 +233,17 @@ GRANT  EXECUTE ON FUNCTION _apoderado_verificar_pin(UUID, TEXT, TEXT) TO service
 -- RPC 2: Acceso con PIN — datos del alumno y contactos
 -- Volatilidad: VOLATILE (llama a _apoderado_verificar_pin que escribe)
 -- Retorna:
---   alumno: {id, nombre, estado, eximido}
---     — sin obs (interna), sin curso_id, sin cuenta_id
+--   alumno: {id, nombre, estado, eximido, curso_id}
+--     — sin obs (interna), sin cuenta_id
 --   apoderados: [{id, nombre, relacion, telefono, email}]
 --     — solo los de este alumno; sin estado interno
---   cuotas_estado: [{cuota_id, nombre, monto, periodo, estado_pago}]
---     — cuotas activas del curso; estado = pagado/pendiente/eximido
+--   cuotas_estado: [{cuota_id, nombre, monto, tipo, periodo, estado_pago}]
+--     — UNA FILA POR PAGO registrado (alumno+cuota+periodo).
+--     — Si la cuota tiene pagos en Marzo (pagado) y Abril (pendiente),
+--       devuelve dos filas con su estado individual.
+--     — Cuotas activas del curso sin ningún pago: una fila con periodo=NULL
+--       y estado_pago='pendiente'.
+--     — eximido: sobreescribe todos los estados del alumno.
 -- ══════════════════════════════════════════════════════════════
 CREATE OR REPLACE FUNCTION apoderado_acceso(
   p_cuenta_id UUID,
@@ -274,29 +295,30 @@ BEGIN
     AND ap.alumno_id = p_alumno_id
     AND ap.estado = 'activo';
 
-  -- Estado de cuotas activas del curso
-  -- eximido: si el alumno está eximido, todas las cuotas = 'eximido'
-  -- pagado: existe pago con estado='pagado' para ese alumno+cuota
-  -- pendiente: no hay pago
+  -- Estado de cuotas activas del curso — UNA FILA POR PAGO (granularidad por período).
+  -- Si la cuota tiene pagos en Marzo (pagado) y Abril (pendiente), retorna dos filas.
+  -- Cuotas sin ningún pago para este alumno: una fila con periodo=NULL y 'pendiente'.
+  -- eximido sobreescribe todos los estados si el alumno tiene ese flag.
   SELECT COALESCE(jsonb_agg(jsonb_build_object(
-    'cuota_id', c.id,
-    'nombre',   c.nombre,
-    'monto',    c.monto,
-    'tipo',     c.tipo,
+    'cuota_id',   c.id,
+    'nombre',     c.nombre,
+    'monto',      c.monto,
+    'tipo',       c.tipo,
+    'periodo',    p.periodo,
+    'pago_id',    p.id,
     'estado_pago', CASE
-      WHEN (SELECT eximido FROM alumnos WHERE cuenta_id=p_cuenta_id AND id=p_alumno_id) THEN 'eximido'
-      WHEN EXISTS(
-        SELECT 1 FROM pagos p
-        WHERE p.cuenta_id = p_cuenta_id
-          AND p.alumno_id = p_alumno_id
-          AND p.cuota_id  = c.id
-          AND p.estado    = 'pagado'
-      ) THEN 'pagado'
+      WHEN (SELECT eximido FROM alumnos
+            WHERE cuenta_id = p_cuenta_id AND id = p_alumno_id) THEN 'eximido'
+      WHEN p.id IS NOT NULL THEN COALESCE(p.estado, 'pendiente')
       ELSE 'pendiente'
     END
-  ) ORDER BY c.nombre), '[]'::jsonb)
+  ) ORDER BY c.nombre, p.periodo NULLS LAST), '[]'::jsonb)
   INTO v_cuotas
   FROM cuotas c
+  LEFT JOIN pagos p
+    ON  p.cuenta_id = c.cuenta_id
+    AND p.cuota_id  = c.id
+    AND p.alumno_id = p_alumno_id
   WHERE c.cuenta_id = p_cuenta_id
     AND c.curso_id  = v_curso_id
     AND c.activa    = TRUE;
@@ -319,11 +341,14 @@ GRANT  EXECUTE ON FUNCTION apoderado_acceso(UUID, TEXT, TEXT) TO anon;
 -- Retorna:
 --   pagos: [{id, monto, fecha, medio, estado, periodo, cuota_nombre}]
 --     — solo pagos de este alumno; sin obs ni creado_por
---   planes: [{id, periodo, monto_total, activo, abonos_count, monto_abonado}]
---     — solo planes de este alumno
---   comprobantes: [{id, desc, fecha, monto, comprobante_url}]
+--   planes: [{id, periodo, monto_total, activo, abonos_count, monto_abonado,
+--             abonos_pagados, monto_pagado, abonos_pendientes, monto_pendiente,
+--             abonos: [{id, monto, fecha, estado, pagado}]}]
+--     — solo planes de este alumno; con desglose de abonos pagados/pendientes
+--   comprobantes: [{id, desc, fecha, monto, tipo, comprobante_url}]
 --     — movimientos del curso con visible=TRUE y comprobante publicado
---     — son comprobantes del curso completo, no solo del alumno
+--   balance_curso: {total_ingresos, total_gastos, saldo}
+--     — suma de movimientos visibles del curso (autorizado para publicar)
 -- ══════════════════════════════════════════════════════════════
 CREATE OR REPLACE FUNCTION apoderado_situacion_financiera(
   p_cuenta_id UUID,
@@ -337,11 +362,12 @@ SECURITY DEFINER
 SET search_path = public, extensions
 AS $$
 DECLARE
-  v_result   TEXT;
-  v_pagos    JSONB;
-  v_planes   JSONB;
+  v_result       TEXT;
+  v_pagos        JSONB;
+  v_planes       JSONB;
   v_comprobantes JSONB;
-  v_curso_id TEXT;
+  v_balance      JSONB;
+  v_curso_id     TEXT;
 BEGIN
   v_result := _apoderado_verificar_pin(p_cuenta_id, p_alumno_id, p_pin);
 
@@ -368,22 +394,49 @@ BEGIN
   WHERE p.cuenta_id = p_cuenta_id
     AND p.alumno_id = p_alumno_id;
 
-  -- Planes de pago del alumno
+  -- Planes de pago del alumno con desglose de abonos pagados/pendientes.
+  -- abonos_pagados / monto_pagado: abonos con pagado=TRUE (cobrados).
+  -- abonos_pendientes / monto_pendiente: abonos con pagado=FALSE (registrados, pendiente cobro).
+  -- abonos: lista completa para que el apoderado vea el cronograma.
   SELECT COALESCE(jsonb_agg(jsonb_build_object(
-    'id',             pp.id,
-    'periodo',        pp.periodo,
-    'monto_total',    pp.monto_total,
-    'activo',         pp.activo,
-    'abonos_count',   (SELECT COUNT(*) FROM abonos ab WHERE ab.cuenta_id=p_cuenta_id AND ab.plan_id=pp.id),
-    'monto_abonado',  (SELECT COALESCE(SUM(ab.monto),0) FROM abonos ab WHERE ab.cuenta_id=p_cuenta_id AND ab.plan_id=pp.id AND ab.pagado=TRUE)
+    'id',                  pp.id,
+    'periodo',             pp.periodo,
+    'monto_total',         pp.monto_total,
+    'activo',              pp.activo,
+    'abonos_count',        (SELECT COUNT(*) FROM abonos ab
+                            WHERE ab.cuenta_id = p_cuenta_id AND ab.plan_id = pp.id),
+    'monto_abonado',       (SELECT COALESCE(SUM(ab.monto), 0) FROM abonos ab
+                            WHERE ab.cuenta_id = p_cuenta_id AND ab.plan_id = pp.id
+                              AND ab.pagado = TRUE),
+    'abonos_pagados',      (SELECT COUNT(*) FROM abonos ab
+                            WHERE ab.cuenta_id = p_cuenta_id AND ab.plan_id = pp.id
+                              AND ab.pagado = TRUE),
+    'monto_pagado',        (SELECT COALESCE(SUM(ab.monto), 0) FROM abonos ab
+                            WHERE ab.cuenta_id = p_cuenta_id AND ab.plan_id = pp.id
+                              AND ab.pagado = TRUE),
+    'abonos_pendientes',   (SELECT COUNT(*) FROM abonos ab
+                            WHERE ab.cuenta_id = p_cuenta_id AND ab.plan_id = pp.id
+                              AND ab.pagado = FALSE),
+    'monto_pendiente',     (SELECT COALESCE(SUM(ab.monto), 0) FROM abonos ab
+                            WHERE ab.cuenta_id = p_cuenta_id AND ab.plan_id = pp.id
+                              AND ab.pagado = FALSE),
+    'abonos',              (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                              'id',     ab.id,
+                              'monto',  ab.monto,
+                              'fecha',  ab.fecha,
+                              'estado', ab.estado,
+                              'pagado', ab.pagado
+                            ) ORDER BY ab.fecha), '[]'::jsonb)
+                            FROM abonos ab
+                            WHERE ab.cuenta_id = p_cuenta_id AND ab.plan_id = pp.id)
   ) ORDER BY pp.creado_en DESC), '[]'::jsonb)
   INTO v_planes
   FROM planes_pago pp
   WHERE pp.cuenta_id = p_cuenta_id
     AND pp.alumno_id = p_alumno_id;
 
-  -- Comprobantes publicados del curso (visible=TRUE y con URL de comprobante)
-  -- Son del curso, no exclusivos del alumno: reflejan gastos e ingresos publicados
+  -- Comprobantes publicados del curso (visible=TRUE y con URL de comprobante).
+  -- Son del curso, no exclusivos del alumno: reflejan ingresos/gastos publicados.
   SELECT COALESCE(jsonb_agg(jsonb_build_object(
     'id',              m.id,
     'desc',            m."desc",
@@ -399,10 +452,26 @@ BEGIN
     AND m.visible    = TRUE
     AND m.comprobante IS NOT NULL;
 
+  -- Balance autorizado del curso (solo movimientos visible=TRUE).
+  -- Es el balance que el tesorero eligió publicar; no incluye movimientos internos.
+  SELECT jsonb_build_object(
+    'total_ingresos', COALESCE(SUM(CASE WHEN m.tipo IN ('ingreso', 'aporte') THEN m.monto ELSE 0 END), 0),
+    'total_gastos',   COALESCE(SUM(CASE WHEN m.tipo IN ('gasto', 'egreso')   THEN m.monto ELSE 0 END), 0),
+    'saldo',          COALESCE(SUM(CASE WHEN m.tipo IN ('ingreso', 'aporte') THEN m.monto
+                                        WHEN m.tipo IN ('gasto', 'egreso')   THEN -m.monto
+                                        ELSE 0 END), 0)
+  )
+  INTO v_balance
+  FROM movimientos m
+  WHERE m.cuenta_id = p_cuenta_id
+    AND m.curso_id  = v_curso_id
+    AND m.visible   = TRUE;
+
   RETURN jsonb_build_object(
-    'pagos',         v_pagos,
-    'planes',        v_planes,
-    'comprobantes',  v_comprobantes
+    'pagos',          v_pagos,
+    'planes',         v_planes,
+    'comprobantes',   v_comprobantes,
+    'balance_curso',  v_balance
   );
 END;
 $$;
@@ -509,11 +578,9 @@ BEGIN
     RETURN jsonb_build_object('error', 'nombre_requerido');
   END IF;
 
-  -- ID sintético: 'apo-' + timestamp en microsegundos + alumno_id (sin guiones)
-  -- (epoch * 1e6)::bigint da microsegundos; ::bigint sin el factor daría solo segundos,
-  -- lo que colisionaría en inserciones concurrentes del mismo segundo.
-  v_nuevo_id := 'apo-' || (extract(epoch FROM clock_timestamp()) * 1000000)::bigint::text
-                || '-' || replace(p_alumno_id, '-', '');
+  -- ID basado en UUID: garantiza unicidad incluso entre conexiones concurrentes.
+  -- El prefijo 'apo-' mantiene compatibilidad con el formato textual de la app.
+  v_nuevo_id := 'apo-' || gen_random_uuid()::text;
 
   INSERT INTO apoderados (cuenta_id, id, alumno_id, nombre, relacion, telefono, email, estado)
   VALUES (p_cuenta_id, v_nuevo_id, p_alumno_id, trim(p_nombre), p_relacion, p_telefono, p_email, 'activo');

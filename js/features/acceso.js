@@ -941,6 +941,9 @@ if(!codigoObj) return err('Código de invitación inválido, ya utilizado o desa
 // Paso 1: verificar código y mostrar selector de alumno
 let _cursoTempId = null;
 function doVerificarCodigo(){
+  // ── v9: delegar al flujo relacional si la bandera está activa ──
+  if(typeof V9_RELACIONAL!=='undefined'&&V9_RELACIONAL){ return doVerificarCodigoV9(); }
+
   const code = document.getElementById('l-codigo').value.trim().toUpperCase();
   const errEl = document.getElementById('codigo-err');
   if(!code){ errEl.textContent='Ingresa el código del curso.'; errEl.style.display=''; return; }
@@ -1092,6 +1095,9 @@ function seleccionarAlumnoAp(aluId, el){
 
 // Paso 2 → Paso 3: ir a pantalla de PIN
 function irPaso3(){
+  // ── v9: delegar al flujo relacional si la bandera está activa ──
+  if(typeof V9_RELACIONAL!=='undefined'&&V9_RELACIONAL){ return irPaso3V9(); }
+
   const errEl = document.getElementById('alumno-err');
   if(!window._aluSelId){
     errEl.textContent='Selecciona el nombre de tu hijo/a para continuar.';
@@ -1188,6 +1194,9 @@ function verMiCodigoRecuperacion(){
 
 // Paso 3: verificar PIN y crear sesión
 async function doAccesoCodigo(){
+  // ── v9: delegar al flujo relacional si la bandera está activa ──
+  if(typeof V9_RELACIONAL!=='undefined'&&V9_RELACIONAL){ return doAccesoCodigoV9(); }
+
   const pin = document.getElementById('l-pin').value.trim();
   const errEl = document.getElementById('pin-err');
   if(!pin){ errEl.textContent='Ingresa tu PIN para continuar.'; errEl.style.display=''; return; }
@@ -1296,6 +1305,11 @@ function limpiarSesionApoderado(){
 }
 
 function logoutLector(){
+  // ── v9: si es sesión v9 activa, delegar para limpiar el PIN de memoria ──
+  if(typeof V9_RELACIONAL!=='undefined'&&V9_RELACIONAL&&
+     S.session&&S.session.rol==='apoderado_v9'){
+    return logoutApoderadoV9();
+  }
   // Cierra sesión del apoderado SIN borrar credenciales guardadas.
   // ── v9: invalidar epochs ANTES de limpiar el estado, igual que logout().
   //        Descarta fetches en vuelo que pudieran escribir en DB tras salir.
@@ -1482,3 +1496,286 @@ async function guardarResetPassword() {
 // ─────────────────────────────────────────────
 // SELECTOR DE CURSO
 // ─────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FLUJO APODERADO v9 RELACIONAL
+// Solo se activa cuando V9_RELACIONAL === true (definido en config.js).
+//
+// Este bloque reemplaza el flujo legado (doVerificarCodigo / doAccesoCodigo)
+// para los cursos gestionados con el esquema relacional de El Gran Cambio v9.
+//
+// Diferencias clave respecto al flujo legado:
+//   1. Paso 1 usa RPC apoderado_alumnos_curso → no carga DB del tesorero.
+//   2. El PIN se verifica en el servidor (RPC apoderado_acceso con bcrypt).
+//   3. El PIN vive SOLO en una variable JS cerrada (closure); nunca en
+//      localStorage, sessionStorage ni ninguna variable global persistente.
+//   4. Los datos del alumno (cuotas, apoderados) vienen del RPC, no del blob.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Estado transitorio del flujo apoderado v9 (borrado al salir o al paso 1)
+const _v9ApState = {
+  cuentaId:   null,   // UUID de la cuenta del curso (de apoderado_alumnos_curso)
+  alumnoId:   null,   // id del alumno seleccionado en paso 2
+  alumnoNombre: null, // para mostrar en UI
+  alumnos:    [],     // lista del selector (paso 1→2)
+  // ⚠️  El PIN NO se guarda aquí — vive solo como argumento de _v9AluEntrar()
+};
+
+/**
+ * Paso 1 v9: verificar código de curso via RPC.
+ * Reemplaza doVerificarCodigo() cuando V9_RELACIONAL === true.
+ * Llama a v9AluSelector(codigo) y pasa a paso 2 si hay alumnos.
+ */
+async function doVerificarCodigoV9() {
+  if (typeof V9_RELACIONAL === 'undefined' || !V9_RELACIONAL) {
+    // Fallback al flujo legado si la bandera no está activa
+    return doVerificarCodigo();
+  }
+
+  const inp   = document.getElementById('l-codigo');
+  const errEl = document.getElementById('codigo-err');
+  const btn   = document.querySelector('#paso-codigo .btn.bp');
+  const code  = (inp?.value || '').trim().toUpperCase();
+
+  if (!code) {
+    errEl.textContent = 'Ingresa el código del curso.';
+    errEl.style.display = '';
+    return;
+  }
+
+  errEl.style.display = 'none';
+  if (btn) { btn.textContent = 'Buscando...'; btn.disabled = true; }
+
+  try {
+    const filas = await v9AluSelector(code);
+
+    if (!filas || filas.length === 0) {
+      errEl.textContent = 'Código inválido o curso no encontrado.';
+      errEl.style.display = '';
+      return;
+    }
+
+    // Guardar estado transitorio (sin PIN)
+    _v9ApState.cuentaId = filas[0].cuenta_id;
+    _v9ApState.alumnos  = filas;
+    _v9ApState.alumnoId = null;
+    _v9ApState.alumnoNombre = null;
+
+    // Mostrar nombre del curso en paso 2
+    const nombreCurso = filas[0].curso_nombre || code;
+    document.getElementById('paso-codigo').style.display = 'none';
+    document.getElementById('paso-alumno').style.display = '';
+    document.getElementById('paso2-curso-nombre').textContent = nombreCurso;
+
+    // Renderizar lista de alumnos (formato v9)
+    _v9RenderAlumnosSelector('');
+    const busq = document.getElementById('busq-alumno-ap');
+    if (busq) { busq.value = ''; busq.focus(); }
+
+  } catch (err) {
+    console.error('[v9] doVerificarCodigoV9:', err);
+    errEl.textContent = 'Error de conexión. Verifica tu internet e intenta de nuevo.';
+    errEl.style.display = '';
+  } finally {
+    if (btn) { btn.textContent = 'Verificar código →'; btn.disabled = false; }
+  }
+}
+
+/**
+ * Renderiza la lista de alumnos del selector v9 (sin DB.alumnos — usa _v9ApState).
+ * @param {string} busq — texto de búsqueda
+ */
+function _v9RenderAlumnosSelector(busq) {
+  const lista = (_v9ApState.alumnos || [])
+    .filter(f => f.activo !== false)
+    .filter(f => {
+      if (!busq) return true;
+      return (f.nombre || '').toLowerCase().includes(busq.toLowerCase());
+    })
+    .sort((a, b) => (a.nombre || '').localeCompare(b.nombre || '', 'es'));
+
+  const cont = document.getElementById('lista-alumnos-selector');
+  if (!cont) return;
+
+  if (!lista.length) {
+    cont.innerHTML = `<div style="font-size:13px;color:var(--t3);text-align:center;padding:12px">Sin resultados</div>`;
+    return;
+  }
+
+  cont.innerHTML = lista.map(f => `
+    <div class="ap-alumno-card" onclick="_v9SeleccionarAlumno('${f.alumno_id}',${JSON.stringify(f.nombre||'')},this)"
+      style="display:flex;align-items:center;gap:12px;padding:12px 14px;border:1.5px solid var(--brd);border-radius:10px;cursor:pointer;transition:.15s"
+      onmouseover="this.style.borderColor='var(--gm)'"
+      onmouseout="if(!this.classList.contains('selected'))this.style.borderColor='var(--brd)'">
+      <div style="width:38px;height:38px;border-radius:50%;background:var(--gl);display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:var(--g);flex-shrink:0">
+        ${((f.nombre||'?')[0]).toUpperCase()}
+      </div>
+      <div style="font-weight:600;font-size:14px">${escHtml(f.nombre||'—')}</div>
+      <div style="margin-left:auto;font-size:18px;display:none" class="ap-check">✓</div>
+    </div>`).join('');
+}
+
+/**
+ * Selecciona un alumno en el paso 2 del selector v9.
+ */
+function _v9SeleccionarAlumno(alumnoId, nombre, el) {
+  _v9ApState.alumnoId     = alumnoId;
+  _v9ApState.alumnoNombre = nombre;
+  document.querySelectorAll('.ap-alumno-card').forEach(c => {
+    c.classList.remove('selected');
+    c.style.borderColor = 'var(--brd)';
+    c.style.background  = 'var(--wh)';
+    c.querySelector('.ap-check').style.display = 'none';
+  });
+  el.classList.add('selected');
+  el.style.borderColor = 'var(--gm)';
+  el.style.background  = 'var(--gl)';
+  el.querySelector('.ap-check').style.display = '';
+  document.getElementById('alumno-err').style.display = 'none';
+}
+
+/**
+ * Paso 2 → Paso 3 v9: ir a pantalla de PIN tras seleccionar alumno.
+ * Reemplaza irPaso3() cuando V9_RELACIONAL === true.
+ */
+function irPaso3V9() {
+  if (typeof V9_RELACIONAL === 'undefined' || !V9_RELACIONAL) return irPaso3();
+
+  const errEl = document.getElementById('alumno-err');
+  if (!_v9ApState.alumnoId) {
+    errEl.textContent = 'Selecciona el nombre de tu hijo/a para continuar.';
+    errEl.style.display = '';
+    return;
+  }
+  errEl.style.display = 'none';
+  document.getElementById('paso-alumno').style.display = 'none';
+  document.getElementById('paso-pin').style.display    = '';
+  document.getElementById('paso3-alumno-nombre').textContent = _v9ApState.alumnoNombre || _v9ApState.alumnoId;
+  document.getElementById('l-pin').value = '';
+  setTimeout(() => document.getElementById('l-pin').focus(), 100);
+}
+
+/**
+ * Paso 3 v9: verificar PIN con RPC y crear sesión.
+ * Reemplaza doAccesoCodigo() cuando V9_RELACIONAL === true.
+ *
+ * El PIN se lee del input, se usa en el RPC y luego se mantiene
+ * SOLO en una variable local del closure de la sesión del apoderado.
+ * Nunca se escribe en localStorage ni en _v9ApState.
+ */
+async function doAccesoCodigoV9() {
+  if (typeof V9_RELACIONAL === 'undefined' || !V9_RELACIONAL) {
+    return doAccesoCodigo();
+  }
+
+  const pinInput = document.getElementById('l-pin');
+  const errEl    = document.getElementById('pin-err');
+  const btn      = document.querySelector('#paso-pin .btn.bp');
+
+  // Leer el PIN AHORA y guardarlo en variable local — no en estado global
+  const pin = (pinInput?.value || '').trim();
+
+  if (!pin) {
+    errEl.textContent = 'Ingresa tu PIN para continuar.';
+    errEl.style.display = '';
+    return;
+  }
+
+  if (!_v9ApState.cuentaId || !_v9ApState.alumnoId) {
+    errEl.textContent = 'Error interno. Vuelve al paso 1.';
+    errEl.style.display = '';
+    return;
+  }
+
+  errEl.style.display = 'none';
+  if (btn) { btn.textContent = 'Verificando...'; btn.disabled = true; }
+  if (pinInput) pinInput.value = ''; // limpiar input inmediatamente (no dejar PIN visible)
+
+  const cuentaId  = _v9ApState.cuentaId;
+  const alumnoId  = _v9ApState.alumnoId;
+  const nombreAlu = _v9ApState.alumnoNombre || alumnoId;
+
+  try {
+    // El RPC valida PIN con bcrypt y retorna datos del alumno o error
+    const resultado = await v9AluAcceso(cuentaId, alumnoId, pin);
+
+    if (resultado?.error) {
+      const mensajes = {
+        pin_incorrecto: 'PIN incorrecto. Verifica con el tesorero del curso.',
+        pin_requerido:  'Ingresa tu PIN para continuar.',
+        bloqueado:      'Acceso bloqueado por demasiados intentos fallidos. Contacta al tesorero del curso.',
+        alumno_inactivo:'Este alumno ya no pertenece al curso activo.',
+        sin_credencial: 'Este alumno aún no tiene PIN asignado. Solicítalo al tesorero del curso.',
+      };
+      const msg = mensajes[resultado.error] || `Error: ${resultado.error}`;
+      errEl.textContent = msg;
+      errEl.style.display = '';
+      return;
+    }
+
+    // PIN correcto — crear sesión
+    // El PIN queda capturado en el closure _v9PinEnMemoria para las siguientes
+    // llamadas a situacion_financiera, editar_contacto, etc.
+    // ⚠️  Esta variable NO es accesible desde consola ni desde el DOM;
+    //     solo la usan las funciones v9 de esta sesión.
+    window._v9PinEnMemoria = (function(p) {
+      // Inmediatamente borrar el parámetro y retornar un getter de un solo uso.
+      // Para que cada RPC que necesita el PIN lo pida explícitamente.
+      const _pin = p;
+      return function obtenerPin() { return _pin; };
+    })(pin);
+
+    // Guardar datos del alumno en S para que la UI los use
+    S._v9AccesoData = resultado;  // { alumno, apoderados, cuotas_estado }
+
+    S.session = {
+      id:          'ap_v9_' + alumnoId,
+      nombre:      'Apoderado de ' + nombreAlu,
+      rol:         'apoderado_v9',
+      cursoIds:    [],                  // no aplica en v9 (no tenemos cursoId en DB)
+      alumnoId:    alumnoId,
+      alumnoNombre: nombreAlu,
+      _v9CuentaId: cuentaId,
+    };
+
+    // Limpiar estado transitorio (ya no necesitamos la lista de alumnos)
+    _v9ApState.alumnos  = [];
+    _v9ApState.alumnoId = null;
+    window._aluSelId    = null;
+
+    // Navegar al dashboard
+    go('dashboard');
+
+  } catch (err) {
+    console.error('[v9] doAccesoCodigoV9:', err);
+    errEl.textContent = 'Error de conexión. Verifica tu internet e intenta de nuevo.';
+    errEl.style.display = '';
+  } finally {
+    if (btn) { btn.textContent = 'Acceder →'; btn.disabled = false; }
+  }
+}
+
+/**
+ * Cierra la sesión apoderado v9 limpiando el PIN de memoria.
+ * Llamar en lugar de logoutLector() para sesiones v9.
+ */
+function logoutApoderadoV9() {
+  // Borrar el PIN de memoria antes de cualquier otra acción
+  if (typeof window._v9PinEnMemoria !== 'undefined') {
+    window._v9PinEnMemoria = null;
+  }
+  S._v9AccesoData = null;
+
+  // Resetear estado transitorio del flujo
+  _v9ApState.cuentaId     = null;
+  _v9ApState.alumnoId     = null;
+  _v9ApState.alumnoNombre = null;
+  _v9ApState.alumnos      = [];
+
+  // Limpiar el rol de la sesión ANTES de llamar logoutLector para evitar
+  // recursión infinita (logoutLector redirige aquí si rol === 'apoderado_v9').
+  if (S.session) { S.session.rol = null; }
+
+  // Delegar al cierre de sesión estándar del lector
+  logoutLector();
+}

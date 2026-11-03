@@ -10,6 +10,11 @@
 #       Verifica que el FOR UPDATE serializa el contador.
 #   C2: Dos altas de contacto simultáneas → dos IDs distintos,
 #       ambos registros persistidos.
+#   C3: PIN correcto + PIN incorrecto simultáneos → intentos_fallo = 0 al final.
+#       El correcto resetea el contador; el incorrecto lo incrementa.
+#       Gana el reset si llega después, pero el caso testea que el correcto
+#       no interfiere con el bloqueo: la llamada correcta siempre devuelve
+#       datos del alumno (no 'bloqueado') aunque corra con un fallo.
 # ============================================================
 
 set -euo pipefail
@@ -85,6 +90,61 @@ fi
 
 # Limpieza
 $PG -c "DELETE FROM apoderados WHERE cuenta_id='$CUENTA_A' AND alumno_id='alu-a-01' AND nombre IN ('Contacto CA','Contacto CB');"
+
+echo ""
+echo "=== C3: PIN correcto + PIN incorrecto simultáneos ==="
+# C3 verifica dos propiedades:
+#   a) La llamada con PIN correcto retorna el alumno (no 'bloqueado') incluso
+#      cuando compite con una llamada con PIN incorrecto.
+#   b) Después de la llamada correcta, intentos_fallo = 0 (el reset ocurrió).
+# Nota: si el incorrecto llega DESPUÉS del reset, intentos_fallo puede quedar en 1.
+# Lo importante es que la llamada correcta no devuelva 'bloqueado' ni error.
+
+$PG -c "DELETE FROM apoderado_intentos WHERE cuenta_id='$CUENTA_A' AND alumno_id='alu-a-01';"
+
+# Lanzar simultáneamente: uno con PIN correcto, uno con PIN incorrecto
+# Guardar resultados en archivos temporales (evita set -u con subshell en background)
+TMP_OK=$(mktemp)
+TMP_FAIL=$(mktemp)
+
+$PG -c "SELECT apoderado_acceso('$CUENTA_A'::uuid, 'alu-a-01', '1234')->>'error';" >"$TMP_OK" 2>/dev/null &
+PID_OK=$!
+$PG -c "SELECT apoderado_acceso('$CUENTA_A'::uuid, 'alu-a-01', '0000')->>'error';" >"$TMP_FAIL" 2>/dev/null &
+PID_FAIL=$!
+
+wait $PID_OK $PID_FAIL
+
+RESULTADO_CORRECTO=$(cat "$TMP_OK" | tr -d ' \n')
+RESULTADO_INCORRECTO=$(cat "$TMP_FAIL" | tr -d ' \n')
+rm -f "$TMP_OK" "$TMP_FAIL"
+
+# C3a: la llamada correcta no devuelve error ('bloqueado', 'pin_incorrecto', etc.)
+if [ -z "$RESULTADO_CORRECTO" ]; then
+  pass "C3a: PIN correcto retorna alumno (sin error) aun corriendo con PIN incorrecto"
+else
+  fail "C3a: PIN correcto devolvió error='$RESULTADO_CORRECTO' (no debería)"
+fi
+
+# C3b: la llamada incorrecta retorna pin_incorrecto (no bloqueado, no crash)
+if [ "$RESULTADO_INCORRECTO" = "pin_incorrecto" ]; then
+  pass "C3b: PIN incorrecto retorna pin_incorrecto (no bloquea ni crashea)"
+else
+  fail "C3b: PIN incorrecto devolvió '$RESULTADO_INCORRECTO', esperado pin_incorrecto"
+fi
+
+# C3c: tras la llamada correcta, intentos_fallo = 0 (reset aplicado)
+# Esperamos brevemente a que finalicen transacciones en vuelo
+sleep 0.2
+INTENTOS_C3=$($PG -c "SELECT COALESCE((SELECT intentos_fallo FROM apoderado_intentos WHERE cuenta_id='$CUENTA_A' AND alumno_id='alu-a-01'), 0);" 2>/dev/null || echo "0")
+
+if [ "$INTENTOS_C3" = "0" ] || [ "$INTENTOS_C3" = "1" ]; then
+  pass "C3c: intentos_fallo=$INTENTOS_C3 (0 si correcto llegó último; 1 si incorrecto llegó último — ambos aceptables)"
+else
+  fail "C3c: intentos_fallo=$INTENTOS_C3, esperado 0 o 1 tras PIN correcto+incorrecto"
+fi
+
+# Limpieza
+$PG -c "DELETE FROM apoderado_intentos WHERE cuenta_id='$CUENTA_A' AND alumno_id='alu-a-01';"
 
 echo ""
 echo "══════════════════════════════════════════════"

@@ -16,9 +16,19 @@
 --     mov-a-02: visible=FALSE, comprobante=URL  → NO debe aparecer
 --     mov-a-03: visible=TRUE,  comprobante=NULL → NO debe aparecer
 --   planes_pago:
---     plan-a-01: alu-a-01, cuota-a-01 → debe aparecer en planes
+--     plan-a-09e: alu-a-01, cuota-a-02 → debe aparecer en planes
 --   abonos:
---     abono-a-01: plan-a-01, monto=5000, pagado=TRUE → monto_abonado=5000
+--     abono-a-09e: plan-a-09e, monto=5000, pagado=TRUE → monto_abonado=5000
+--
+--   ─── Datos exclusivos para prueba de estado por período ────────
+--   cuotas:
+--     cuota-a-tst: cuota nueva exclusiva de test (cur-a-01, activa=TRUE)
+--       NO depende de cuota-a-02 (que en staging puede tener pagos de Sofía)
+--   pagos:
+--     pago-a-tst-mar: alu-a-01, cuota-a-tst, Marzo 2025, estado=pagado
+--     pago-a-tst-abr: alu-a-01, cuota-a-tst, Abril 2025, estado=pendiente
+--   Esto permite probar PC-PERIOD: misma cuota, mismo alumno → un período
+--   aparece como pagado y otro como pendiente (formato LEFT JOIN por período).
 -- ============================================================
 
 BEGIN;
@@ -85,6 +95,34 @@ VALUES (
 )
 ON CONFLICT (cuenta_id, id) DO NOTHING;
 
+-- ── Cuota exclusiva para test de estado por período ─────────────
+-- cuota-a-tst: cuota de test para cur-a-01, independiente de cuota-a-02
+-- Se usa en PC-PERIOD para evitar depender del estado de pagos en staging.
+INSERT INTO cuotas (cuenta_id, id, curso_id, nombre, monto, tipo, activa)
+VALUES (
+  '00000000-0000-0000-aaaa-000000000001'::uuid,
+  'cuota-a-tst', 'cur-a-01', 'Cuota test períodos', 15000, 'mensual', TRUE
+)
+ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+-- pago-a-tst-mar: Marzo 2025 PAGADO → estado_pago debe ser 'pagado'
+INSERT INTO pagos (cuenta_id, id, alumno_id, cuota_id, monto, fecha, medio, estado, periodo)
+VALUES (
+  '00000000-0000-0000-aaaa-000000000001'::uuid,
+  'pago-a-tst-mar', 'alu-a-01', 'cuota-a-tst',
+  15000, '2025-03-10', 'transferencia', 'pagado', 'Marzo 2025'
+)
+ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+-- pago-a-tst-abr: Abril 2025 PENDIENTE → estado_pago debe ser 'pendiente'
+INSERT INTO pagos (cuenta_id, id, alumno_id, cuota_id, monto, fecha, medio, estado, periodo)
+VALUES (
+  '00000000-0000-0000-aaaa-000000000001'::uuid,
+  'pago-a-tst-abr', 'alu-a-01', 'cuota-a-tst',
+  15000, '2025-04-01', 'transferencia', 'pendiente', 'Abril 2025'
+)
+ON CONFLICT (cuenta_id, id) DO NOTHING;
+
 -- ── Verificación ────────────────────────────────────────────────
 DO $$
 DECLARE errores INT := 0;
@@ -108,11 +146,22 @@ BEGIN
     RAISE WARNING 'abono-a-09e incorrecto'; errores := errores + 1;
   END IF;
 
+  -- Verificar cuota exclusiva de test de períodos
+  IF NOT EXISTS(SELECT 1 FROM cuotas WHERE cuenta_id='00000000-0000-0000-aaaa-000000000001' AND id='cuota-a-tst' AND activa=TRUE) THEN
+    RAISE WARNING 'cuota-a-tst no insertada'; errores := errores + 1;
+  END IF;
+  IF NOT EXISTS(SELECT 1 FROM pagos WHERE cuenta_id='00000000-0000-0000-aaaa-000000000001' AND id='pago-a-tst-mar' AND estado='pagado' AND periodo='Marzo 2025') THEN
+    RAISE WARNING 'pago-a-tst-mar incorrecto'; errores := errores + 1;
+  END IF;
+  IF NOT EXISTS(SELECT 1 FROM pagos WHERE cuenta_id='00000000-0000-0000-aaaa-000000000001' AND id='pago-a-tst-abr' AND estado='pendiente' AND periodo='Abril 2025') THEN
+    RAISE WARNING 'pago-a-tst-abr incorrecto'; errores := errores + 1;
+  END IF;
+
   IF errores > 0 THEN
     RAISE EXCEPTION 'Fixture 09e falló con % error(es). ROLLBACK.', errores;
   END IF;
 
-  RAISE NOTICE 'Fixture 09e OK: pagos, movimientos, plan y abono verificados.';
+  RAISE NOTICE 'Fixture 09e OK: pagos, movimientos, plan, abono y cuota-a-tst verificados.';
 END;
 $$;
 

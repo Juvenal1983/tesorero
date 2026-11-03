@@ -436,3 +436,194 @@ async function recargarCursoV9(cursoId, accessToken) {
     pagos:   pagosRaw.map(_mapPago),
   };
 }
+
+// ─── Flujo apoderado v9 ──────────────────────────────────────────────────────
+// Estas funciones llaman a los RPC de SECURITY DEFINER vía la API REST de
+// Supabase (/rest/v1/rpc/<nombre>). No acceden a tablas directamente.
+// El PIN viaja solo en el cuerpo del POST, nunca en la URL ni en localStorage.
+//
+// ⚠️  Todas usan el anon key (SUPA_KEY) como apikey porque el flujo apoderado
+//     es público (el apoderado no tiene cuenta Supabase). El SECURITY DEFINER
+//     se encarga de validar identidad con el PIN.
+
+/**
+ * Llama a un RPC de apoderado via POST /rest/v1/rpc/<nombre>.
+ * Siempre usa el anon key; el RPC valida internamente.
+ *
+ * @param {string} nombre — nombre del RPC (ej. 'apoderado_acceso')
+ * @param {Object} params — parámetros a enviar en el cuerpo JSON
+ * @returns {Promise<any>} resultado del RPC (JSONB devuelto por Supabase)
+ */
+async function _v9RpcApoderado(nombre, params) {
+  const base = _v9BaseUrl().replace('/rest/v1', '') + '/rest/v1';
+  const url  = base + '/rpc/' + nombre;
+
+  const res = await fetch(url, {
+    method:  'POST',
+    headers: {
+      'apikey':        SUPA_KEY,
+      'Authorization': 'Bearer ' + SUPA_KEY,
+      'Content-Type':  'application/json',
+      'Accept':        'application/json',
+    },
+    body: JSON.stringify(params),
+  });
+
+  if (!res.ok) {
+    let body = '';
+    try { body = await res.text(); } catch (_) {}
+    throw Object.assign(
+      new Error(`[datos_v9] RPC ${nombre} → HTTP ${res.status}: ${body}`),
+      { status: res.status, body }
+    );
+  }
+
+  return res.json();
+}
+
+/**
+ * Selector inicial: dado un código de curso devuelve la lista de alumnos del curso.
+ * No requiere PIN; devuelve solo id y nombre (sin datos sensibles).
+ *
+ * RPC: apoderado_alumnos_curso(p_codigo TEXT)
+ * Retorna: TABLE(cuenta_id, alumno_id, nombre, curso_nombre, codigo, activo)
+ *
+ * @param {string} codigo — código alfanumérico del curso (ej. 'CUR-A01')
+ * @returns {Promise<Array<{cuenta_id, alumno_id, nombre, curso_nombre, codigo, activo}>>}
+ */
+async function v9AluSelector(codigo) {
+  // apoderado_alumnos_curso es una SRF (set-returning function); Supabase la
+  // expone como GET o POST y devuelve un array de filas.
+  const base = _v9BaseUrl().replace('/rest/v1', '') + '/rest/v1';
+  const url  = base + '/rpc/apoderado_alumnos_curso';
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'apikey':        SUPA_KEY,
+      'Authorization': 'Bearer ' + SUPA_KEY,
+      'Content-Type':  'application/json',
+      'Accept':        'application/json',
+    },
+    body: JSON.stringify({ p_codigo: codigo }),
+  });
+
+  if (!res.ok) {
+    let body = '';
+    try { body = await res.text(); } catch (_) {}
+    throw Object.assign(
+      new Error(`[datos_v9] v9AluSelector → HTTP ${res.status}: ${body}`),
+      { status: res.status, body }
+    );
+  }
+
+  const rows = await res.json();
+  return Array.isArray(rows) ? rows : [];
+}
+
+/**
+ * Verifica PIN y devuelve los datos del alumno con sus apoderados y cuotas.
+ * El PIN viaja en el cuerpo del POST y NO se almacena en ninguna variable
+ * persistente; debe vivir solo en el closure del llamador.
+ *
+ * RPC: apoderado_acceso(p_cuenta_id UUID, p_alumno_id TEXT, p_pin TEXT)
+ * Retorna JSONB con:
+ *   { alumno, apoderados, cuotas_estado }
+ *   o { error: 'pin_incorrecto' | 'bloqueado' | 'alumno_inactivo' | ... }
+ *
+ * @param {string} cuentaId
+ * @param {string} alumnoId
+ * @param {string} pin        — debe vivir solo en memoria (closure/variable local)
+ * @returns {Promise<Object>}
+ */
+async function v9AluAcceso(cuentaId, alumnoId, pin) {
+  return _v9RpcApoderado('apoderado_acceso', {
+    p_cuenta_id: cuentaId,
+    p_alumno_id: alumnoId,
+    p_pin:       pin,
+  });
+}
+
+/**
+ * Devuelve la situación financiera del alumno (requiere PIN válido).
+ * El RPC verifica el PIN internamente; no asume sesión previa.
+ *
+ * RPC: apoderado_situacion_financiera(p_cuenta_id UUID, p_alumno_id TEXT, p_pin TEXT)
+ * Retorna JSONB con:
+ *   { pagos, planes, comprobantes, balance_curso }
+ *   o { error: '...' }
+ *
+ * @param {string} cuentaId
+ * @param {string} alumnoId
+ * @param {string} pin — debe vivir solo en memoria
+ * @returns {Promise<Object>}
+ */
+async function v9AluSituacion(cuentaId, alumnoId, pin) {
+  return _v9RpcApoderado('apoderado_situacion_financiera', {
+    p_cuenta_id: cuentaId,
+    p_alumno_id: alumnoId,
+    p_pin:       pin,
+  });
+}
+
+/**
+ * Edita los datos de un contacto/apoderado existente.
+ * Pasa solo los campos a cambiar (null = no cambiar).
+ *
+ * RPC: apoderado_editar_contacto(
+ *        p_cuenta_id UUID, p_alumno_id TEXT, p_pin TEXT,
+ *        p_apoderado_id TEXT,
+ *        p_nombre TEXT, p_relacion TEXT, p_telefono TEXT, p_email TEXT)
+ * Retorna JSONB: { ok: true } o { error: '...' }
+ *
+ * @param {string}      cuentaId
+ * @param {string}      alumnoId
+ * @param {string}      pin
+ * @param {string}      apoderadoId
+ * @param {string|null} nombre
+ * @param {string|null} relacion
+ * @param {string|null} telefono
+ * @param {string|null} email
+ * @returns {Promise<Object>}
+ */
+async function v9AluEditarContacto(cuentaId, alumnoId, pin, apoderadoId, nombre, relacion, telefono, email) {
+  return _v9RpcApoderado('apoderado_editar_contacto', {
+    p_cuenta_id:    cuentaId,
+    p_alumno_id:    alumnoId,
+    p_pin:          pin,
+    p_apoderado_id: apoderadoId,
+    p_nombre:       nombre   ?? null,
+    p_relacion:     relacion ?? null,
+    p_telefono:     telefono ?? null,
+    p_email:        email    ?? null,
+  });
+}
+
+/**
+ * Agrega un nuevo contacto/apoderado al alumno.
+ *
+ * RPC: apoderado_agregar_contacto(
+ *        p_cuenta_id UUID, p_alumno_id TEXT, p_pin TEXT,
+ *        p_nombre TEXT, p_relacion TEXT, p_telefono TEXT, p_email TEXT)
+ * Retorna JSONB: { ok: true, apoderado_id: '...' } o { error: '...' }
+ *
+ * @param {string}      cuentaId
+ * @param {string}      alumnoId
+ * @param {string}      pin
+ * @param {string}      nombre
+ * @param {string|null} relacion
+ * @param {string|null} telefono
+ * @param {string|null} email
+ * @returns {Promise<Object>}
+ */
+async function v9AluAgregarContacto(cuentaId, alumnoId, pin, nombre, relacion, telefono, email) {
+  return _v9RpcApoderado('apoderado_agregar_contacto', {
+    p_cuenta_id: cuentaId,
+    p_alumno_id: alumnoId,
+    p_pin:       pin,
+    p_nombre:    nombre,
+    p_relacion:  relacion  ?? null,
+    p_telefono:  telefono  ?? null,
+    p_email:     email     ?? null,
+  });
+}
