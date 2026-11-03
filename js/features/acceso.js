@@ -245,7 +245,8 @@ function renderLogin(){
           <div style="font-size:12px;color:var(--t3);margin-bottom:10px;text-align:center">
             ¿No tienes PIN? Solicítalo al tesorero del curso.
           </div>
-          <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;justify-content:center">
+          <!-- PENDIENTE: "Recordar mi acceso" — oculto hasta implementar almacenamiento seguro de PIN -->
+          <div style="display:none;align-items:center;gap:8px;margin-bottom:14px;justify-content:center">
             <input type="checkbox" id="ap-recordar" style="width:16px;height:16px;cursor:pointer;accent-color:var(--gm)">
             <label for="ap-recordar" style="font-size:13px;color:var(--t2);cursor:pointer;user-select:none">Recordar mi acceso</label>
           </div>
@@ -278,7 +279,9 @@ function bindLogin(){
   }
 
   // Auto-login apoderado si tiene sesión guardada (y no acaba de cerrar sesión)
-  if(!window._skipApAutoLogin && previewStorage.getItem('tesorero_ap_recordar')==='1'){
+  // Guard: en modo V9_RELACIONAL el auto-login legacy no aplica — los apoderados
+  // usan el flujo v9 con PIN verificado en Supabase, no el modelo legado.
+  if(!window._skipApAutoLogin && !V9_RELACIONAL && previewStorage.getItem('tesorero_ap_recordar')==='1'){
     var apCursoId = previewStorage.getItem('tesorero_ap_cursoId');
     var apAluId   = previewStorage.getItem('tesorero_ap_aluId');
     var apPin     = previewStorage.getItem('tesorero_ap_pin');
@@ -1865,7 +1868,7 @@ function _apV9RenderBalance(b) {
       <div><div style="font-size:11px;color:var(--t3);margin-bottom:4px">Gastos</div><div style="font-size:17px;font-weight:700;color:var(--r)">${fmt(b.total_gastos)}</div></div>
       <div><div style="font-size:11px;color:var(--t3);margin-bottom:4px">Saldo</div><div style="font-size:17px;font-weight:700;color:${colorSaldo}">${fmt(saldo)}</div></div>
     </div>
-    <div style="font-size:11px;color:var(--t3);margin-top:10px;text-align:center">Solo movimientos publicados por el tesorero.</div>`;
+    <div style="font-size:11px;color:var(--t3);margin-top:10px;text-align:center">Incluye cuotas recaudadas, abonos y movimientos del curso.</div>`;
 }
 
 function _apV9RenderDeudas(cuotas) {

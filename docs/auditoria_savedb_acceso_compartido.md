@@ -23,21 +23,18 @@ _Sesión v9 · 2026-11-03_
 - `doAccesoCodigoV9()` **no llama** `_setUserKeyV9()`, por lo que `KEY` retiene el  
   valor previo (vacío o del último tesorero en esa sesión de navegador).
 
-### ⚠️ Pendiente #1 — saveDB() carece de guard de rol
+### ✅ Pendiente #1 — RESUELTO (commit 862bae2)
 
-`saveDB()` en sí **no verifica el rol** antes de escribir. Si alguna ruta omite la  
-comprobación de `puedeEscribir()`, un `apoderado_v9` podría escribir en el  
-localStorage del tesorero activo.
-
-**Corrección recomendada** (en `saveDB()`):
+Guard de rol aplicado en `saveDB()` (`js/core/almacenamiento.js`):
 
 ```javascript
 function saveDB(){
-  // Guard: apoderado_v9 nunca escribe en el storage del tesorero
-  if (S.session?.rol === 'apoderado_v9') return;
+  if (S && S.session && S.session.rol === 'apoderado_v9') return;
   // … resto del código …
 }
 ```
+
+Un `apoderado_v9` jamás puede escribir en el localStorage del tesorero.
 
 ---
 
@@ -53,19 +50,24 @@ function saveDB(){
 
 ### Estado en v9
 
-- En la versión v9 el "acceso compartido" del apoderado usa un flujo distinto:  
-  código de invitación (`CUR-XXX`) + PIN por alumno → `rol: 'apoderado_v9'`.
-- El código `CC-XXXX-XXXX` sigue existiendo para el acceso de "visor" del tesorero  
-  (acceso compartido al panel completo, no al estado de un alumno).
+- El código `CC-XXXX-XXXX` es generado por el **tesorero** y permite que los  
+  **apoderados y miembros del curso** consulten quién ha pagado y quién debe.  
+  **No** es un "tesorero visor" ni un acceso al panel completo del tesorero.  
+  Es una función de transparencia: cualquier miembro del curso puede ver el estado  
+  de pagos del grupo completo usando ese código.
+- En v9 el flujo de apoderado individual usa código `CUR-XXX` + PIN → `rol: 'apoderado_v9'`.  
+  El código `CC-XXXX-XXXX` es **complementario**, no equivalente ni reemplazado.
 
-### ⚠️ Pendiente #2 — sin migración del acceso compartido a v9
+### ⚠️ Pendiente #2 — sin RPC v9 para acceso compartido (CC-XXXX)
 
 El acceso compartido (`codigoCompartido`) sigue leyendo `DB.cursos` (modelo local).  
 En un tenant 100% v9 relacional, `DB.cursos` estará vacío y `codigoCompartido`  
-no se aplicará. No hay RPC v9 para acceso de tipo "visor" del tesorero.
+no se aplicará.
 
-**Trabajo pendiente:** decidir si el acceso compartido v9 debe reemplazarse por  
-invitaciones en Supabase, o si el rol `visor` queda fuera del flujo v9 inicial.
+**Trabajo pendiente:** implementar RPC v9 para consulta de estado de pagos del curso  
+mediante código CC-XXXX. El rol de ese acceso es permitir transparencia a los  
+miembros del curso, no reemplazar el modelo de invitaciones ni otorgar acceso de tesorero.  
+Este pendiente queda separado del flujo de invitaciones.
 
 ---
 
@@ -100,38 +102,32 @@ seguridad de v9 se basa en la no persistencia, no en la inaccesibilidad:
   al refresco de la página, ni al logout (`logoutApoderadoV9()` hace `_v9PinEnMemoria = null`).
 - No se escribe en `localStorage`, `sessionStorage`, ni en el DOM.
 
-### ⚠️ Pendiente #3 — checkbox "Recordar mi acceso" en pantalla v9
+### ✅ Pendiente #3 — RESUELTO
 
-En `doVerificarCodigoV9()`, si el formulario heredado muestra el checkbox `#ap-recordar`  
-y el usuario lo marca, la marca se ignora silenciosamente. El usuario no recibe  
-retroalimentación de que el acceso v9 no puede recordarse.
+Checkbox `#ap-recordar` oculto (`display:none`) en `acceso.js`. El elemento sigue  
+en el DOM para mantener compatibilidad, pero no es visible ni interactuable.  
+Queda como pendiente futuro implementar recordatorio seguro de acceso para v9.
 
-**Corrección recomendada:** ocultar el checkbox en el flujo v9, o reemplazar su label  
-por: _"Por seguridad, el acceso con PIN no se puede recordar automáticamente."_
+### ✅ Pendiente #4 — RESUELTO
 
-### ⚠️ Pendiente #4 — coexistencia `tesorero_ap_recordar` entre flujos
+Guard `!V9_RELACIONAL` agregado en el bloque de auto-login legacy de `bindLogin()`:
 
-Si un usuario usó el flujo antiguo (apoderado_lector) y dejó `tesorero_ap_recordar=1`  
-en localStorage, y luego el tesorero activa `V9_RELACIONAL`, `bindLogin()` intentará  
-hacer auto-login con el flujo antiguo antes de evaluar si el flujo es v9.  
-En la práctica esto falla graciosamente (el PIN incorrecto no pasa), pero el UX  
-muestra un "panel de acceso rápido" que no debería aparecer.
+```javascript
+if(!window._skipApAutoLogin && !V9_RELACIONAL && previewStorage.getItem('tesorero_ap_recordar')==='1'){
+```
 
-**Corrección recomendada:** en `bindLogin()`, antes de mostrar el panel rápido,  
-verificar `if (typeof V9_RELACIONAL === 'undefined' || !V9_RELACIONAL)` para omitir  
-el bloque de auto-login del flujo antiguo cuando el tenant es v9.
+En tenants v9, el auto-login del flujo antiguo queda completamente inactivo.
 
 ---
 
 ## 4. Resumen de pendientes
 
-| # | Área | Severidad | Descripción |
-|---|------|-----------|-------------|
-| 1 | `saveDB()` | Media | Agregar guard `if (rol === 'apoderado_v9') return` |
-| 2 | Acceso compartido v9 | Alta | No existe RPC v9 para rol "visor" del tesorero; pendiente decisión de diseño |
-| 3 | Checkbox recordar en v9 | Baja | Ocultar o cambiar label en flujo `V9_RELACIONAL` |
-| 4 | Auto-login legado con V9 activo | Baja | Guard `V9_RELACIONAL` en bloque auto-login de `bindLogin()` |
+| # | Área | Severidad | Estado | Descripción |
+|---|------|-----------|--------|-------------|
+| 1 | `saveDB()` | Media | ✅ RESUELTO (862bae2) | Guard `if (rol === 'apoderado_v9') return` aplicado |
+| 2 | Acceso compartido v9 (CC-XXXX) | Alta | ⏳ Pendiente | RPC v9 para consulta de pagos del curso por código CC-XXXX; es transparencia para miembros, no "visor tesorero" |
+| 3 | Checkbox recordar en v9 | Baja | ✅ RESUELTO | Oculto (`display:none`) en `acceso.js`; pendiente implementación segura futura |
+| 4 | Auto-login legado con V9 activo | Baja | ✅ RESUELTO | Guard `!V9_RELACIONAL` en `bindLogin()` |
 
-Los pendientes #3 y #4 son de bajo riesgo y pueden resolverse en la misma iteración  
-que la integración completa de la pantalla de acceso v9. El pendiente #2 requiere  
-una decisión de arquitectura antes de implementar.
+El pendiente #2 requiere decisión de arquitectura: implementar un RPC v9 que  
+permita a miembros del curso ver el estado de pagos del grupo usando el código CC-XXXX.

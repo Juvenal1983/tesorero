@@ -539,20 +539,99 @@ BEGIN
     AND m.visible    = TRUE
     AND m.comprobante IS NOT NULL;
 
-  -- Balance autorizado del curso (solo movimientos visible=TRUE).
-  -- Es el balance que el tesorero eligió publicar; no incluye movimientos internos.
+  -- Balance del curso: misma lógica que calcFinanzas() del frontend.
+  --   total_ingresos = pagos_pagados + abonos_pagados_de_planes_activos + movimientos_tipo_ingreso
+  --   total_gastos   = movimientos_tipo_gasto (visible=TRUE)
+  --   saldo          = total_ingresos − total_gastos
+  -- No se exponen datos individuales de familias: solo totales del curso.
   SELECT jsonb_build_object(
-    'total_ingresos', COALESCE(SUM(CASE WHEN m.tipo IN ('ingreso', 'aporte') THEN m.monto ELSE 0 END), 0),
-    'total_gastos',   COALESCE(SUM(CASE WHEN m.tipo IN ('gasto', 'egreso')   THEN m.monto ELSE 0 END), 0),
-    'saldo',          COALESCE(SUM(CASE WHEN m.tipo IN ('ingreso', 'aporte') THEN m.monto
-                                        WHEN m.tipo IN ('gasto', 'egreso')   THEN -m.monto
-                                        ELSE 0 END), 0)
+    'total_recaudado_cuotas',
+      COALESCE((
+        SELECT SUM(p.monto)
+        FROM pagos p
+        WHERE p.cuenta_id = p_cuenta_id
+          AND p.alumno_id IN (
+            SELECT a.id FROM alumnos a
+            WHERE a.cuenta_id = p_cuenta_id AND a.curso_id = v_curso_id
+          )
+          AND p.estado = 'pagado'
+      ), 0),
+    'total_abonos_pagados',
+      COALESCE((
+        SELECT SUM(ab.monto)
+        FROM abonos ab
+        JOIN planes_pago pp ON pp.cuenta_id = ab.cuenta_id AND pp.id = ab.plan_id
+        WHERE ab.cuenta_id = p_cuenta_id
+          AND pp.alumno_id IN (
+            SELECT a.id FROM alumnos a
+            WHERE a.cuenta_id = p_cuenta_id AND a.curso_id = v_curso_id
+          )
+          AND ab.pagado = TRUE
+          AND pp.activo = TRUE
+      ), 0),
+    'total_ingresos_extra',
+      COALESCE((
+        SELECT SUM(m.monto)
+        FROM movimientos m
+        WHERE m.cuenta_id = p_cuenta_id
+          AND m.curso_id  = v_curso_id
+          AND m.tipo IN ('ingreso', 'aporte')
+          AND m.visible   = TRUE
+      ), 0),
+    'total_gastos',
+      COALESCE((
+        SELECT SUM(m.monto)
+        FROM movimientos m
+        WHERE m.cuenta_id = p_cuenta_id
+          AND m.curso_id  = v_curso_id
+          AND m.tipo IN ('gasto', 'egreso')
+          AND m.visible   = TRUE
+      ), 0),
+    'total_ingresos',
+      COALESCE((
+        SELECT SUM(p.monto) FROM pagos p
+        WHERE p.cuenta_id = p_cuenta_id
+          AND p.alumno_id IN (SELECT a.id FROM alumnos a WHERE a.cuenta_id = p_cuenta_id AND a.curso_id = v_curso_id)
+          AND p.estado = 'pagado'
+      ), 0)
+      + COALESCE((
+        SELECT SUM(ab.monto) FROM abonos ab
+        JOIN planes_pago pp ON pp.cuenta_id = ab.cuenta_id AND pp.id = ab.plan_id
+        WHERE ab.cuenta_id = p_cuenta_id
+          AND pp.alumno_id IN (SELECT a.id FROM alumnos a WHERE a.cuenta_id = p_cuenta_id AND a.curso_id = v_curso_id)
+          AND ab.pagado = TRUE AND pp.activo = TRUE
+      ), 0)
+      + COALESCE((
+        SELECT SUM(m.monto) FROM movimientos m
+        WHERE m.cuenta_id = p_cuenta_id AND m.curso_id = v_curso_id
+          AND m.tipo IN ('ingreso', 'aporte') AND m.visible = TRUE
+      ), 0),
+    'saldo',
+      COALESCE((
+        SELECT SUM(p.monto) FROM pagos p
+        WHERE p.cuenta_id = p_cuenta_id
+          AND p.alumno_id IN (SELECT a.id FROM alumnos a WHERE a.cuenta_id = p_cuenta_id AND a.curso_id = v_curso_id)
+          AND p.estado = 'pagado'
+      ), 0)
+      + COALESCE((
+        SELECT SUM(ab.monto) FROM abonos ab
+        JOIN planes_pago pp ON pp.cuenta_id = ab.cuenta_id AND pp.id = ab.plan_id
+        WHERE ab.cuenta_id = p_cuenta_id
+          AND pp.alumno_id IN (SELECT a.id FROM alumnos a WHERE a.cuenta_id = p_cuenta_id AND a.curso_id = v_curso_id)
+          AND ab.pagado = TRUE AND pp.activo = TRUE
+      ), 0)
+      + COALESCE((
+        SELECT SUM(m.monto) FROM movimientos m
+        WHERE m.cuenta_id = p_cuenta_id AND m.curso_id = v_curso_id
+          AND m.tipo IN ('ingreso', 'aporte') AND m.visible = TRUE
+      ), 0)
+      - COALESCE((
+        SELECT SUM(m.monto) FROM movimientos m
+        WHERE m.cuenta_id = p_cuenta_id AND m.curso_id = v_curso_id
+          AND m.tipo IN ('gasto', 'egreso') AND m.visible = TRUE
+      ), 0)
   )
-  INTO v_balance
-  FROM movimientos m
-  WHERE m.cuenta_id = p_cuenta_id
-    AND m.curso_id  = v_curso_id
-    AND m.visible   = TRUE;
+  INTO v_balance;
 
   RETURN jsonb_build_object(
     'pagos',          v_pagos,
