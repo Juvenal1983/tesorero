@@ -627,3 +627,72 @@ async function v9AluAgregarContacto(cuentaId, alumnoId, pin, nombre, relacion, t
     p_email:     email     ?? null,
   });
 }
+
+// ── Acceso compartido CC-XXXX ─────────────────────────────────
+
+/**
+ * Verifica un código CC-XXXX y devuelve los datos del curso.
+ * No requiere PIN: el código CC es la credencial de transparencia.
+ *
+ * RPC: apoderado_cc_verificar(p_codigo_cc TEXT)
+ * Retorna: TABLE(cuenta_id, curso_id, nombre_curso, anio)
+ *          → una fila si válido, cero filas si inválido/inactivo.
+ *
+ * @param {string} codigoCc — código con formato CC-XXXX-XXXX
+ * @returns {Promise<{cuenta_id, curso_id, nombre_curso, anio}|null>}
+ */
+async function v9CcVerificar(codigoCc) {
+  const filas = await (async () => {
+    const base = _v9BaseUrl().replace('/rest/v1', '') + '/rest/v1';
+    const res  = await fetch(base + '/rpc/apoderado_cc_verificar', {
+      method:  'POST',
+      headers: {
+        'apikey':        SUPA_KEY,
+        'Authorization': 'Bearer ' + SUPA_KEY,
+        'Content-Type':  'application/json',
+        'Accept':        'application/json',
+      },
+      body: JSON.stringify({ p_codigo_cc: codigoCc }),
+    });
+    if (!res.ok) {
+      let body = ''; try { body = await res.text(); } catch (_) {}
+      throw new Error(`[datos_v9] v9CcVerificar → HTTP ${res.status}: ${body}`);
+    }
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  })();
+  return filas.length > 0 ? filas[0] : null;
+}
+
+/**
+ * Devuelve el resumen de pagos de todos los alumnos del curso.
+ * Se llama solo después de verificar el código con v9CcVerificar().
+ * No requiere PIN.
+ *
+ * RPC: apoderado_cc_resumen_pagos(p_cuenta_id UUID, p_curso_id TEXT)
+ * Retorna: TABLE(alumno_id, nombre, monto_pagado, monto_abonado,
+ *                monto_pendiente, num_cuotas_pagadas, num_cuotas_pendientes)
+ *
+ * @param {string} cuentaId
+ * @param {string} cursoId
+ * @returns {Promise<Array>}
+ */
+async function v9CcResumenPagos(cuentaId, cursoId) {
+  const base = _v9BaseUrl().replace('/rest/v1', '') + '/rest/v1';
+  const res  = await fetch(base + '/rpc/apoderado_cc_resumen_pagos', {
+    method:  'POST',
+    headers: {
+      'apikey':        SUPA_KEY,
+      'Authorization': 'Bearer ' + SUPA_KEY,
+      'Content-Type':  'application/json',
+      'Accept':        'application/json',
+    },
+    body: JSON.stringify({ p_cuenta_id: cuentaId, p_curso_id: cursoId }),
+  });
+  if (!res.ok) {
+    let body = ''; try { body = await res.text(); } catch (_) {}
+    throw new Error(`[datos_v9] v9CcResumenPagos → HTTP ${res.status}: ${body}`);
+  }
+  const data = await res.json();
+  return Array.isArray(data) ? data : [];
+}

@@ -1540,6 +1540,40 @@ async function doVerificarCodigoV9() {
   errEl.style.display = 'none';
   if (btn) { btn.textContent = 'Buscando...'; btn.disabled = true; }
 
+  // ── Código CC-XXXX: acceso compartido sin PIN ──────────────
+  if (code.startsWith('CC-')) {
+    try {
+      const curso = await v9CcVerificar(code);
+      if (!curso) {
+        errEl.textContent = 'Código de acceso compartido inválido o expirado.';
+        errEl.style.display = '';
+        return;
+      }
+      // Sesión de acceso compartido (sin alumno, sin PIN)
+      S.session = {
+        id:               'cc_' + curso.curso_id,
+        rol:              'compartido_v9',
+        nombre:           'Acceso compartido',
+        cursoIds:         [curso.curso_id],
+        alumnoId:         null,
+        esAccesoCompartido: true,
+        _v9CuentaId:      curso.cuenta_id,
+        _v9CursoId:       curso.curso_id,
+        _v9NombreCurso:   curso.nombre_curso,
+        _v9CodigoCc:      code,
+      };
+      S.cursoId = curso.curso_id;
+      go('resumen-cc');
+    } catch (err) {
+      console.error('[v9] doVerificarCodigoV9 (CC):', err);
+      errEl.textContent = 'Error de conexión. Verifica tu internet e intenta de nuevo.';
+      errEl.style.display = '';
+    } finally {
+      if (btn) { btn.textContent = 'Verificar código →'; btn.disabled = false; }
+    }
+    return;
+  }
+
   try {
     const filas = await v9AluSelector(code);
 
@@ -2062,4 +2096,107 @@ async function _apV9GuardarContacto(apodId) {
   } finally {
     if (btn) { btn.textContent = 'Guardar'; btn.disabled = false; }
   }
+}
+
+// ══════════════════════════════════════════════════════════════
+// Acceso compartido CC-XXXX — renderResumenCc() y helpers
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * Vista de acceso compartido (rol compartido_v9).
+ * Muestra el estado de pagos del curso completo sin requerir PIN.
+ * Se activa cuando el tesorero genera un código CC-XXXX y lo comparte.
+ */
+function renderResumenCc() {
+  const ses = S.session || {};
+  const nombre = escHtml(ses._v9NombreCurso || 'Curso');
+  const codigo = escHtml(ses._v9CodigoCc || '');
+
+  setTimeout(_cargarResumenCc, 50);
+
+  return `
+  <div style="padding:16px;max-width:640px;margin:0 auto">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
+      <div style="font-size:20px;font-weight:700">Estado de pagos</div>
+      <div style="font-size:11px;background:var(--gl);color:var(--t3);padding:2px 8px;border-radius:20px;font-weight:600">${codigo}</div>
+    </div>
+    <div style="font-size:15px;color:var(--t2);margin-bottom:20px">${nombre}</div>
+
+    <div id="cc-resumen-cuerpo" style="background:var(--wh);border:1px solid var(--brd);border-radius:var(--rad);overflow:hidden">
+      <div style="padding:20px;color:var(--t3);font-size:13px">Cargando…</div>
+    </div>
+
+    <button class="btn bs" onclick="logoutCompartidoV9()" style="margin-top:16px;width:100%">
+      Cerrar acceso compartido
+    </button>
+  </div>`;
+}
+
+async function _cargarResumenCc() {
+  const ses = S.session;
+  if (!ses || ses.rol !== 'compartido_v9') return;
+
+  const el = document.getElementById('cc-resumen-cuerpo');
+  if (!el) return;
+
+  try {
+    const filas = await v9CcResumenPagos(ses._v9CuentaId, ses._v9CursoId);
+
+    if (!filas || filas.length === 0) {
+      el.innerHTML = '<div style="padding:20px;color:var(--t3);font-size:13px">No hay alumnos en este curso.</div>';
+      return;
+    }
+
+    // Encabezado
+    const header = `
+      <div style="display:grid;grid-template-columns:1fr auto auto;gap:8px;padding:10px 16px;
+                  background:var(--gl);border-bottom:1px solid var(--brd);
+                  font-size:11px;font-weight:600;color:var(--t3);text-transform:uppercase;letter-spacing:.5px">
+        <div>Nombre</div>
+        <div style="text-align:right">Pagado</div>
+        <div style="text-align:right">Pendiente</div>
+      </div>`;
+
+    const fimp = (n) => '$ ' + Number(n||0).toLocaleString('es-CL');
+
+    const filas_html = filas.map(f => {
+      const nombre = escHtml(f.nombre || f.alumno_id);
+      const pagado  = (f.monto_pagado || 0) + (f.monto_abonado || 0);
+      const pendiente = f.monto_pendiente || 0;
+      const color = pendiente === 0 ? 'var(--v)' : 'var(--r)';
+      return `
+        <div style="display:grid;grid-template-columns:1fr auto auto;gap:8px;padding:10px 16px;
+                    border-bottom:1px solid var(--brd);font-size:14px;align-items:center">
+          <div style="font-weight:500">${nombre}</div>
+          <div style="text-align:right;color:var(--t2)">${fimp(pagado)}</div>
+          <div style="text-align:right;font-weight:600;color:${color}">${pendiente > 0 ? fimp(pendiente) : '✓ Al día'}</div>
+        </div>`;
+    }).join('');
+
+    // Totales
+    const totalPagado   = filas.reduce((s, f) => s + (f.monto_pagado||0) + (f.monto_abonado||0), 0);
+    const totalPendiente = filas.reduce((s, f) => s + (f.monto_pendiente||0), 0);
+    const footer = `
+      <div style="display:grid;grid-template-columns:1fr auto auto;gap:8px;padding:10px 16px;
+                  background:var(--gl);font-size:13px;font-weight:700">
+        <div>Total curso</div>
+        <div style="text-align:right">${fimp(totalPagado)}</div>
+        <div style="text-align:right;color:${totalPendiente>0?'var(--r)':'var(--v)'}">
+          ${totalPendiente > 0 ? fimp(totalPendiente) : '✓ Todos al día'}
+        </div>
+      </div>`;
+
+    el.innerHTML = header + filas_html + footer;
+
+  } catch (err) {
+    console.error('[v9] _cargarResumenCc:', err);
+    el.innerHTML = '<div style="padding:20px;color:var(--r);font-size:13px">Error al cargar el resumen. Intenta de nuevo más tarde.</div>';
+  }
+}
+
+/** Cierra la sesión de acceso compartido CC-XXXX. */
+function logoutCompartidoV9() {
+  S.session = null;
+  S.cursoId = null;
+  go('acceso');
 }

@@ -137,6 +137,47 @@ DELETE FROM pagos
 WHERE cuenta_id = '00000000-0000-0000-aaaa-000000000001'::uuid
   AND id = 'pago-a-tst-abr';
 
+-- ── Fixtures de exclusión para P17b ────────────────────────────
+-- Estos registros NO deben sumarse en el balance_curso de cur-a-01.
+
+-- (E1) Pago PENDIENTE de alu-a-01 → excluido por estado <> 'pagado'
+-- Usamos cuota-a-01 con periodo Febrero 2025 (no existe en calendarios de test)
+-- para no interferir con PC2 que verifica cuota-a-02 sin fila de pago.
+INSERT INTO pagos (cuenta_id, id, alumno_id, cuota_id, monto, fecha, medio, estado, periodo)
+VALUES (
+  '00000000-0000-0000-aaaa-000000000001'::uuid,
+  'pago-a-excl-pendiente', 'alu-a-01', 'cuota-a-01',
+  9999, '2025-02-10', 'transferencia', 'pendiente', 'Febrero 2025'
+)
+ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+-- (E2) Plan INACTIVO con abono pagado → excluido por planes_pago.activo = FALSE
+INSERT INTO planes_pago (cuenta_id, id, alumno_id, cuota_id, periodo, monto_total, activo, creado_en)
+VALUES (
+  '00000000-0000-0000-aaaa-000000000001'::uuid,
+  'plan-a-inactivo', 'alu-a-01', 'cuota-a-01',
+  '2025-03', 7000, FALSE, '2025-03-01'
+)
+ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+INSERT INTO abonos (cuenta_id, id, alumno_id, cuota_id, plan_id, monto, fecha, pagado, estado)
+VALUES (
+  '00000000-0000-0000-aaaa-000000000001'::uuid,
+  'abono-a-inactivo', 'alu-a-01', 'cuota-a-01', 'plan-a-inactivo',
+  7777, '2025-03-05', TRUE, 'pagado'
+)
+ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+-- (E3) Movimiento de OTRO CURSO (cur-a-02) → excluido por curso_id <> cur-a-01
+INSERT INTO movimientos (cuenta_id, id, curso_id, tipo, monto, "desc", fecha, visible)
+VALUES (
+  '00000000-0000-0000-aaaa-000000000001'::uuid,
+  'mov-a-otro-curso', 'cur-a-02', 'ingreso', 11111,
+  'Ingreso de otro curso — no debe sumar', '2025-03-15',
+  TRUE
+)
+ON CONFLICT (cuenta_id, id) DO NOTHING;
+
 -- ── Verificación ────────────────────────────────────────────────
 DO $$
 DECLARE errores INT := 0;

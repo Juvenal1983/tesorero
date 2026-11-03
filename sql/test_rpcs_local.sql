@@ -327,37 +327,79 @@ BEGIN
   ASSERT jsonb_typeof(v->'balance_curso') = 'object', 'P17 FAIL: balance_curso no es object';
   RAISE NOTICE '[OK] P17a: estructura completa (pagos, planes, comprobantes, balance_curso)';
 
-  -- balance_curso: campos presentes, importes exactos y coherencia aritmética.
+  -- ── P17b: balance_curso — lógica calcFinanzas() ─────────────────
   --
-  -- Movimientos de cur-a-01 usados por el fixture 09e:
-  --   mov-a-01: gasto  8000  visible=TRUE   → cuenta como gasto
-  --   mov-a-02: gasto  3000  visible=FALSE  → excluido (oculto)
-  --   mov-a-03: ingreso 15000 visible=TRUE  → cuenta como ingreso
+  -- El RPC aplica la misma regla que calcFinanzas() del frontend:
+  --   total_ingresos = pagos_pagados + abonos_pagados_planes_activos + movimientos_ingreso_visible
+  --   total_gastos   = movimientos_gasto_visible
+  --   saldo          = total_ingresos - total_gastos
   --
-  -- Pagos de cuotas (tabla pagos) NO se incluyen en movimientos — es correcto
-  -- por diseño: movimientos es el flujo de caja del curso; pagos es la
-  -- cobranza individual de alumnos. Los importes aquí reflejan solo movimientos.
+  -- Datos activos del fixture (cur-a-01, cuenta_a):
   --
-  -- Valores esperados:
-  --   total_ingresos = 15000   (solo mov-a-03)
-  --   total_gastos   =  8000   (solo mov-a-01; mov-a-02 excluido por visible=FALSE)
-  --   saldo          =  7000   (15000 - 8000)
+  --   PAGOS PAGADOS (alumnos de cur-a-01: alu-a-01, alu-a-02):
+  --     pago-a-01          alu-a-01  15000 pagado  SUMA
+  --     pago-a-02          alu-a-02  15000 pagado  SUMA (mismo curso)
+  --     pago-a-tst-mar     alu-a-01  15000 pagado  SUMA
+  --     pago-a-excl-pendiente alu-a-01 9999 pendiente  EXCLUIDO (estado<>pagado)
+  --     total_recaudado_cuotas = 45000
+  --
+  --   ABONOS PAGADOS (planes activos, alumnos de cur-a-01):
+  --     abono-a-09e   plan-a-09e (activo=TRUE)  5000 pagado=TRUE  SUMA
+  --     abono-a-01    plan-a-01  pagado=FALSE         EXCLUIDO
+  --     abono-a-inactivo plan-a-inactivo (activo=FALSE) 7777 pagado=TRUE  EXCLUIDO
+  --     total_abonos_pagados = 5000
+  --
+  --   MOVIMIENTOS INGRESO visible=TRUE, curso=cur-a-01:
+  --     mov-a-03  ingreso  15000  visible=TRUE   SUMA
+  --     mov-a-otro-curso ingreso 11111 cur-a-02  EXCLUIDO (otro curso)
+  --     total_ingresos_extra = 15000
+  --
+  --   MOVIMIENTOS GASTO visible=TRUE, curso=cur-a-01:
+  --     mov-a-01  gasto   8000  visible=TRUE    SUMA
+  --     mov-a-02  gasto   3000  visible=FALSE   EXCLUIDO
+  --     total_gastos = 8000
+  --
+  --   TOTALES:
+  --     total_ingresos = 45000+5000+15000 = 65000
+  --     total_gastos   = 8000
+  --     saldo          = 57000
   balance := v->'balance_curso';
-  ASSERT balance ? 'total_ingresos', 'P17b FAIL: falta total_ingresos en balance_curso';
-  ASSERT balance ? 'total_gastos',   'P17b FAIL: falta total_gastos en balance_curso';
-  ASSERT balance ? 'saldo',          'P17b FAIL: falta saldo en balance_curso';
-  -- Importes exactos esperados del fixture 09e
-  ASSERT (balance->>'total_ingresos')::numeric = 15000,
-    format('P17b FAIL: total_ingresos esperado 15000, obtenido %s', balance->>'total_ingresos');
+
+  -- Campos presentes
+  ASSERT balance ? 'total_ingresos',        'P17b FAIL: falta total_ingresos en balance_curso';
+  ASSERT balance ? 'total_gastos',          'P17b FAIL: falta total_gastos en balance_curso';
+  ASSERT balance ? 'saldo',                 'P17b FAIL: falta saldo en balance_curso';
+  ASSERT balance ? 'total_recaudado_cuotas','P17b FAIL: falta total_recaudado_cuotas en balance_curso';
+  ASSERT balance ? 'total_abonos_pagados',  'P17b FAIL: falta total_abonos_pagados en balance_curso';
+  ASSERT balance ? 'total_ingresos_extra',  'P17b FAIL: falta total_ingresos_extra en balance_curso';
+
+  -- Componentes individuales (verifican cada exclusión)
+  ASSERT (balance->>'total_recaudado_cuotas')::numeric = 45000,
+    format('P17b FAIL: total_recaudado_cuotas esperado 45000, obtenido %s (debe excluir estado pendiente)', balance->>'total_recaudado_cuotas');
+  ASSERT (balance->>'total_abonos_pagados')::numeric = 5000,
+    format('P17b FAIL: total_abonos_pagados esperado 5000, obtenido %s (debe excluir plan inactivo y pagado=false)', balance->>'total_abonos_pagados');
+  ASSERT (balance->>'total_ingresos_extra')::numeric = 15000,
+    format('P17b FAIL: total_ingresos_extra esperado 15000, obtenido %s (debe excluir otro curso)', balance->>'total_ingresos_extra');
+
+  -- Totales
+  ASSERT (balance->>'total_ingresos')::numeric = 65000,
+    format('P17b FAIL: total_ingresos esperado 65000, obtenido %s', balance->>'total_ingresos');
   ASSERT (balance->>'total_gastos')::numeric = 8000,
-    format('P17b FAIL: total_gastos esperado 8000, obtenido %s', balance->>'total_gastos');
-  ASSERT (balance->>'saldo')::numeric = 7000,
-    format('P17b FAIL: saldo esperado 7000, obtenido %s', balance->>'saldo');
-  -- Coherencia aritmética (también válida como invariante general)
+    format('P17b FAIL: total_gastos esperado 8000, obtenido %s (debe excluir visible=false)', balance->>'total_gastos');
+  ASSERT (balance->>'saldo')::numeric = 57000,
+    format('P17b FAIL: saldo esperado 57000, obtenido %s', balance->>'saldo');
+
+  -- Coherencia aritmética interna
   ASSERT (balance->>'saldo')::numeric
        = (balance->>'total_ingresos')::numeric - (balance->>'total_gastos')::numeric,
     format('P17b FAIL: saldo no cuadra: %s', balance);
-  RAISE NOTICE '[OK] P17b: balance_curso ingresos=15000 gastos=8000 saldo=7000 (importes exactos del fixture)';
+  ASSERT (balance->>'total_ingresos')::numeric
+       = (balance->>'total_recaudado_cuotas')::numeric
+       + (balance->>'total_abonos_pagados')::numeric
+       + (balance->>'total_ingresos_extra')::numeric,
+    format('P17b FAIL: total_ingresos no suma componentes: %s', balance);
+
+  RAISE NOTICE '[OK] P17b: balance_curso ingresos=65000 gastos=8000 saldo=57000 (pagos+abonos+movimientos; exclusiones verificadas)';
 
   -- planes: desglose de abonos por plan
   IF jsonb_array_length(v->'planes') > 0 THEN
@@ -621,6 +663,95 @@ END;
 $$;
 
 ROLLBACK TO SAVEPOINT sp_revocacion;
+
+-- ══════════════════════════════════════════════════════════════
+-- CC: Acceso compartido (codigo_compartido / CC-XXXX)
+-- CC1: verificar código válido retorna datos del curso
+-- CC2: código inválido retorna vacío
+-- CC3: resumen de pagos retorna todos los alumnos del curso
+-- CC4: resumen excluye alumnos de otro curso
+-- CC5: generar código CC con PIN correcto
+-- CC6: generar falla con PIN incorrecto
+-- CC7: revocar código CC con PIN correcto
+-- ══════════════════════════════════════════════════════════════
+DO $$
+DECLARE
+  cuenta_a UUID := '00000000-0000-0000-aaaa-000000000001'::uuid;
+  fila     RECORD;
+  cnt      INT;
+  nueva_cc JSONB;
+  cc_cod   TEXT;
+BEGIN
+  -- CC1: código CC-TEST-0001 debe encontrar cur-a-01
+  SELECT * INTO fila FROM apoderado_cc_verificar('CC-TEST-0001');
+  ASSERT fila IS NOT NULL,
+    'CC1 FAIL: CC-TEST-0001 no encontró ningún curso';
+  ASSERT fila.curso_id = 'cur-a-01',
+    format('CC1 FAIL: esperaba cur-a-01, obtuvo %s', fila.curso_id);
+  ASSERT fila.nombre_curso IS NOT NULL AND fila.nombre_curso <> '',
+    'CC1 FAIL: nombre_curso vacío';
+  RAISE NOTICE '[OK] CC1: CC-TEST-0001 retorna cur-a-01 "%"', fila.nombre_curso;
+
+  -- CC2: código inválido retorna vacío
+  SELECT count(*) INTO cnt FROM apoderado_cc_verificar('CC-FAKE-9999');
+  ASSERT cnt = 0,
+    format('CC2 FAIL: código inválido debería retornar 0 filas, retornó %s', cnt);
+  RAISE NOTICE '[OK] CC2: código inválido retorna 0 filas';
+
+  -- CC3: resumen retorna ambos alumnos del curso
+  SELECT count(*) INTO cnt
+  FROM apoderado_cc_resumen_pagos(cuenta_a, 'cur-a-01');
+  ASSERT cnt = 2,
+    format('CC3 FAIL: esperaba 2 alumnos, obtuvo %s', cnt);
+  RAISE NOTICE '[OK] CC3: resumen incluye % alumnos en cur-a-01', cnt;
+
+  -- CC4: resumen de cur-a-02 no incluye alumnos de cur-a-01
+  SELECT count(*) INTO cnt
+  FROM apoderado_cc_resumen_pagos(cuenta_a, 'cur-a-02');
+  -- cur-a-02 puede tener 0 o más alumnos; verificamos que alu-a-01 y alu-a-02 no estén
+  FOR fila IN SELECT * FROM apoderado_cc_resumen_pagos(cuenta_a, 'cur-a-02') LOOP
+    ASSERT fila.alumno_id NOT IN ('alu-a-01', 'alu-a-02'),
+      format('CC4 FAIL: alu-a-01/alu-a-02 aparecieron en cur-a-02');
+  END LOOP;
+  RAISE NOTICE '[OK] CC4: resumen de cur-a-02 excluye alumnos de cur-a-01';
+
+  -- CC5: generar código CC con PIN correcto
+  nueva_cc := apoderado_cc_generar(cuenta_a, 'cur-a-01', 'alu-a-01', '1234');
+  ASSERT nueva_cc ? 'codigo_cc',
+    format('CC5 FAIL: respuesta no tiene clave codigo_cc: %s', nueva_cc);
+  cc_cod := nueva_cc->>'codigo_cc';
+  ASSERT cc_cod LIKE 'CC-%-%',
+    format('CC5 FAIL: código generado no tiene formato CC-XXXX-XXXX: %s', cc_cod);
+  -- Verificar que quedó en la BD
+  SELECT count(*) INTO cnt FROM cursos
+  WHERE cuenta_id = cuenta_a AND id = 'cur-a-01' AND codigo_compartido = cc_cod;
+  ASSERT cnt = 1,
+    format('CC5 FAIL: código %s no quedó en cursos.codigo_compartido', cc_cod);
+  RAISE NOTICE '[OK] CC5: código generado % guardado en cursos', cc_cod;
+
+  -- CC6: generar falla con PIN incorrecto
+  BEGIN
+    PERFORM apoderado_cc_generar(cuenta_a, 'cur-a-01', 'alu-a-01', '0000');
+    RAISE EXCEPTION 'CC6 FAIL: debería haber lanzado excepción con PIN incorrecto';
+  EXCEPTION WHEN SQLSTATE 'P0001' THEN
+    RAISE NOTICE '[OK] CC6: PIN incorrecto lanza excepción P0001';
+  END;
+
+  -- CC7: revocar código CC con PIN correcto
+  PERFORM apoderado_cc_revocar(cuenta_a, 'cur-a-01', 'alu-a-01', '1234');
+  SELECT count(*) INTO cnt FROM cursos
+  WHERE cuenta_id = cuenta_a AND id = 'cur-a-01'
+    AND codigo_compartido IS NOT NULL;
+  ASSERT cnt = 0,
+    'CC7 FAIL: codigo_compartido no fue eliminado tras revocar';
+  RAISE NOTICE '[OK] CC7: código CC revocado (NULL en cursos)';
+
+  -- Restaurar CC-TEST-0001 para no romper tests subsiguientes
+  UPDATE cursos SET codigo_compartido = 'CC-TEST-0001'
+  WHERE cuenta_id = cuenta_a AND id = 'cur-a-01';
+
+END;
+$$;
 
 -- ── Fin ────────────────────────────────────────────────────────
 DO $$

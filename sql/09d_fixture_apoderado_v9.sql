@@ -42,6 +42,15 @@ WHERE cuenta_id = '00000000-0000-0000-bbbb-000000000002'::uuid
 -- cur-a-02: sin codigo — verifica que alumnos de ese curso no sean accesibles.
 -- No se toca.
 
+-- ── Código CC de acceso compartido para cur-a-01 ───────────────
+-- Solo para staging/pruebas. En producción el tesorero lo genera
+-- desde la UI y queda almacenado en cursos.codigo_compartido.
+UPDATE cursos
+SET codigo_compartido = 'CC-TEST-0001'
+WHERE cuenta_id = '00000000-0000-0000-aaaa-000000000001'::uuid
+  AND id = 'cur-a-01'
+  AND (codigo_compartido IS NULL OR codigo_compartido = '');
+
 -- ── 2. Credenciales PIN para alumnos ──────────────────────────
 -- crypt() y gen_salt() requieren pgcrypto. En Supabase puede estar en
 -- el schema 'extensions'; SET search_path lo cubre en la sesión.
@@ -104,6 +113,16 @@ BEGIN
       AND id = 'cur-a-02' AND codigo IS NOT NULL AND codigo <> ''
   ) THEN
     RAISE WARNING 'cur-a-02 tiene codigo inesperado (debería ser NULL)';
+    errores := errores + 1;
+  END IF;
+
+  -- Verificar código compartido CC-TEST-0001 en cur-a-01
+  IF NOT EXISTS(
+    SELECT 1 FROM cursos
+    WHERE cuenta_id = '00000000-0000-0000-aaaa-000000000001'
+      AND id = 'cur-a-01' AND codigo_compartido = 'CC-TEST-0001'
+  ) THEN
+    RAISE WARNING 'cur-a-01 no tiene codigo_compartido=CC-TEST-0001';
     errores := errores + 1;
   END IF;
 

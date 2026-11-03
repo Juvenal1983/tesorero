@@ -84,6 +84,12 @@ function renderRoute(){
     // Para cualquier otra ruta (incluido 'dashboard') renderizar el dashboard del apoderado
     return renderDashboardApoderadoV9();
   }
+
+  // ── Guard compartido_v9 ───────────────────────────────────────────────────
+  // Acceso compartido CC-XXXX: solo ve el resumen de pagos del curso.
+  if (S.session && S.session.rol === 'compartido_v9') {
+    return renderResumenCc();
+  }
   // ── Rutas estándar (tesorero / admin / editor / visor / apoderado_lector) ──
   switch(S.route){
     case 'dashboard': return renderDashboard();
