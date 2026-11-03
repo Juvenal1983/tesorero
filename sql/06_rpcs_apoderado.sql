@@ -295,33 +295,120 @@ BEGIN
     AND ap.alumno_id = p_alumno_id
     AND ap.estado = 'activo';
 
-  -- Estado de cuotas activas del curso — UNA FILA POR PAGO (granularidad por período).
-  -- Si la cuota tiene pagos en Marzo (pagado) y Abril (pendiente), retorna dos filas.
-  -- Cuotas sin ningún pago para este alumno: una fila con periodo=NULL y 'pendiente'.
-  -- eximido sobreescribe todos los estados si el alumno tiene ese flag.
+  -- Estado de cuotas activas del curso — granularidad por período.
+  --
+  -- Cuotas tipo='mensual':
+  --   Se generan los períodos esperados según el CALENDARIO de la cuota
+  --   (mes_inicio..mes_termino del curso o de la propia cuota) y se hace
+  --   LEFT JOIN con pagos.  Un período sin ninguna fila en pagos aparece
+  --   como 'pendiente' con pago_id=NULL.  Esto garantiza que un mes que
+  --   nunca fue registrado en pagos igual se informa al apoderado.
+  --
+  -- Cuotas de otro tipo (anual, etc.):
+  --   LEFT JOIN directo sobre pagos; sin pago → una fila con periodo=NULL
+  --   y estado='pendiente' (comportamiento anterior).
+  --
+  -- eximido sobreescribe todos los estados.
+  WITH
+  -- Nombres de mes en español (array 1-based)
+  meses(idx, nombre) AS (
+    VALUES (0,'Enero'),(1,'Febrero'),(2,'Marzo'),(3,'Abril'),
+           (4,'Mayo'),(5,'Junio'),(6,'Julio'),(7,'Agosto'),
+           (8,'Septiembre'),(9,'Octubre'),(10,'Noviembre'),(11,'Diciembre')
+  ),
+  -- Cuotas activas del curso con datos del curso para fallback de calendario
+  cuotas_activas AS (
+    SELECT
+      c.id            AS cuota_id,
+      c.nombre        AS cuota_nombre,
+      c.monto         AS cuota_monto,
+      c.tipo          AS cuota_tipo,
+      COALESCE(c.mes_inicio,   cur.mes_inicio_cuota, 0)  AS mes_ini,
+      COALESCE(c.mes_termino,  cur.mes_termino_cuota, 11) AS mes_fin,
+      COALESCE(c.anio,         cur.anio,
+               EXTRACT(YEAR FROM CURRENT_DATE)::int)      AS anio
+    FROM cuotas c
+    JOIN cursos cur
+      ON  cur.cuenta_id = c.cuenta_id
+      AND cur.id        = c.curso_id
+    WHERE c.cuenta_id = p_cuenta_id
+      AND c.curso_id  = v_curso_id
+      AND c.activa    = TRUE
+  ),
+  -- Períodos esperados para cuotas mensuales (uno por mes del calendario)
+  periodos_mensuales AS (
+    SELECT
+      ca.cuota_id,
+      ca.cuota_nombre,
+      ca.cuota_monto,
+      ca.cuota_tipo,
+      m.nombre || ' ' || ca.anio AS periodo_esperado
+    FROM cuotas_activas ca
+    JOIN generate_series(0, 11) AS gs(mes) ON gs.mes BETWEEN ca.mes_ini AND ca.mes_fin
+    JOIN meses m ON m.idx = gs.mes
+    WHERE ca.cuota_tipo = 'mensual'
+  ),
+  -- Resultado para cuotas mensuales: LEFT JOIN con pago real
+  estado_mensual AS (
+    SELECT
+      pm.cuota_id,
+      pm.cuota_nombre,
+      pm.cuota_monto,
+      pm.cuota_tipo,
+      pm.periodo_esperado  AS periodo,
+      p.id                 AS pago_id,
+      CASE
+        WHEN (SELECT eximido FROM alumnos
+              WHERE cuenta_id = p_cuenta_id AND id = p_alumno_id) THEN 'eximido'
+        WHEN p.id IS NOT NULL THEN COALESCE(p.estado, 'pendiente')
+        ELSE 'pendiente'
+      END AS estado_pago
+    FROM periodos_mensuales pm
+    LEFT JOIN pagos p
+      ON  p.cuenta_id = p_cuenta_id
+      AND p.cuota_id  = pm.cuota_id
+      AND p.alumno_id = p_alumno_id
+      AND p.periodo   = pm.periodo_esperado
+  ),
+  -- Resultado para cuotas no-mensuales: LEFT JOIN directo
+  estado_otros AS (
+    SELECT
+      ca.cuota_id,
+      ca.cuota_nombre,
+      ca.cuota_monto,
+      ca.cuota_tipo,
+      p.periodo,
+      p.id AS pago_id,
+      CASE
+        WHEN (SELECT eximido FROM alumnos
+              WHERE cuenta_id = p_cuenta_id AND id = p_alumno_id) THEN 'eximido'
+        WHEN p.id IS NOT NULL THEN COALESCE(p.estado, 'pendiente')
+        ELSE 'pendiente'
+      END AS estado_pago
+    FROM cuotas_activas ca
+    LEFT JOIN pagos p
+      ON  p.cuenta_id = p_cuenta_id
+      AND p.cuota_id  = ca.cuota_id
+      AND p.alumno_id = p_alumno_id
+    WHERE ca.cuota_tipo IS DISTINCT FROM 'mensual'
+  ),
+  -- Unión de ambos resultados
+  estado_union AS (
+    SELECT * FROM estado_mensual
+    UNION ALL
+    SELECT * FROM estado_otros
+  )
   SELECT COALESCE(jsonb_agg(jsonb_build_object(
-    'cuota_id',   c.id,
-    'nombre',     c.nombre,
-    'monto',      c.monto,
-    'tipo',       c.tipo,
-    'periodo',    p.periodo,
-    'pago_id',    p.id,
-    'estado_pago', CASE
-      WHEN (SELECT eximido FROM alumnos
-            WHERE cuenta_id = p_cuenta_id AND id = p_alumno_id) THEN 'eximido'
-      WHEN p.id IS NOT NULL THEN COALESCE(p.estado, 'pendiente')
-      ELSE 'pendiente'
-    END
-  ) ORDER BY c.nombre, p.periodo NULLS LAST), '[]'::jsonb)
+    'cuota_id',   eu.cuota_id,
+    'nombre',     eu.cuota_nombre,
+    'monto',      eu.cuota_monto,
+    'tipo',       eu.cuota_tipo,
+    'periodo',    eu.periodo,
+    'pago_id',    eu.pago_id,
+    'estado_pago', eu.estado_pago
+  ) ORDER BY eu.cuota_nombre, eu.periodo NULLS LAST), '[]'::jsonb)
   INTO v_cuotas
-  FROM cuotas c
-  LEFT JOIN pagos p
-    ON  p.cuenta_id = c.cuenta_id
-    AND p.cuota_id  = c.id
-    AND p.alumno_id = p_alumno_id
-  WHERE c.cuenta_id = p_cuenta_id
-    AND c.curso_id  = v_curso_id
-    AND c.activa    = TRUE;
+  FROM estado_union eu;
 
   RETURN jsonb_build_object(
     'alumno',        v_alumno,

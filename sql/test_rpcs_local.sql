@@ -30,7 +30,8 @@
 --   PR         Revocación: cambio PIN, alumno inactivo, curso inactivo + selector
 --   PC         Contenido correcto: cuotas formato por período (LEFT JOIN), comprobantes,
 --                aislamiento de pagos, plan con monto_abonado correcto
---   PC-PERIOD  Misma cuota (cuota-a-tst), mismo alumno: Marzo=pagado, Abril=pendiente
+--   PC-PERIOD  Calendario: cuota-a-tst Marzo=pagado (fila en pagos),
+--              Abril=pendiente (SIN fila en pagos — generado por mes_inicio/mes_termino)
 -- ============================================================
 
 \set ON_ERROR_STOP on
@@ -326,15 +327,37 @@ BEGIN
   ASSERT jsonb_typeof(v->'balance_curso') = 'object', 'P17 FAIL: balance_curso no es object';
   RAISE NOTICE '[OK] P17a: estructura completa (pagos, planes, comprobantes, balance_curso)';
 
-  -- balance_curso: campos presentes y coherentes
+  -- balance_curso: campos presentes, importes exactos y coherencia aritmética.
+  --
+  -- Movimientos de cur-a-01 usados por el fixture 09e:
+  --   mov-a-01: gasto  8000  visible=TRUE   → cuenta como gasto
+  --   mov-a-02: gasto  3000  visible=FALSE  → excluido (oculto)
+  --   mov-a-03: ingreso 15000 visible=TRUE  → cuenta como ingreso
+  --
+  -- Pagos de cuotas (tabla pagos) NO se incluyen en movimientos — es correcto
+  -- por diseño: movimientos es el flujo de caja del curso; pagos es la
+  -- cobranza individual de alumnos. Los importes aquí reflejan solo movimientos.
+  --
+  -- Valores esperados:
+  --   total_ingresos = 15000   (solo mov-a-03)
+  --   total_gastos   =  8000   (solo mov-a-01; mov-a-02 excluido por visible=FALSE)
+  --   saldo          =  7000   (15000 - 8000)
   balance := v->'balance_curso';
   ASSERT balance ? 'total_ingresos', 'P17b FAIL: falta total_ingresos en balance_curso';
   ASSERT balance ? 'total_gastos',   'P17b FAIL: falta total_gastos en balance_curso';
   ASSERT balance ? 'saldo',          'P17b FAIL: falta saldo en balance_curso';
+  -- Importes exactos esperados del fixture 09e
+  ASSERT (balance->>'total_ingresos')::numeric = 15000,
+    format('P17b FAIL: total_ingresos esperado 15000, obtenido %s', balance->>'total_ingresos');
+  ASSERT (balance->>'total_gastos')::numeric = 8000,
+    format('P17b FAIL: total_gastos esperado 8000, obtenido %s', balance->>'total_gastos');
+  ASSERT (balance->>'saldo')::numeric = 7000,
+    format('P17b FAIL: saldo esperado 7000, obtenido %s', balance->>'saldo');
+  -- Coherencia aritmética (también válida como invariante general)
   ASSERT (balance->>'saldo')::numeric
        = (balance->>'total_ingresos')::numeric - (balance->>'total_gastos')::numeric,
     format('P17b FAIL: saldo no cuadra: %s', balance);
-  RAISE NOTICE '[OK] P17b: balance_curso con total_ingresos, total_gastos, saldo coherente';
+  RAISE NOTICE '[OK] P17b: balance_curso ingresos=15000 gastos=8000 saldo=7000 (importes exactos del fixture)';
 
   -- planes: desglose de abonos por plan
   IF jsonb_array_length(v->'planes') > 0 THEN
@@ -457,50 +480,60 @@ BEGIN
 END;
 $$;
 
--- ── PC-PERIOD: Estado por período de la misma cuota ────────────
--- cuota-a-tst tiene dos filas para alu-a-01:
---   Marzo 2025 → pago-a-tst-mar (estado=pagado)
---   Abril 2025 → pago-a-tst-abr (estado=pendiente)
--- El LEFT JOIN produce una fila por pago; ambas para la misma cuota.
--- Usamos datos exclusivos de test (cuota-a-tst) para no depender del
--- estado de staging de cuota-a-02.
+-- ── PC-PERIOD: Estado por período generado por calendario ───────
+--
+-- cuota-a-tst: mensual, mes_inicio=2 (Marzo), mes_termino=3 (Abril), anio=2025
+--
+-- Filas en pagos para alu-a-01 / cuota-a-tst:
+--   pago-a-tst-mar: Marzo 2025, estado=pagado   → tiene fila en BD
+--   Abril 2025:     SIN NINGUNA FILA en pagos   → generado por calendario
+--
+-- El RPC debe retornar DOS filas usando el calendario de la cuota:
+--   - Marzo 2025 → pagado  (con pago_id)
+--   - Abril 2025 → pendiente (pago_id=null, generado sin fila en BD)
+--
+-- Esto verifica la corrección del cálculo por calendario introducido
+-- en la versión v9: la cuota no requiere fila en pagos para mostrar
+-- un período pendiente.
 DO $$
 DECLARE
   v JSONB;
   cuenta_a CONSTANT UUID := '00000000-0000-0000-aaaa-000000000001';
 BEGIN
   RAISE NOTICE '';
-  RAISE NOTICE '=== PC-PERIOD: Estado por período (misma cuota) ===';
+  RAISE NOTICE '=== PC-PERIOD: Estado por período (calendario, sin fila en pagos) ===';
 
   v := apoderado_acceso(cuenta_a, 'alu-a-01', '1234');
 
-  -- Marzo 2025 = pagado
+  -- PC-PERIOD1: Marzo 2025 = pagado (tiene pago en BD)
   ASSERT EXISTS(
     SELECT 1 FROM jsonb_array_elements(v->'cuotas_estado') c
-    WHERE c->>'cuota_id'   = 'cuota-a-tst'
-      AND c->>'periodo'    = 'Marzo 2025'
+    WHERE c->>'cuota_id'    = 'cuota-a-tst'
+      AND c->>'periodo'     = 'Marzo 2025'
       AND c->>'estado_pago' = 'pagado'
-  ), format('PC-PERIOD1 FAIL: cuota-a-tst Marzo 2025 no es pagado: %s', v->'cuotas_estado');
-  RAISE NOTICE '[OK] PC-PERIOD1: cuota-a-tst / Marzo 2025 → pagado';
+      AND (c->>'pago_id') IS NOT NULL
+  ), format('PC-PERIOD1 FAIL: cuota-a-tst Marzo 2025 no es pagado o falta pago_id: %s', v->'cuotas_estado');
+  RAISE NOTICE '[OK] PC-PERIOD1: cuota-a-tst / Marzo 2025 → pagado (con pago_id)';
 
-  -- Abril 2025 = pendiente
+  -- PC-PERIOD2: Abril 2025 = pendiente GENERADO POR CALENDARIO (sin fila en pagos)
   ASSERT EXISTS(
     SELECT 1 FROM jsonb_array_elements(v->'cuotas_estado') c
-    WHERE c->>'cuota_id'   = 'cuota-a-tst'
-      AND c->>'periodo'    = 'Abril 2025'
+    WHERE c->>'cuota_id'    = 'cuota-a-tst'
+      AND c->>'periodo'     = 'Abril 2025'
       AND c->>'estado_pago' = 'pendiente'
-  ), format('PC-PERIOD2 FAIL: cuota-a-tst Abril 2025 no es pendiente: %s', v->'cuotas_estado');
-  RAISE NOTICE '[OK] PC-PERIOD2: cuota-a-tst / Abril 2025 → pendiente';
+      AND (c->>'pago_id') IS NULL
+  ), format('PC-PERIOD2 FAIL: cuota-a-tst Abril 2025 no aparece pendiente sin pago_id (calendario): %s', v->'cuotas_estado');
+  RAISE NOTICE '[OK] PC-PERIOD2: cuota-a-tst / Abril 2025 → pendiente (sin fila en pagos, generado por calendario)';
 
-  -- Exactamente 2 filas para cuota-a-tst
+  -- PC-PERIOD3: Exactamente 2 filas para cuota-a-tst (Marzo y Abril del calendario)
   ASSERT (
     SELECT count(*) FROM jsonb_array_elements(v->'cuotas_estado') c
     WHERE c->>'cuota_id' = 'cuota-a-tst'
   ) = 2,
-    format('PC-PERIOD3 FAIL: esperado 2 filas para cuota-a-tst, hay %s',
+    format('PC-PERIOD3 FAIL: esperado 2 filas del calendario para cuota-a-tst, hay %s',
       (SELECT count(*) FROM jsonb_array_elements(v->'cuotas_estado') c
        WHERE c->>'cuota_id' = 'cuota-a-tst'));
-  RAISE NOTICE '[OK] PC-PERIOD3: cuota-a-tst tiene exactamente 2 filas (una por período)';
+  RAISE NOTICE '[OK] PC-PERIOD3: cuota-a-tst tiene exactamente 2 filas (Marzo y Abril del calendario)';
 END;
 $$;
 

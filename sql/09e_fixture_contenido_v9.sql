@@ -95,17 +95,34 @@ VALUES (
 )
 ON CONFLICT (cuenta_id, id) DO NOTHING;
 
--- ── Cuota exclusiva para test de estado por período ─────────────
--- cuota-a-tst: cuota de test para cur-a-01, independiente de cuota-a-02
--- Se usa en PC-PERIOD para evitar depender del estado de pagos en staging.
-INSERT INTO cuotas (cuenta_id, id, curso_id, nombre, monto, tipo, activa)
+-- ── Cuota exclusiva para test de estado por período (calendario) ─
+--
+-- cuota-a-tst: mensual, Marzo 2025 (mes_inicio=2) a Abril 2025 (mes_termino=3).
+--   El RPC debe generar ambos períodos del calendario aunque no haya fila
+--   en pagos para uno de ellos.
+--
+-- Escenario:
+--   pago-a-tst-mar: Marzo 2025, estado=pagado  (fila en pagos → pagado)
+--   Abril 2025: SIN fila en pagos              → el RPC lo genera como 'pendiente'
+--
+-- Esto verifica que el cálculo por calendario funciona correctamente
+-- (antes de este fix, Abril no aparecía si no había fila en pagos).
+--
+-- NOTA: pago-a-tst-abr fue ELIMINADO del fixture intencionalmente
+-- para probar la generación de período pendiente sin fila en BD.
+
+INSERT INTO cuotas (cuenta_id, id, curso_id, nombre, monto, tipo, activa, mes_inicio, mes_termino, anio)
 VALUES (
   '00000000-0000-0000-aaaa-000000000001'::uuid,
-  'cuota-a-tst', 'cur-a-01', 'Cuota test períodos', 15000, 'mensual', TRUE
+  'cuota-a-tst', 'cur-a-01', 'Cuota test períodos', 15000, 'mensual', TRUE,
+  2, 3, 2025   -- mes 2=Marzo, mes 3=Abril (0-based)
 )
-ON CONFLICT (cuenta_id, id) DO NOTHING;
+ON CONFLICT (cuenta_id, id) DO UPDATE SET
+  mes_inicio  = EXCLUDED.mes_inicio,
+  mes_termino = EXCLUDED.mes_termino,
+  anio        = EXCLUDED.anio;
 
--- pago-a-tst-mar: Marzo 2025 PAGADO → estado_pago debe ser 'pagado'
+-- pago-a-tst-mar: Marzo 2025 PAGADO (tiene fila → estado debe ser 'pagado')
 INSERT INTO pagos (cuenta_id, id, alumno_id, cuota_id, monto, fecha, medio, estado, periodo)
 VALUES (
   '00000000-0000-0000-aaaa-000000000001'::uuid,
@@ -114,14 +131,11 @@ VALUES (
 )
 ON CONFLICT (cuenta_id, id) DO NOTHING;
 
--- pago-a-tst-abr: Abril 2025 PENDIENTE → estado_pago debe ser 'pendiente'
-INSERT INTO pagos (cuenta_id, id, alumno_id, cuota_id, monto, fecha, medio, estado, periodo)
-VALUES (
-  '00000000-0000-0000-aaaa-000000000001'::uuid,
-  'pago-a-tst-abr', 'alu-a-01', 'cuota-a-tst',
-  15000, '2025-04-01', 'transferencia', 'pendiente', 'Abril 2025'
-)
-ON CONFLICT (cuenta_id, id) DO NOTHING;
+-- Eliminamos pago-a-tst-abr si existe de una carga anterior
+-- (el test verifica que Abril aparezca pendiente SIN fila en pagos)
+DELETE FROM pagos
+WHERE cuenta_id = '00000000-0000-0000-aaaa-000000000001'::uuid
+  AND id = 'pago-a-tst-abr';
 
 -- ── Verificación ────────────────────────────────────────────────
 DO $$
@@ -146,22 +160,26 @@ BEGIN
     RAISE WARNING 'abono-a-09e incorrecto'; errores := errores + 1;
   END IF;
 
-  -- Verificar cuota exclusiva de test de períodos
-  IF NOT EXISTS(SELECT 1 FROM cuotas WHERE cuenta_id='00000000-0000-0000-aaaa-000000000001' AND id='cuota-a-tst' AND activa=TRUE) THEN
-    RAISE WARNING 'cuota-a-tst no insertada'; errores := errores + 1;
+  -- Verificar cuota-a-tst: mensual con calendario Marzo-Abril 2025
+  IF NOT EXISTS(SELECT 1 FROM cuotas
+                WHERE cuenta_id='00000000-0000-0000-aaaa-000000000001'
+                  AND id='cuota-a-tst' AND activa=TRUE
+                  AND mes_inicio=2 AND mes_termino=3 AND anio=2025) THEN
+    RAISE WARNING 'cuota-a-tst no insertada o sin mes_inicio/mes_termino/anio'; errores := errores + 1;
   END IF;
   IF NOT EXISTS(SELECT 1 FROM pagos WHERE cuenta_id='00000000-0000-0000-aaaa-000000000001' AND id='pago-a-tst-mar' AND estado='pagado' AND periodo='Marzo 2025') THEN
     RAISE WARNING 'pago-a-tst-mar incorrecto'; errores := errores + 1;
   END IF;
-  IF NOT EXISTS(SELECT 1 FROM pagos WHERE cuenta_id='00000000-0000-0000-aaaa-000000000001' AND id='pago-a-tst-abr' AND estado='pendiente' AND periodo='Abril 2025') THEN
-    RAISE WARNING 'pago-a-tst-abr incorrecto'; errores := errores + 1;
+  -- pago-a-tst-abr NO debe existir (se verifica que el período sea generado por calendario)
+  IF EXISTS(SELECT 1 FROM pagos WHERE cuenta_id='00000000-0000-0000-aaaa-000000000001' AND id='pago-a-tst-abr') THEN
+    RAISE WARNING 'pago-a-tst-abr no debería existir (prueba de calendario sin fila en pagos)'; errores := errores + 1;
   END IF;
 
   IF errores > 0 THEN
     RAISE EXCEPTION 'Fixture 09e falló con % error(es). ROLLBACK.', errores;
   END IF;
 
-  RAISE NOTICE 'Fixture 09e OK: pagos, movimientos, plan, abono y cuota-a-tst verificados.';
+  RAISE NOTICE 'Fixture 09e OK: pagos, movimientos, plan, abono, cuota-a-tst con calendario verificados.';
 END;
 $$;
 
