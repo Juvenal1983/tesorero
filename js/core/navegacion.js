@@ -50,7 +50,7 @@ function render(){
   if(S.modal) renderModalOverlay();
   afterRender();
   // Verificar suscripción después de renderizar
-  if(S.session && S.session.rol!=='apoderado_lector'){
+  if(S.session && S.session.rol!=='apoderado_lector' && S.session.rol!=='apoderado_v9'){
     setTimeout(verificarSuscripcion, 1000);
     setTimeout(verificarFechaEspecial, 1500);
   }
@@ -59,9 +59,13 @@ function render(){
 function renderShell(){
   const cur = getCurso();
   const usr = S.session;
-  const isLector = usr.rol === 'apoderado_lector';
-  const isVisor  = usr.rol === 'visor';
-  const navItems = isLector ? [
+  const isLector      = usr.rol === 'apoderado_lector';
+  const isVisor       = usr.rol === 'visor';
+  const isApoderadoV9 = usr.rol === 'apoderado_v9';
+  const navItems = isApoderadoV9 ? [
+    {r:'dashboard',icon:'📊',label:'Mi resumen'},
+    {r:'mis-datos',icon:'👤',label:'Mis datos'},
+  ] : isLector ? [
     {r:'dashboard',icon:'📊',label:'Resumen'},
     {r:'movimientos',icon:'💸',label:'Movimientos'},
     {r:'reportes',icon:'📄',label:'Reportes'},
@@ -106,7 +110,7 @@ function renderShell(){
           <span style="font-size:20px">${n.icon}</span>${n.label}
           ${S.route===n.r?'<span style="margin-left:auto;color:var(--g)">●</span>':''}
         </div>`).join('')}
-      ${!isLector ? `
+      ${(!isLector && !isApoderadoV9) ? `
         <div style="padding:10px 22px 4px;font-size:10px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.8px">Mis cursos</div>
         ${(DB.cursos||[]).filter(c=>(usr.cursoIds||[]).includes(c.id)).map(c=>{
           const col=(DB.colegios||[]).find(x=>x.id===c.colegioId);
@@ -126,7 +130,7 @@ function renderShell(){
           <span style="font-size:18px">➕</span>
           <div style="font-size:14px;font-weight:600">Agregar ${V('grupo').toLowerCase()}</div>
         </div>`:''}` : ''}
-      <div onclick="${isLector?'logoutLector':'logout'}();closeMasMenu()"
+      <div onclick="${isApoderadoV9?'logoutApoderadoV9':isLector?'logoutLector':'logout'}();closeMasMenu()"
         style="display:flex;align-items:center;gap:14px;padding:14px 22px;cursor:pointer;color:var(--r);font-weight:600;border-top:2px solid var(--brd);margin-top:4px">
         <span style="font-size:20px">↩</span>
         <div style="font-size:15px">Cerrar sesión</div>
@@ -152,7 +156,7 @@ function renderShell(){
       <div class="nav" id="sidebar-nav">
         <div class="nav-section">Menú</div>
         ${navHtml}
-        ${!isLector ? `
+        ${(!isLector && !isApoderadoV9) ? `
         <div class="nav-section" style="margin-top:10px">Mis cursos</div>
         ${(DB.cursos||[]).filter(c=>(usr.cursoIds||[]).includes(c.id)).map(c=>{
           const col=(DB.colegios||[]).find(x=>x.id===c.colegioId);
@@ -173,8 +177,8 @@ function renderShell(){
       <div class="sidebar-footer">
         <div class="user-row">
           <div class="avatar">${initials(usr.nombre)}</div>
-          <div><div class="user-name">${escHtml(usr.nombre)}</div><div class="user-role">${isLector?'Apoderado lector':usr.rol==='superadmin'?'Superadmin':usr.rol==='admin'?'Administrador':usr.rol==='editor'?'Editor':usr.rol==='visor'?'Visor':'Tesorero'}</div></div>
-          <button class="btn bs" onclick="logout()" style="margin-left:auto;padding:4px 8px;font-size:11px" title="Salir">↩</button>
+          <div><div class="user-name">${escHtml(usr.nombre)}</div><div class="user-role">${isApoderadoV9?'Apoderado':isLector?'Apoderado lector':usr.rol==='superadmin'?'Superadmin':usr.rol==='admin'?'Administrador':usr.rol==='editor'?'Editor':usr.rol==='visor'?'Visor':'Tesorero'}</div></div>
+          <button class="btn bs" onclick="${isApoderadoV9?'logoutApoderadoV9':isLector?'logoutLector':'logout'}()" style="margin-left:auto;padding:4px 8px;font-size:11px" title="Salir">↩</button>
         </div>
       </div>
     </div>
@@ -182,8 +186,8 @@ function renderShell(){
       <div class="topbar">
         <div class="topbar-title">${routeLabels[S.route]||''}</div>
         <div class="topbar-right">
-          ${(isLector||isVisor)?'<span class="badge bgt">Solo lectura</span>':''}
-          ${isLector?'<button onclick="logoutLector()" style="background:var(--r);border:none;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:700;color:#fff;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 8px rgba(226,75,74,0.3)">↩ Salir</button>':''}
+          ${(isLector||isVisor||isApoderadoV9)?'<span class="badge bgt">Solo lectura</span>':''}
+          ${(isLector||isApoderadoV9)?'<button onclick="'+(isApoderadoV9?'logoutApoderadoV9':'logoutLector')+'()" style="background:var(--r);border:none;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:700;color:#fff;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 8px rgba(226,75,74,0.3)">↩ Salir</button>':''}
           <span class="badge bgg" style="display:none" id="install-badge" onclick="doInstall()" style="cursor:pointer">📲 Instalar app</span>
         </div>
       </div>

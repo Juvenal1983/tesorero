@@ -306,6 +306,8 @@ function _setSyncStatus(status){
 }
 
 function saveDB(){
+  // Guard: apoderado_v9 opera sobre datos del servidor (RPCs), nunca sobre el storage local del tesorero.
+  if (S && S.session && S.session.rol === 'apoderado_v9') return;
   const ahora = new Date().toISOString();
   DB._lastSaved = ahora;
   previewStorage.setItem(KEY, JSON.stringify(DB));

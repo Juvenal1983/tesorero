@@ -76,6 +76,15 @@ function selectCurso(id){
 // RUTAS
 // ─────────────────────────────────────────────
 function renderRoute(){
+  // ── Guard apoderado_v9 ────────────────────────────────────────────────────
+  // El apoderado v9 solo puede acceder a su propio dashboard y a mis-datos.
+  // Cualquier intento de navegar a pantallas de tesorero se redirige al dashboard.
+  if (S.session && S.session.rol === 'apoderado_v9') {
+    if (S.route === 'mis-datos') return renderMisDatos();
+    // Para cualquier otra ruta (incluido 'dashboard') renderizar el dashboard del apoderado
+    return renderDashboardApoderadoV9();
+  }
+  // ── Rutas estándar (tesorero / admin / editor / visor / apoderado_lector) ──
   switch(S.route){
     case 'dashboard': return renderDashboard();
     case 'alumnos': return renderAlumnos();

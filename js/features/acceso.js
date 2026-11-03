@@ -1716,8 +1716,10 @@ async function doAccesoCodigoV9() {
     // PIN correcto — crear sesión
     // El PIN queda capturado en el closure _v9PinEnMemoria para las siguientes
     // llamadas a situacion_financiera, editar_contacto, etc.
-    // ⚠️  Esta variable NO es accesible desde consola ni desde el DOM;
-    //     solo la usan las funciones v9 de esta sesión.
+    // ⚠️  window._v9PinEnMemoria ES accesible desde consola (window._v9PinEnMemoria()).
+    //     Su seguridad no radica en la inaccesibilidad sino en la no persistencia:
+    //     el PIN nunca se escribe en localStorage ni en sessionStorage; vive solo
+    //     en memoria y se elimina al llamar logoutApoderadoV9().
     window._v9PinEnMemoria = (function(p) {
       // Inmediatamente borrar el parámetro y retornar un getter de un solo uso.
       // Para que cada RPC que necesita el PIN lo pida explícitamente.
@@ -1778,4 +1780,292 @@ function logoutApoderadoV9() {
 
   // Delegar al cierre de sesión estándar del lector
   logoutLector();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD APODERADO V9
+// Renderiza la vista principal del apoderado: balance del curso, cuotas,
+// pagos realizados, comprobantes publicados y contactos editables.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Vista principal del apoderado v9 (llamada desde renderRoute en rutas.js).
+ * Retorna HTML esqueleto de forma síncrona; los datos se cargan asincrónicamente
+ * mediante _cargarDashboardApoderadoV9() y actualizan el DOM por id.
+ */
+function renderDashboardApoderadoV9() {
+  setTimeout(_cargarDashboardApoderadoV9, 50);
+  const ses = S.session || {};
+  const alumNombre = escHtml(ses.alumnoNombre || 'alumno');
+  return `
+  <div style="padding:16px;max-width:600px;margin:0 auto">
+    <div style="font-size:20px;font-weight:700;margin-bottom:4px">Hola 👋</div>
+    <div style="font-size:15px;color:var(--t2);margin-bottom:20px">Estado de <strong>${alumNombre}</strong></div>
+
+    <div id="ap-v9-balance" style="background:var(--gl);border-radius:var(--rad);padding:16px;margin-bottom:16px">
+      <div style="color:var(--t3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Balance del curso</div>
+      <div style="color:var(--t3);font-size:13px">Cargando…</div>
+    </div>
+
+    <div id="ap-v9-deudas" style="background:var(--wh);border:1px solid var(--brd);border-radius:var(--rad);padding:16px;margin-bottom:16px">
+      <div style="color:var(--t3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Mis cuotas</div>
+      <div style="color:var(--t3);font-size:13px">Cargando…</div>
+    </div>
+
+    <div id="ap-v9-pagos" style="background:var(--wh);border:1px solid var(--brd);border-radius:var(--rad);padding:16px;margin-bottom:16px">
+      <div style="color:var(--t3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Mis pagos</div>
+      <div style="color:var(--t3);font-size:13px">Cargando…</div>
+    </div>
+
+    <div id="ap-v9-comprobantes" style="background:var(--wh);border:1px solid var(--brd);border-radius:var(--rad);padding:16px;margin-bottom:16px">
+      <div style="color:var(--t3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Comprobantes publicados</div>
+      <div style="color:var(--t3);font-size:13px">Cargando…</div>
+    </div>
+
+    <div id="ap-v9-contactos" style="background:var(--wh);border:1px solid var(--brd);border-radius:var(--rad);padding:16px;margin-bottom:24px">
+      <div style="color:var(--t3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Mis datos de contacto</div>
+      <div style="color:var(--t3);font-size:13px">Cargando…</div>
+    </div>
+  </div>`;
+}
+
+async function _cargarDashboardApoderadoV9() {
+  const ses = S.session;
+  if (!ses || ses.rol !== 'apoderado_v9') return;
+  const pin = typeof window._v9PinEnMemoria === 'function' ? window._v9PinEnMemoria() : null;
+  if (!pin) {
+    _apV9SetMsg('ap-v9-balance', 'Sesión expirada. Vuelve a ingresar tu PIN.');
+    return;
+  }
+  try {
+    const data = await v9AluSituacion(ses._v9CuentaId, ses.alumnoId, pin);
+    if (data?.error) {
+      _apV9SetMsg('ap-v9-balance', `Error: ${data.error}`);
+      return;
+    }
+    _apV9RenderBalance(data.balance_curso);
+    _apV9RenderDeudas(S._v9AccesoData?.cuotas_estado || []);
+    _apV9RenderPagos(data.pagos || []);
+    _apV9RenderComprobantes(data.comprobantes || []);
+    _apV9RenderContactos(S._v9AccesoData?.apoderados || []);
+  } catch(e) {
+    console.error('[v9] _cargarDashboardApoderadoV9:', e);
+    _apV9SetMsg('ap-v9-balance', 'Error de conexión. Recarga la página.');
+  }
+}
+
+function _apV9SetMsg(id, msg) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const last = el.querySelector('div:last-child');
+  if (last) last.textContent = msg;
+}
+
+function _apV9RenderBalance(b) {
+  const el = document.getElementById('ap-v9-balance');
+  if (!el || !b) return;
+  const fmt = n => '$' + Number(n||0).toLocaleString('es-CL');
+  const saldo = Number(b.saldo||0);
+  const colorSaldo = saldo >= 0 ? 'var(--g)' : 'var(--r)';
+  el.innerHTML = `
+    <div style="color:var(--t3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;margin-bottom:12px">Balance del curso</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;text-align:center">
+      <div><div style="font-size:11px;color:var(--t3);margin-bottom:4px">Ingresos</div><div style="font-size:17px;font-weight:700;color:var(--g)">${fmt(b.total_ingresos)}</div></div>
+      <div><div style="font-size:11px;color:var(--t3);margin-bottom:4px">Gastos</div><div style="font-size:17px;font-weight:700;color:var(--r)">${fmt(b.total_gastos)}</div></div>
+      <div><div style="font-size:11px;color:var(--t3);margin-bottom:4px">Saldo</div><div style="font-size:17px;font-weight:700;color:${colorSaldo}">${fmt(saldo)}</div></div>
+    </div>
+    <div style="font-size:11px;color:var(--t3);margin-top:10px;text-align:center">Solo movimientos publicados por el tesorero.</div>`;
+}
+
+function _apV9RenderDeudas(cuotas) {
+  const el = document.getElementById('ap-v9-deudas');
+  if (!el) return;
+  const title = '<div style="color:var(--t3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Mis cuotas</div>';
+  if (!cuotas || cuotas.length === 0) {
+    el.innerHTML = title + '<div style="color:var(--t3);font-size:13px">Sin cuotas registradas.</div>';
+    return;
+  }
+  const fmt = n => '$' + Number(n||0).toLocaleString('es-CL');
+  const rows = cuotas.map(c => {
+    const est = c.estado || 'pendiente';
+    const colorEst = est==='pagado'?'var(--g)':est==='eximido'?'var(--t3)':'var(--r)';
+    const badge = est==='pagado'?'✅ Pagado':est==='eximido'?'Eximido':'⏳ Pendiente';
+    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--brd)">
+      <div>
+        <div style="font-size:14px;font-weight:600">${escHtml(c.cuota_nombre||'Cuota')}</div>
+        <div style="font-size:12px;color:var(--t3)">${escHtml(c.periodo||'')}</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:14px;font-weight:700">${fmt(c.monto||0)}</div>
+        <div style="font-size:12px;color:${colorEst};font-weight:600">${badge}</div>
+      </div>
+    </div>`;
+  }).join('');
+  el.innerHTML = title + rows;
+}
+
+function _apV9RenderPagos(pagos) {
+  const el = document.getElementById('ap-v9-pagos');
+  if (!el) return;
+  const title = '<div style="color:var(--t3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Mis pagos</div>';
+  if (!pagos || pagos.length === 0) {
+    el.innerHTML = title + '<div style="color:var(--t3);font-size:13px">Sin pagos registrados.</div>';
+    return;
+  }
+  const fmt = n => '$' + Number(n||0).toLocaleString('es-CL');
+  const rows = pagos.slice(0, 10).map(p => {
+    const fecha = (p.fecha||'').substring(0,10);
+    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--brd)">
+      <div>
+        <div style="font-size:14px;font-weight:600">${escHtml(p.cuota_nombre||'Pago')}</div>
+        <div style="font-size:12px;color:var(--t3)">${escHtml(fecha)}${p.medio?' · '+escHtml(p.medio):''}</div>
+      </div>
+      <div style="font-size:15px;font-weight:700;color:var(--g)">${fmt(p.monto)}</div>
+    </div>`;
+  }).join('');
+  const extra = pagos.length > 10 ? `<div style="font-size:12px;color:var(--t3);padding-top:8px">+${pagos.length-10} pagos más</div>` : '';
+  el.innerHTML = title + rows + extra;
+}
+
+function _apV9RenderComprobantes(comps) {
+  const el = document.getElementById('ap-v9-comprobantes');
+  if (!el) return;
+  const title = '<div style="color:var(--t3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Comprobantes publicados</div>';
+  if (!comps || comps.length === 0) {
+    el.innerHTML = title + '<div style="color:var(--t3);font-size:13px">No hay comprobantes publicados aún.</div>';
+    return;
+  }
+  const fmt = n => '$' + Number(n||0).toLocaleString('es-CL');
+  const rows = comps.slice(0, 8).map(m => {
+    const fecha = (m.fecha||'').substring(0,10);
+    const esGasto = ['gasto','egreso'].includes(m.tipo);
+    const urlBtn = m.comprobante_url
+      ? `<a href="${escHtml(m.comprobante_url)}" target="_blank" rel="noopener" style="font-size:11px;color:var(--gm);text-decoration:none">📎 Ver</a>`
+      : '';
+    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--brd)">
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(m.desc||'')}</div>
+        <div style="font-size:11px;color:var(--t3)">${escHtml(fecha)}</div>
+      </div>
+      <div style="margin-left:12px;text-align:right">
+        <div style="font-size:14px;font-weight:700;color:${esGasto?'var(--r)':'var(--g)'}">${esGasto?'−':'+'}${fmt(m.monto)}</div>
+        ${urlBtn}
+      </div>
+    </div>`;
+  }).join('');
+  el.innerHTML = title + rows;
+}
+
+function _apV9RenderContactos(apods) {
+  const el = document.getElementById('ap-v9-contactos');
+  if (!el) return;
+  const title = '<div style="color:var(--t3);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px">Mis datos de contacto</div>';
+  if (!apods || apods.length === 0) {
+    el.innerHTML = title + '<div style="color:var(--t3);font-size:13px">Sin apoderados registrados.</div>';
+    return;
+  }
+  const rows = apods.map(ap => {
+    // Escapar para atributo onclick (comillas simples)
+    const esc1 = s => (s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+    return `
+    <div style="background:var(--f);border-radius:8px;padding:12px;margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+        <div style="min-width:0">
+          <div style="font-size:14px;font-weight:700">${escHtml(ap.nombre||'')}</div>
+          <div style="font-size:12px;color:var(--t3);margin-top:2px">${escHtml(ap.relacion||'')}</div>
+          ${ap.telefono?`<div style="font-size:13px;margin-top:6px">📞 ${escHtml(ap.telefono)}</div>`:''}
+          ${ap.email?`<div style="font-size:13px;margin-top:2px">✉️ ${escHtml(ap.email)}</div>`:''}
+        </div>
+        <button class="btn bs" style="flex-shrink:0;font-size:11px;padding:4px 10px"
+          onclick="_apV9EditarContacto('${esc1(ap.id)}','${esc1(ap.nombre||'')}','${esc1(ap.relacion||'')}','${esc1(ap.telefono||'')}','${esc1(ap.email||'')}')">
+          ✏️ Editar
+        </button>
+      </div>
+    </div>`;
+  }).join('');
+  el.innerHTML = title + rows;
+}
+
+/**
+ * Muestra un overlay inline para editar un contacto apoderado.
+ * No usa el sistema de modales de la app: es autocontenido para evitar
+ * modificar renderModal() y no afectar flujos del tesorero.
+ */
+function _apV9EditarContacto(apodId, nombre, relacion, telefono, email) {
+  const ses = S.session;
+  if (!ses || ses.rol !== 'apoderado_v9') return;
+  const pin = typeof window._v9PinEnMemoria === 'function' ? window._v9PinEnMemoria() : null;
+  if (!pin) { alert('Sesión expirada. Vuelve a ingresar tu PIN.'); return; }
+
+  // Remover overlay anterior si existe
+  document.getElementById('ap-v9-edit-ov')?.remove();
+
+  const esc = s => (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;');
+  const ov = document.createElement('div');
+  ov.id = 'ap-v9-edit-ov';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:300;display:flex;align-items:center;justify-content:center;padding:16px';
+  ov.innerHTML = `
+    <div style="background:var(--wh);border-radius:var(--rad);padding:20px;width:100%;max-width:400px;box-shadow:0 8px 32px rgba(0,0,0,.18)">
+      <div style="font-size:17px;font-weight:700;margin-bottom:16px">Editar contacto</div>
+      <label style="display:block;margin-bottom:12px">
+        <div style="font-size:12px;color:var(--t3);margin-bottom:4px">Nombre</div>
+        <input id="ap-v9-ed-nombre" class="inp" value="${esc(nombre)}" style="width:100%;box-sizing:border-box">
+      </label>
+      <label style="display:block;margin-bottom:12px">
+        <div style="font-size:12px;color:var(--t3);margin-bottom:4px">Relación (Madre, Padre, Tutor…)</div>
+        <input id="ap-v9-ed-relacion" class="inp" value="${esc(relacion)}" style="width:100%;box-sizing:border-box">
+      </label>
+      <label style="display:block;margin-bottom:12px">
+        <div style="font-size:12px;color:var(--t3);margin-bottom:4px">Teléfono</div>
+        <input id="ap-v9-ed-telefono" class="inp" value="${esc(telefono)}" style="width:100%;box-sizing:border-box">
+      </label>
+      <label style="display:block;margin-bottom:16px">
+        <div style="font-size:12px;color:var(--t3);margin-bottom:4px">Correo electrónico</div>
+        <input id="ap-v9-ed-email" class="inp" type="email" value="${esc(email)}" style="width:100%;box-sizing:border-box">
+      </label>
+      <div id="ap-v9-ed-err" style="display:none;color:var(--r);font-size:13px;margin-bottom:10px"></div>
+      <div style="display:flex;gap:8px">
+        <button class="btn bs" onclick="document.getElementById('ap-v9-edit-ov').remove()" style="flex:1">Cancelar</button>
+        <button id="ap-v9-ed-btn" class="btn bp" onclick="_apV9GuardarContacto('${esc(apodId)}')" style="flex:2">Guardar</button>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+  document.getElementById('ap-v9-ed-nombre')?.focus();
+}
+
+async function _apV9GuardarContacto(apodId) {
+  const ses = S.session;
+  const pin = typeof window._v9PinEnMemoria === 'function' ? window._v9PinEnMemoria() : null;
+  if (!ses || !pin) return;
+
+  const nombre   = document.getElementById('ap-v9-ed-nombre')?.value?.trim()   || null;
+  const relacion = document.getElementById('ap-v9-ed-relacion')?.value?.trim() || null;
+  const telefono = document.getElementById('ap-v9-ed-telefono')?.value?.trim() || null;
+  const email    = document.getElementById('ap-v9-ed-email')?.value?.trim()    || null;
+  const errEl    = document.getElementById('ap-v9-ed-err');
+  const btn      = document.getElementById('ap-v9-ed-btn');
+
+  if (btn) { btn.textContent = 'Guardando…'; btn.disabled = true; }
+
+  try {
+    const res = await v9AluEditarContacto(
+      ses._v9CuentaId, ses.alumnoId, pin, apodId,
+      nombre, relacion, telefono, email
+    );
+    if (res?.error) {
+      if (errEl) { errEl.textContent = `Error: ${res.error}`; errEl.style.display = ''; }
+      return;
+    }
+    // Actualizar datos locales en S._v9AccesoData para reflejar el cambio sin recargar
+    const apods = S._v9AccesoData?.apoderados || [];
+    const ap = apods.find(a => a.id === apodId);
+    if (ap) { ap.nombre=nombre; ap.relacion=relacion; ap.telefono=telefono; ap.email=email; }
+    // Cerrar overlay y re-renderizar la sección de contactos
+    document.getElementById('ap-v9-edit-ov')?.remove();
+    _apV9RenderContactos(apods);
+  } catch(e) {
+    if (errEl) { errEl.textContent = 'Error de conexión. Intenta de nuevo.'; errEl.style.display = ''; }
+  } finally {
+    if (btn) { btn.textContent = 'Guardar'; btn.disabled = false; }
+  }
 }
