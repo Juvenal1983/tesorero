@@ -668,11 +668,13 @@ ROLLBACK TO SAVEPOINT sp_revocacion;
 -- CC: Acceso compartido (codigo_compartido / CC-XXXX)
 -- CC1: verificar código válido retorna datos del curso
 -- CC2: código inválido retorna vacío
--- CC3: resumen de pagos retorna todos los alumnos del curso
--- CC4: resumen excluye alumnos de otro curso
--- CC5: generar código CC con PIN correcto
--- CC6: generar falla con PIN incorrecto
--- CC7: revocar código CC con PIN correcto
+-- CC3: resumen de pagos (por código CC) retorna todos los alumnos del curso
+-- CC4: resumen excluye alumnos de otro curso (aislamiento por código)
+-- CC5: generar código CC requiere JWT de tesorero/admin
+-- CC5b: generar falla si anon intenta llamar (42501 desde permisos PostgreSQL)
+-- CC6: anon no puede llamar apoderado_cc_generar (42501 desde permisos PostgreSQL)
+-- CC7: revocar código CC requiere JWT de tesorero/admin
+-- CC8: tras revocar, resumen_pagos con el código anterior retorna vacío
 -- ══════════════════════════════════════════════════════════════
 DO $$
 DECLARE
@@ -681,8 +683,9 @@ DECLARE
   cnt      INT;
   nueva_cc JSONB;
   cc_cod   TEXT;
+  cc_02    TEXT;
 BEGIN
-  -- CC1: código CC-TEST-0001 debe encontrar cur-a-01
+  -- ── CC1: código CC-TEST-0001 debe encontrar cur-a-01 ─────────
   SELECT * INTO fila FROM apoderado_cc_verificar('CC-TEST-0001');
   ASSERT fila IS NOT NULL,
     'CC1 FAIL: CC-TEST-0001 no encontró ningún curso';
@@ -692,31 +695,47 @@ BEGIN
     'CC1 FAIL: nombre_curso vacío';
   RAISE NOTICE '[OK] CC1: CC-TEST-0001 retorna cur-a-01 "%"', fila.nombre_curso;
 
-  -- CC2: código inválido retorna vacío
+  -- ── CC2: código inválido retorna vacío ───────────────────────
   SELECT count(*) INTO cnt FROM apoderado_cc_verificar('CC-FAKE-9999');
   ASSERT cnt = 0,
     format('CC2 FAIL: código inválido debería retornar 0 filas, retornó %s', cnt);
   RAISE NOTICE '[OK] CC2: código inválido retorna 0 filas';
 
-  -- CC3: resumen retorna ambos alumnos del curso
+  -- ── CC3: resumen por código CC retorna alumnos del curso ─────
+  -- La nueva firma acepta el código CC como único parámetro.
   SELECT count(*) INTO cnt
-  FROM apoderado_cc_resumen_pagos(cuenta_a, 'cur-a-01');
+  FROM apoderado_cc_resumen_pagos('CC-TEST-0001');
   ASSERT cnt = 2,
-    format('CC3 FAIL: esperaba 2 alumnos, obtuvo %s', cnt);
-  RAISE NOTICE '[OK] CC3: resumen incluye % alumnos en cur-a-01', cnt;
+    format('CC3 FAIL: esperaba 2 alumnos para CC-TEST-0001, obtuvo %s', cnt);
+  RAISE NOTICE '[OK] CC3: resumen CC-TEST-0001 incluye % alumnos', cnt;
 
-  -- CC4: resumen de cur-a-02 no incluye alumnos de cur-a-01
-  SELECT count(*) INTO cnt
-  FROM apoderado_cc_resumen_pagos(cuenta_a, 'cur-a-02');
-  -- cur-a-02 puede tener 0 o más alumnos; verificamos que alu-a-01 y alu-a-02 no estén
-  FOR fila IN SELECT * FROM apoderado_cc_resumen_pagos(cuenta_a, 'cur-a-02') LOOP
+  -- ── CC4: resumen de otro código excluye alumnos de cur-a-01 ──
+  -- Crear un código temporal para cur-a-02 y verificar aislamiento
+  UPDATE cursos SET codigo_compartido = 'CC-TEST-0002'
+  WHERE cuenta_id = cuenta_a AND id = 'cur-a-02';
+
+  FOR fila IN SELECT * FROM apoderado_cc_resumen_pagos('CC-TEST-0002') LOOP
     ASSERT fila.alumno_id NOT IN ('alu-a-01', 'alu-a-02'),
-      format('CC4 FAIL: alu-a-01/alu-a-02 aparecieron en cur-a-02');
+      format('CC4 FAIL: alumno %s de cur-a-01 apareció en resumen de CC-TEST-0002',
+             fila.alumno_id);
   END LOOP;
-  RAISE NOTICE '[OK] CC4: resumen de cur-a-02 excluye alumnos de cur-a-01';
+  RAISE NOTICE '[OK] CC4: resumen CC-TEST-0002 excluye alumnos de cur-a-01';
 
-  -- CC5: generar código CC con PIN correcto
-  nueva_cc := apoderado_cc_generar(cuenta_a, 'cur-a-01', 'alu-a-01', '1234');
+  -- Limpiar código temporal de cur-a-02
+  UPDATE cursos SET codigo_compartido = NULL
+  WHERE cuenta_id = cuenta_a AND id = 'cur-a-02';
+
+  -- ── CC5: generar código CC con JWT de tesorero ───────────────
+  -- Simular JWT del tesorero (auth_id = aaaaaaaa-…-01 es dueño de cuenta_a)
+  PERFORM set_config('request.jwt.claims',
+    '{"sub":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","role":"authenticated"}',
+    true);
+  SET LOCAL ROLE authenticated;
+
+  nueva_cc := apoderado_cc_generar(cuenta_a, 'cur-a-01');
+  RESET ROLE;
+  PERFORM set_config('request.jwt.claims', '', true);
+
   ASSERT nueva_cc ? 'codigo_cc',
     format('CC5 FAIL: respuesta no tiene clave codigo_cc: %s', nueva_cc);
   cc_cod := nueva_cc->>'codigo_cc';
@@ -727,26 +746,60 @@ BEGIN
   WHERE cuenta_id = cuenta_a AND id = 'cur-a-01' AND codigo_compartido = cc_cod;
   ASSERT cnt = 1,
     format('CC5 FAIL: código %s no quedó en cursos.codigo_compartido', cc_cod);
-  RAISE NOTICE '[OK] CC5: código generado % guardado en cursos', cc_cod;
+  RAISE NOTICE '[OK] CC5: JWT tesorero generó código % guardado en cursos', cc_cod;
 
-  -- CC6: generar falla con PIN incorrecto
+  -- ── CC5b: restaurar CC-TEST-0001 para CC3 (y cc_cod queda en cur-a-01) ──
+  -- cc_cod es el nuevo código; lo necesitamos para CC7/CC8.
+  -- También verificamos que CC-TEST-0001 ya no apunta a cur-a-01 (fue reemplazado).
+  SELECT count(*) INTO cnt FROM cursos
+  WHERE cuenta_id = cuenta_a AND id = 'cur-a-01' AND codigo_compartido = 'CC-TEST-0001';
+  ASSERT cnt = 0,
+    'CC5b FAIL: CC-TEST-0001 debería haber sido reemplazado por el nuevo código';
+  RAISE NOTICE '[OK] CC5b: CC-TEST-0001 fue reemplazado por % en cursos', cc_cod;
+
+  -- ── CC6: anon no puede llamar apoderado_cc_generar (42501) ───
+  -- anon no tiene EXECUTE; PostgreSQL lanza 42501 antes de entrar al cuerpo.
+  -- Usamos ERRCODE = '45000' en la aserción de fallo para que no sea capturado
+  -- por el handler de insufficient_privilege (42501).
   BEGIN
-    PERFORM apoderado_cc_generar(cuenta_a, 'cur-a-01', 'alu-a-01', '0000');
-    RAISE EXCEPTION 'CC6 FAIL: debería haber lanzado excepción con PIN incorrecto';
-  EXCEPTION WHEN SQLSTATE 'P0001' THEN
-    RAISE NOTICE '[OK] CC6: PIN incorrecto lanza excepción P0001';
+    SET LOCAL ROLE anon;
+    PERFORM apoderado_cc_generar(cuenta_a, 'cur-a-01');
+    RESET ROLE;
+    -- Si llegamos aquí, el RPC aceptó la llamada → fallo real del test
+    RAISE EXCEPTION 'CC6 FAIL: anon pudo llamar apoderado_cc_generar'
+      USING ERRCODE = '45000';    -- <-- ERRCODE distinto: no lo captura el EXCEPTION de abajo
+  EXCEPTION
+    WHEN insufficient_privilege THEN   -- 42501
+      RESET ROLE;
+      RAISE NOTICE '[OK] CC6: anon no puede llamar apoderado_cc_generar (42501)';
   END;
 
-  -- CC7: revocar código CC con PIN correcto
-  PERFORM apoderado_cc_revocar(cuenta_a, 'cur-a-01', 'alu-a-01', '1234');
+  -- ── CC7: revocar código CC con JWT de tesorero ───────────────
+  PERFORM set_config('request.jwt.claims',
+    '{"sub":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","role":"authenticated"}',
+    true);
+  SET LOCAL ROLE authenticated;
+
+  PERFORM apoderado_cc_revocar(cuenta_a, 'cur-a-01');
+  RESET ROLE;
+  PERFORM set_config('request.jwt.claims', '', true);
+
   SELECT count(*) INTO cnt FROM cursos
   WHERE cuenta_id = cuenta_a AND id = 'cur-a-01'
     AND codigo_compartido IS NOT NULL;
   ASSERT cnt = 0,
     'CC7 FAIL: codigo_compartido no fue eliminado tras revocar';
-  RAISE NOTICE '[OK] CC7: código CC revocado (NULL en cursos)';
+  RAISE NOTICE '[OK] CC7: JWT tesorero revocó el código CC (NULL en cursos)';
 
-  -- Restaurar CC-TEST-0001 para no romper tests subsiguientes
+  -- ── CC8: tras revocar, resumen_pagos con el código anterior retorna vacío ──
+  -- cc_cod tenía el código generado en CC5; ahora debe ser inválido.
+  SELECT count(*) INTO cnt
+  FROM apoderado_cc_resumen_pagos(cc_cod);
+  ASSERT cnt = 0,
+    format('CC8 FAIL: código revocado %s aún retorna %s filas', cc_cod, cnt);
+  RAISE NOTICE '[OK] CC8: código revocado % retorna 0 filas en resumen_pagos', cc_cod;
+
+  -- ── Restaurar CC-TEST-0001 para no romper tests subsiguientes ──
   UPDATE cursos SET codigo_compartido = 'CC-TEST-0001'
   WHERE cuenta_id = cuenta_a AND id = 'cur-a-01';
 

@@ -2140,7 +2140,9 @@ async function _cargarResumenCc() {
   if (!el) return;
 
   try {
-    const filas = await v9CcResumenPagos(ses._v9CuentaId, ses._v9CursoId);
+    // La nueva firma acepta solo el código CC; el servidor lo valida en cada llamada.
+    // Si fue revocado entre la verificación y ahora, retorna vacío → el usuario verá "sin alumnos".
+    const filas = await v9CcResumenPagos(ses._v9CodigoCc);
 
     if (!filas || filas.length === 0) {
       el.innerHTML = '<div style="padding:20px;color:var(--t3);font-size:13px">No hay alumnos en este curso.</div>';

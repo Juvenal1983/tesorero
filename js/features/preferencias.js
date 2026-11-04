@@ -76,9 +76,26 @@ function copiarCodigoCompartido(){
   if(cc) navigator.clipboard?.writeText(cc).then(()=>showToast('¡Copiado!'));
 }
 
-function generarCodigoCompartido(){
+async function generarCodigoCompartido(){
   if(!puedeConfigurar()){ showToast('⛔ Sin permisos para gestionar códigos de acceso','#E24B4A'); return; }
   if(!confirm('¿Generar código de acceso compartido? Quien lo tenga verá TODA la información del curso.')) return;
+
+  if(typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL){
+    // v9 relacional: el servidor genera el código con credenciales del tesorero.
+    // La autorización se verifica en PostgreSQL (JWT); anon recibe 42501.
+    try {
+      const res = await v9CcGenerar(S._v9CuentaId, S.cursoId);
+      if(!res || !res.codigo_cc) throw new Error('Respuesta inesperada del servidor');
+      showToast('✅ Código compartido generado: ' + res.codigo_cc);
+      go('config', S.params);
+    } catch(err) {
+      console.error('[v9] generarCodigoCompartido:', err);
+      showToast('⛔ Error al generar el código: ' + err.message, '#E24B4A');
+    }
+    return;
+  }
+
+  // Ruta clásica (no v9)
   const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
   const seg = ()=>{ let s=''; for(let i=0;i<4;i++) s+=chars[Math.floor(Math.random()*chars.length)]; return s; };
   const codigo = 'CC-'+seg()+'-'+seg();
@@ -91,9 +108,26 @@ function generarCodigoCompartido(){
   }
 }
 
-function desactivarCodigoCompartido(){
+async function desactivarCodigoCompartido(){
   if(!puedeConfigurar()){ showToast('⛔ Sin permisos para gestionar códigos de acceso','#E24B4A'); return; }
   if(!confirm('¿Desactivar el código compartido? Nadie más podrá entrar con él.')) return;
+
+  if(typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL){
+    // v9 relacional: revocar en el servidor. Revocación inmediata:
+    // cualquier llamada posterior a v9CcResumenPagos con el código anterior
+    // recibirá un conjunto vacío (el servidor verifica en cada consulta).
+    try {
+      await v9CcRevocar(S._v9CuentaId, S.cursoId);
+      showToast('Código compartido desactivado');
+      go('config', S.params);
+    } catch(err) {
+      console.error('[v9] desactivarCodigoCompartido:', err);
+      showToast('⛔ Error al desactivar el código: ' + err.message, '#E24B4A');
+    }
+    return;
+  }
+
+  // Ruta clásica (no v9)
   const ci = (DB.cursos||[]).findIndex(c=>c.id===S.cursoId);
   if(ci>=0){
     delete DB.cursos[ci].codigoCompartido;

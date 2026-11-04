@@ -666,18 +666,19 @@ async function v9CcVerificar(codigoCc) {
 
 /**
  * Devuelve el resumen de pagos de todos los alumnos del curso.
- * Se llama solo después de verificar el código con v9CcVerificar().
- * No requiere PIN.
+ * El servidor verifica en cada llamada que el código compartido siga vigente.
+ * Si fue revocado, la función retorna vacío.
+ * No requiere JWT: el código CC es la única credencial.
  *
- * RPC: apoderado_cc_resumen_pagos(p_cuenta_id UUID, p_curso_id TEXT)
+ * RPC: apoderado_cc_resumen_pagos(p_codigo_cc TEXT)
+ * Acceso: anon
  * Retorna: TABLE(alumno_id, nombre, monto_pagado, monto_abonado,
  *                monto_pendiente, num_cuotas_pagadas, num_cuotas_pendientes)
  *
- * @param {string} cuentaId
- * @param {string} cursoId
+ * @param {string} codigoCc  — código CC-XXXX-XXXX verificado
  * @returns {Promise<Array>}
  */
-async function v9CcResumenPagos(cuentaId, cursoId) {
+async function v9CcResumenPagos(codigoCc) {
   const base = _v9BaseUrl().replace('/rest/v1', '') + '/rest/v1';
   const res  = await fetch(base + '/rpc/apoderado_cc_resumen_pagos', {
     method:  'POST',
@@ -687,7 +688,7 @@ async function v9CcResumenPagos(cuentaId, cursoId) {
       'Content-Type':  'application/json',
       'Accept':        'application/json',
     },
-    body: JSON.stringify({ p_cuenta_id: cuentaId, p_curso_id: cursoId }),
+    body: JSON.stringify({ p_codigo_cc: codigoCc }),
   });
   if (!res.ok) {
     let body = ''; try { body = await res.text(); } catch (_) {}
@@ -695,4 +696,69 @@ async function v9CcResumenPagos(cuentaId, cursoId) {
   }
   const data = await res.json();
   return Array.isArray(data) ? data : [];
+}
+
+/**
+ * Genera un código compartido CC-XXXX-XXXX para el curso.
+ * Requiere JWT de Supabase (tesorero o admin de la cuenta).
+ *
+ * RPC: apoderado_cc_generar(p_cuenta_id UUID, p_curso_id TEXT)
+ * Acceso: authenticated  (anon recibe 42501)
+ * Retorna: JSONB { codigo_cc: "CC-XXXX-XXXX" }
+ *
+ * @param {string} cuentaId
+ * @param {string} cursoId
+ * @returns {Promise<{codigo_cc: string}>}
+ */
+async function v9CcGenerar(cuentaId, cursoId) {
+  const base  = _v9BaseUrl().replace('/rest/v1', '') + '/rest/v1';
+  const token = _authToken();   // JWT de Supabase del tesorero autenticado
+  const res   = await fetch(base + '/rpc/apoderado_cc_generar', {
+    method:  'POST',
+    headers: {
+      'apikey':        SUPA_KEY,
+      'Authorization': 'Bearer ' + token,
+      'Content-Type':  'application/json',
+      'Accept':        'application/json',
+    },
+    body: JSON.stringify({ p_cuenta_id: cuentaId, p_curso_id: cursoId }),
+  });
+  if (!res.ok) {
+    let body = ''; try { body = await res.text(); } catch (_) {}
+    throw new Error(`[datos_v9] v9CcGenerar → HTTP ${res.status}: ${body}`);
+  }
+  return await res.json();
+}
+
+/**
+ * Revoca el código compartido del curso.
+ * Requiere JWT de Supabase (tesorero o admin de la cuenta).
+ * Tras revocar, v9CcResumenPagos con el código anterior retorna vacío.
+ *
+ * RPC: apoderado_cc_revocar(p_cuenta_id UUID, p_curso_id TEXT)
+ * Acceso: authenticated  (anon recibe 42501)
+ * Retorna: JSONB { revocado: true }
+ *
+ * @param {string} cuentaId
+ * @param {string} cursoId
+ * @returns {Promise<{revocado: boolean}>}
+ */
+async function v9CcRevocar(cuentaId, cursoId) {
+  const base  = _v9BaseUrl().replace('/rest/v1', '') + '/rest/v1';
+  const token = _authToken();
+  const res   = await fetch(base + '/rpc/apoderado_cc_revocar', {
+    method:  'POST',
+    headers: {
+      'apikey':        SUPA_KEY,
+      'Authorization': 'Bearer ' + token,
+      'Content-Type':  'application/json',
+      'Accept':        'application/json',
+    },
+    body: JSON.stringify({ p_cuenta_id: cuentaId, p_curso_id: cursoId }),
+  });
+  if (!res.ok) {
+    let body = ''; try { body = await res.text(); } catch (_) {}
+    throw new Error(`[datos_v9] v9CcRevocar → HTTP ${res.status}: ${body}`);
+  }
+  return await res.json();
 }
