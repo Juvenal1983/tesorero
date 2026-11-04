@@ -210,63 +210,73 @@ BEGIN
       AND NOT b.eximido
   ),
 
-  -- ── Pagos realizados para cuotas mensuales ───────────────────
-  -- JOIN por cuota_id + alumno_id + periodo (coincidencia exacta de período).
+  -- ── Pagos realizados para cuotas mensuales (pre-agregados) ──
+  -- GROUP BY (alumno, cuota, periodo) evita fan-out si hubiera más de
+  -- un registro de pago para el mismo período (p.ej. corrección).
   pagos_mensual AS (
-    SELECT p.alumno_id, p.cuota_id, p.periodo, p.monto
+    SELECT p.alumno_id, p.cuota_id, p.periodo, SUM(p.monto) AS monto
     FROM pagos p
     WHERE p.cuenta_id = v_cuenta_id
       AND p.estado    = 'pagado'
       AND p.cuota_id  IN (SELECT om.cuota_id FROM obligaciones_mensual om)
       AND p.alumno_id IN (SELECT bx.alumno_id FROM base bx)
+    GROUP BY p.alumno_id, p.cuota_id, p.periodo
   ),
 
-  -- ── Pagos realizados para cuotas no-mensuales ────────────────
+  -- ── Pagos realizados para cuotas no-mensuales (pre-agregados) ─
+  -- GROUP BY (alumno, cuota) antes del JOIN evita el fan-out que
+  -- duplicaría SUM(oo.monto) cuando existen varios pagos para la
+  -- misma cuota no-mensual (p.ej. pago parcial + corrección).
   pagos_otros AS (
-    SELECT p.alumno_id, p.cuota_id, p.monto
+    SELECT p.alumno_id, p.cuota_id, SUM(p.monto) AS monto
     FROM pagos p
     WHERE p.cuenta_id = v_cuenta_id
       AND p.estado    = 'pagado'
       AND p.cuota_id  IN (SELECT oo.cuota_id FROM obligaciones_otros oo)
       AND p.alumno_id IN (SELECT bx.alumno_id FROM base bx)
+    GROUP BY p.alumno_id, p.cuota_id
   ),
 
-  -- ── Resumen mensual por alumno ───────────────────────────────
-  resumen_mensual AS (
+  -- ── Resumen mensual por (alumno × cuota) ─────────────────────
+  mensual_por_cuota AS (
     SELECT
       om.alumno_id,
+      om.cuota_id,
       COUNT(*)::INT                                              AS total_periodos,
       COUNT(pm.periodo)::INT                                     AS periodos_pagados,
-      SUM(om.monto)                                             AS monto_obligado,
+      SUM(om.monto)                                             AS obligado,
       COALESCE(SUM(CASE WHEN pm.periodo IS NOT NULL
                         THEN pm.monto ELSE 0::NUMERIC END),
-               0::NUMERIC)                                      AS monto_pagado
+               0::NUMERIC)                                      AS pagado
     FROM obligaciones_mensual om
     LEFT JOIN pagos_mensual pm
       ON  pm.alumno_id = om.alumno_id
       AND pm.cuota_id  = om.cuota_id
       AND pm.periodo   = om.periodo
-    GROUP BY om.alumno_id
+    GROUP BY om.alumno_id, om.cuota_id
   ),
 
-  -- ── Resumen no-mensual por alumno ───────────────────────────
-  resumen_otros AS (
+  -- ── Resumen no-mensual por (alumno × cuota) ──────────────────
+  otros_por_cuota AS (
     SELECT
       oo.alumno_id,
-      COUNT(*)::INT                                              AS total_obligaciones,
-      COUNT(po.cuota_id)::INT                                   AS obligaciones_pagadas,
-      SUM(oo.monto)                                             AS monto_obligado,
-      COALESCE(SUM(po.monto), 0::NUMERIC)                      AS monto_pagado
+      oo.cuota_id,
+      1::INT                                                    AS total_obligaciones,
+      (CASE WHEN po.monto IS NOT NULL THEN 1 ELSE 0 END)::INT  AS obligaciones_pagadas,
+      oo.monto                                                  AS obligado,
+      COALESCE(po.monto, 0::NUMERIC)                           AS pagado
     FROM obligaciones_otros oo
     LEFT JOIN pagos_otros po
       ON  po.alumno_id = oo.alumno_id
       AND po.cuota_id  = oo.cuota_id
-    GROUP BY oo.alumno_id
   ),
 
-  -- ── Abonos de planes activos cuya cuota pertenece al curso ───
-  abonos_ok AS (
-    SELECT ab.alumno_id,
+  -- ── Abonos de planes activos agrupados por (alumno × cuota) ──
+  -- Agrupar por cuota permite limitar cada abono al pendiente de
+  -- su propia obligación: un abono en cuota X ya cubierta por pagos
+  -- no se "derrama" hacia el pendiente de otra cuota Y.
+  abonos_por_cuota AS (
+    SELECT ab.alumno_id, pp.cuota_id,
            COALESCE(SUM(ab.monto), 0::NUMERIC) AS total
     FROM abonos ab
     JOIN planes_pago pp
@@ -280,37 +290,75 @@ BEGIN
       AND ab.pagado    = TRUE
       AND pp.activo    = TRUE
       AND cu.curso_id  = v_curso_id
-    GROUP BY ab.alumno_id
+    GROUP BY ab.alumno_id, pp.cuota_id
+  ),
+
+  -- ── Unión mensual + no-mensual por (alumno × cuota) ──────────
+  todos_por_cuota AS (
+    SELECT alumno_id, cuota_id,
+           total_periodos    AS total_obs,
+           periodos_pagados  AS obs_pagadas,
+           obligado, pagado
+    FROM mensual_por_cuota
+    UNION ALL
+    SELECT alumno_id, cuota_id,
+           total_obligaciones,
+           obligaciones_pagadas,
+           obligado, pagado
+    FROM otros_por_cuota
+  ),
+
+  -- ── Aplicar abono limitado al pendiente restante de su cuota ──
+  -- abonado_efectivo = MIN(abono_registrado, MAX(0, obligado − pagado))
+  -- Esto garantiza que el crédito de un abono no exceda la deuda
+  -- residual de la cuota a la que pertenece su plan.
+  con_abono AS (
+    SELECT
+      tpc.alumno_id,
+      tpc.total_obs,
+      tpc.obs_pagadas,
+      tpc.obligado,
+      tpc.pagado,
+      LEAST(
+        COALESCE(apc.total, 0::NUMERIC),
+        GREATEST(0::NUMERIC, tpc.obligado - tpc.pagado)
+      )                                                         AS abonado
+    FROM todos_por_cuota tpc
+    LEFT JOIN abonos_por_cuota apc
+      ON  apc.alumno_id = tpc.alumno_id
+      AND apc.cuota_id  = tpc.cuota_id
+  ),
+
+  -- ── Resumen final agregado por alumno ────────────────────────
+  resumen_alumno AS (
+    SELECT
+      alumno_id,
+      SUM(total_obs)::INT                                       AS total_obligaciones,
+      SUM(obs_pagadas)::INT                                     AS total_pagadas,
+      SUM(pagado)                                               AS monto_pagado,
+      SUM(abonado)                                              AS monto_abonado,
+      SUM(GREATEST(0::NUMERIC, obligado - pagado - abonado))   AS monto_pendiente
+    FROM con_abono
+    GROUP BY alumno_id
   )
 
   SELECT
     b.alumno_id,
     b.nombre,
     -- Pagado = suma de pagos reales (mensual + no-mensual)
-    (COALESCE(rm.monto_pagado, 0::NUMERIC)
-     + COALESCE(ro.monto_pagado, 0::NUMERIC))                  AS monto_pagado,
-    -- Abonado = créditos de planes de pago
-    COALESCE(ao.total, 0::NUMERIC)                             AS monto_abonado,
-    -- Pendiente = obligado − pagado − abonado (mínimo 0)
-    GREATEST(0::NUMERIC,
-      COALESCE(rm.monto_obligado, 0::NUMERIC)
-      + COALESCE(ro.monto_obligado, 0::NUMERIC)
-      - COALESCE(rm.monto_pagado, 0::NUMERIC)
-      - COALESCE(ro.monto_pagado, 0::NUMERIC)
-      - COALESCE(ao.total, 0::NUMERIC)
-    )                                                           AS monto_pendiente,
-    -- Cuotas pagadas = períodos mensuales pagados + obligaciones no-mensual pagadas
-    (COALESCE(rm.periodos_pagados, 0)
-     + COALESCE(ro.obligaciones_pagadas, 0))::INT              AS num_cuotas_pagadas,
+    COALESCE(ra.monto_pagado,  0::NUMERIC)                     AS monto_pagado,
+    -- Abonado = crédito efectivo de planes de pago (capped por cuota)
+    COALESCE(ra.monto_abonado, 0::NUMERIC)                     AS monto_abonado,
+    -- Pendiente = SUM(MAX(0, obligado_i − pagado_i − abonado_i)) por cuota
+    COALESCE(ra.monto_pendiente, 0::NUMERIC)                   AS monto_pendiente,
+    -- Cuotas pagadas = períodos mensuales + obligaciones no-mensual con pago
+    COALESCE(ra.total_pagadas, 0)::INT                         AS num_cuotas_pagadas,
     -- Cuotas pendientes = total_obligaciones − pagadas
     GREATEST(0,
-      (COALESCE(rm.total_periodos, 0) + COALESCE(ro.total_obligaciones, 0))
-      - (COALESCE(rm.periodos_pagados, 0) + COALESCE(ro.obligaciones_pagadas, 0))
-    )::INT                                                     AS num_cuotas_pendientes
+      COALESCE(ra.total_obligaciones, 0) - COALESCE(ra.total_pagadas, 0)
+    )::INT                                                      AS num_cuotas_pendientes
   FROM base b
-  LEFT JOIN resumen_mensual rm ON rm.alumno_id = b.alumno_id
-  LEFT JOIN resumen_otros   ro ON ro.alumno_id = b.alumno_id
-  LEFT JOIN abonos_ok       ao ON ao.alumno_id = b.alumno_id
+  LEFT JOIN resumen_alumno ra ON ra.alumno_id = b.alumno_id
   ORDER BY b.nombre;
 END;
 $$;

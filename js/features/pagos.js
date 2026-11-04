@@ -102,6 +102,18 @@ function renderPagos(){
 function delPago(id){
   if(!confirm('¿Eliminar este pago? Esta acción no se puede deshacer.')) return;
   DB.pagos=(DB.pagos||[]).filter(p=>p.id!==id);
+
+  // ── FLUJO RELACIONAL v9 ──────────────────────────────────────────
+  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
+    const cuentaId = (typeof S!=='undefined' && S._v9CuentaId) || null;
+    if(cuentaId){
+      eliminarPagoV9(cuentaId, id, _authToken).catch(err=>{
+        console.error('[v9] Error eliminando pago:', err);
+      });
+    }
+  }
+  // ────────────────────────────────────────────────────────────────
+
   saveDB(); go('pagos',S.params);
 }
 
@@ -154,6 +166,17 @@ function saveEditPago(pagoId){
   p.fecha = fecha;
   p.medio = medio;
   p.obs   = obs;
+
+  // ── FLUJO RELACIONAL v9 ──────────────────────────────────────────
+  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
+    const cuentaId = (typeof S!=='undefined' && S._v9CuentaId) || null;
+    if(cuentaId){
+      actualizarPagoV9(cuentaId, pagoId, { monto, fecha, medio, obs }, _authToken)
+        .catch(err=>{ console.error('[v9] Error actualizando pago:', err); });
+    }
+  }
+  // ────────────────────────────────────────────────────────────────
+
   saveDB();
   closeModal();
   go('pagos', S.params);

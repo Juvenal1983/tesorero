@@ -1263,6 +1263,199 @@ BEGIN
 END;
 $$;
 
+-- ══════════════════════════════════════════════════════════════
+-- CC-ESC-6 y CC-ESC-7: correctitud del cálculo por obligación
+-- en apoderado_cc_resumen_pagos
+--
+-- CC-ESC-6: un abono cuya cuota ya está cubierta por pagos NO debe
+--           reducir el pendiente de otra cuota del mismo alumno.
+-- CC-ESC-7: varios pagos para la misma cuota no-mensual NO deben
+--           multiplicar el monto obligado de esa cuota.
+--
+-- Ambos tests son independientes del JWT → válidos LOCAL y STAGING.
+-- Se crean cursos temporales (cur-esc6, cur-esc7) con código CC
+-- propio; todo se elimina con DELETE explícito antes del ROLLBACK.
+-- ══════════════════════════════════════════════════════════════
+DO $$
+DECLARE
+  cuenta_a UUID := '00000000-0000-0000-aaaa-000000000001'::uuid;
+  r_esc6   RECORD;
+  r_esc7   RECORD;
+BEGIN
+
+  -- ════════════════════════════════════════════════════════════
+  -- CC-ESC-6: abono en obligación cubierta no "derrama" a otra
+  -- ────────────────────────────────────────────────────────────
+  -- Escenario:
+  --   • cuota-esc6-c1 (mensual, Marzo 2025, $10 000) → pago completo
+  --   • cuota-esc6-c2 (mensual, Abril 2025, $10 000) → sin pago
+  --   • plan-esc6-01 con abono $5 000 para cuota-esc6-c1 (ya cubierta)
+  -- Comportamiento esperado:
+  --   monto_pendiente  = 10 000 (sólo C2 pendiente)
+  --   monto_abonado    =      0 (abono en C1 cubierta queda en 0 efectivo)
+  --   num_cuotas_pagadas   = 1
+  --   num_cuotas_pendientes = 1
+  -- ════════════════════════════════════════════════════════════
+
+  INSERT INTO cursos (cuenta_id, id, nombre, activo, codigo_compartido)
+  VALUES (cuenta_a, 'cur-esc6', 'Curso ESC6 temp', true, 'CC-ESC6-TEST')
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  -- C1: sólo Marzo (mes 2 = índice base-0 en el array de meses)
+  INSERT INTO cuotas (cuenta_id, id, curso_id, nombre, tipo,
+                      monto, anio, mes_inicio, mes_termino, activa)
+  VALUES (cuenta_a, 'cuota-esc6-c1', 'cur-esc6',
+          'Cuota ESC6 C1 Marzo', 'mensual', 10000, 2025, 2, 2, true)
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  -- C2: sólo Abril (mes 3)
+  INSERT INTO cuotas (cuenta_id, id, curso_id, nombre, tipo,
+                      monto, anio, mes_inicio, mes_termino, activa)
+  VALUES (cuenta_a, 'cuota-esc6-c2', 'cur-esc6',
+          'Cuota ESC6 C2 Abril', 'mensual', 10000, 2025, 3, 3, true)
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  INSERT INTO alumnos (cuenta_id, id, curso_id, nombres, apellidos, estado, eximido)
+  VALUES (cuenta_a, 'alu-esc6', 'cur-esc6', 'Alumno', 'ESC6', 'activo', false)
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  -- Pago completo de C1 / Marzo 2025
+  INSERT INTO pagos (cuenta_id, id, alumno_id, cuota_id,
+                     monto, fecha, medio, estado, periodo)
+  VALUES (cuenta_a, 'pago-esc6-01', 'alu-esc6', 'cuota-esc6-c1',
+          10000, '2025-03-05', 'transferencia', 'pagado', 'Marzo 2025')
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  -- Plan y abono para C1 (C1 ya está cubierta; el abono debe quedar sin efecto)
+  INSERT INTO planes_pago (cuenta_id, id, alumno_id, cuota_id, monto_total, activo)
+  VALUES (cuenta_a, 'plan-esc6-01', 'alu-esc6', 'cuota-esc6-c1', 10000, true)
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  INSERT INTO abonos (cuenta_id, id, alumno_id, cuota_id, plan_id, monto, pagado)
+  VALUES (cuenta_a, 'abono-esc6-01', 'alu-esc6', 'cuota-esc6-c1',
+          'plan-esc6-01', 5000, true)
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  SELECT * INTO r_esc6
+  FROM apoderado_cc_resumen_pagos('CC-ESC6-TEST')
+  WHERE alumno_id = 'alu-esc6';
+
+  ASSERT r_esc6 IS NOT NULL,
+    'CC-ESC-6 FAIL: alu-esc6 no apareció en resumen';
+
+  ASSERT r_esc6.monto_pendiente = 10000,
+    format('CC-ESC-6 FAIL: monto_pendiente esperado 10000 (C2 impaga), '
+           'obtuvo %s — el abono de C1 (ya cubierta) reduce ilegalmente C2',
+           r_esc6.monto_pendiente);
+
+  ASSERT r_esc6.monto_abonado = 0,
+    format('CC-ESC-6 FAIL: monto_abonado efectivo esperado 0 (C1 cubierta), '
+           'obtuvo %s',
+           r_esc6.monto_abonado);
+
+  ASSERT r_esc6.monto_pagado = 10000,
+    format('CC-ESC-6 FAIL: monto_pagado esperado 10000, obtuvo %s',
+           r_esc6.monto_pagado);
+
+  ASSERT r_esc6.num_cuotas_pagadas = 1,
+    format('CC-ESC-6 FAIL: num_cuotas_pagadas esperado 1, obtuvo %s',
+           r_esc6.num_cuotas_pagadas);
+
+  ASSERT r_esc6.num_cuotas_pendientes = 1,
+    format('CC-ESC-6 FAIL: num_cuotas_pendientes esperado 1, obtuvo %s',
+           r_esc6.num_cuotas_pendientes);
+
+  RAISE NOTICE '[OK] CC-ESC-6: abono en C1 cubierta no reduce C2 — '
+               'pendiente=10000, abonado=0, pagadas=1, pendientes=1';
+
+  -- Limpieza CC-ESC-6
+  DELETE FROM abonos      WHERE cuenta_id = cuenta_a AND id = 'abono-esc6-01';
+  DELETE FROM planes_pago WHERE cuenta_id = cuenta_a AND id = 'plan-esc6-01';
+  DELETE FROM pagos       WHERE cuenta_id = cuenta_a AND id = 'pago-esc6-01';
+  DELETE FROM alumnos     WHERE cuenta_id = cuenta_a AND id = 'alu-esc6';
+  DELETE FROM cuotas      WHERE cuenta_id = cuenta_a AND id IN ('cuota-esc6-c1','cuota-esc6-c2');
+  DELETE FROM cursos      WHERE cuenta_id = cuenta_a AND id = 'cur-esc6';
+
+
+  -- ════════════════════════════════════════════════════════════
+  -- CC-ESC-7: varios pagos para la misma cuota no-mensual NO
+  --           multiplican el monto obligado
+  -- ────────────────────────────────────────────────────────────
+  -- Escenario:
+  --   • cuota-esc7-c1 (no-mensual, $12 000) — alu-esc7
+  --   • pago-esc7-01: $10 000 (pago parcial inicial)
+  --   • pago-esc7-02: $ 5 000 (corrección/complemento)
+  --   Sin pre-agregar pagos: 2 filas en pagos_otros harían fan-out
+  --   y duplicarían SUM(oo.monto) → monto_obligado ficticio de $24 000
+  --   → monto_pendiente = MAX(0, 24000-15000) = 9000  ← BUG
+  -- Comportamiento esperado con fix:
+  --   monto_pagado  = 15 000  (suma real de ambos pagos)
+  --   monto_pendiente = 0     (pagado ≥ obligado → MAX(0,12000-15000)=0)
+  --   num_cuotas_pagadas   = 1
+  --   num_cuotas_pendientes = 0
+  -- ════════════════════════════════════════════════════════════
+
+  INSERT INTO cursos (cuenta_id, id, nombre, activo, codigo_compartido)
+  VALUES (cuenta_a, 'cur-esc7', 'Curso ESC7 temp', true, 'CC-ESC7-TEST')
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  -- Cuota no-mensual (tipo NULL = no-mensual según la app)
+  INSERT INTO cuotas (cuenta_id, id, curso_id, nombre, tipo, monto, activa)
+  VALUES (cuenta_a, 'cuota-esc7-c1', 'cur-esc7',
+          'Cuota Anual ESC7', NULL, 12000, true)
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  INSERT INTO alumnos (cuenta_id, id, curso_id, nombres, apellidos, estado, eximido)
+  VALUES (cuenta_a, 'alu-esc7', 'cur-esc7', 'Alumno', 'ESC7', 'activo', false)
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  -- Dos pagos distintos para la misma cuota no-mensual
+  INSERT INTO pagos (cuenta_id, id, alumno_id, cuota_id,
+                     monto, fecha, medio, estado)
+  VALUES
+    (cuenta_a, 'pago-esc7-01', 'alu-esc7', 'cuota-esc7-c1',
+     10000, '2025-03-05', 'transferencia', 'pagado'),
+    (cuenta_a, 'pago-esc7-02', 'alu-esc7', 'cuota-esc7-c1',
+     5000,  '2025-03-10', 'transferencia', 'pagado')
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  SELECT * INTO r_esc7
+  FROM apoderado_cc_resumen_pagos('CC-ESC7-TEST')
+  WHERE alumno_id = 'alu-esc7';
+
+  ASSERT r_esc7 IS NOT NULL,
+    'CC-ESC-7 FAIL: alu-esc7 no apareció en resumen';
+
+  ASSERT r_esc7.monto_pendiente = 0,
+    format('CC-ESC-7 FAIL: monto_pendiente esperado 0, obtuvo %s — '
+           'posible fan-out que multiplica el monto obligado ($12000→$24000)',
+           r_esc7.monto_pendiente);
+
+  ASSERT r_esc7.monto_pagado = 15000,
+    format('CC-ESC-7 FAIL: monto_pagado esperado 15000 (suma de los 2 pagos), '
+           'obtuvo %s',
+           r_esc7.monto_pagado);
+
+  ASSERT r_esc7.num_cuotas_pagadas = 1,
+    format('CC-ESC-7 FAIL: num_cuotas_pagadas esperado 1, obtuvo %s',
+           r_esc7.num_cuotas_pagadas);
+
+  ASSERT r_esc7.num_cuotas_pendientes = 0,
+    format('CC-ESC-7 FAIL: num_cuotas_pendientes esperado 0, obtuvo %s',
+           r_esc7.num_cuotas_pendientes);
+
+  RAISE NOTICE '[OK] CC-ESC-7: 2 pagos en cuota no-mensual no multiplican obligado — '
+               'pagado=15000, pendiente=0, pagadas=1, pendientes=0';
+
+  -- Limpieza CC-ESC-7
+  DELETE FROM pagos   WHERE cuenta_id = cuenta_a AND id IN ('pago-esc7-01','pago-esc7-02');
+  DELETE FROM alumnos WHERE cuenta_id = cuenta_a AND id = 'alu-esc7';
+  DELETE FROM cuotas  WHERE cuenta_id = cuenta_a AND id = 'cuota-esc7-c1';
+  DELETE FROM cursos  WHERE cuenta_id = cuenta_a AND id = 'cur-esc7';
+
+END;
+$$;
+
 -- ── Fin ────────────────────────────────────────────────────────
 DO $$
 BEGIN

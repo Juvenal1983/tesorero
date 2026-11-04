@@ -187,6 +187,34 @@ async function eliminarPagoV9(cuentaId, pagoId, accessToken) {
 }
 
 /**
+ * Actualiza monto, fecha, medio y obs de un pago existente.
+ * Usa PATCH con Prefer: return=representation.
+ * @param {string} cuentaId
+ * @param {string} pagoId
+ * @param {{ monto: number, fecha: string, medio: string, obs: string }} cambios
+ * @param {string} accessToken
+ * @returns {Object} registro actualizado
+ */
+async function actualizarPagoV9(cuentaId, pagoId, cambios, accessToken) {
+  const patch = {};
+  if (cambios.monto  !== undefined) patch.monto  = Number(cambios.monto) || 0;
+  if (cambios.fecha  !== undefined) patch.fecha  = cambios.fecha;
+  if (cambios.medio  !== undefined) patch.medio  = cambios.medio;
+  if (cambios.obs    !== undefined) patch.obs    = cambios.obs || null;
+
+  const rows = await _v9Fetch(
+    `/pagos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(pagoId)}&select=*`,
+    {
+      method:  'PATCH',
+      headers: { 'Prefer': 'return=representation' },
+      body:    JSON.stringify(patch),
+    },
+    accessToken
+  );
+  return Array.isArray(rows) && rows.length > 0 ? rows[0] : { cuenta_id: cuentaId, id: pagoId, ...patch };
+}
+
+/**
  * Verifica que un pago existe en la tabla.
  * Devuelve el registro o null.
  */
