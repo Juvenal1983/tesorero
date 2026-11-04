@@ -147,12 +147,22 @@ async function registrarPagoV9(pago, cuentaId, accessToken) {
   // Generar id determinista si no viene: p-{timestamp}-{random}
   const id = pago.id || `p-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
+  // Validación de monto: debe ser un número finito y positivo (CLP entero)
+  const montoNum = Number(pago.monto);
+  if (!Number.isFinite(montoNum) || montoNum <= 0) {
+    throw new Error(
+      `[datos_v9] registrarPagoV9: monto inválido (${JSON.stringify(pago.monto)}). ` +
+      'Debe ser un número entero positivo en CLP.'
+    );
+  }
+  const monto = Math.round(montoNum); // CLP no tiene decimales
+
   const payload = {
     cuenta_id:  cuentaId,
     id,
     alumno_id:  pago.alumno_id,
     cuota_id:   pago.cuota_id,
-    monto:      Number(pago.monto) || 0,
+    monto,
     fecha:      pago.fecha || new Date().toISOString().slice(0, 10),
     medio:      pago.medio || 'efectivo',
     estado:     pago.estado || 'pagado',
@@ -171,7 +181,14 @@ async function registrarPagoV9(pago, cuentaId, accessToken) {
     accessToken
   );
 
-  return Array.isArray(rows) && rows.length > 0 ? rows[0] : { ...payload };
+  // C07: exigir confirmación real de la DB; retorno vacío = error, no éxito silencioso
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new Error(
+      `[datos_v9] registrarPagoV9: el INSERT no devolvió ninguna fila. ` +
+      'El pago puede no haberse guardado. Verifica permisos RLS y constraints.'
+    );
+  }
+  return rows[0];
 }
 
 /**
@@ -197,7 +214,17 @@ async function eliminarPagoV9(cuentaId, pagoId, accessToken) {
  */
 async function actualizarPagoV9(cuentaId, pagoId, cambios, accessToken) {
   const patch = {};
-  if (cambios.monto  !== undefined) patch.monto  = Number(cambios.monto) || 0;
+  if (cambios.monto !== undefined) {
+    // C05: validación explícita — no silenciar importes inválidos
+    const montoNum = Number(cambios.monto);
+    if (!Number.isFinite(montoNum) || montoNum <= 0) {
+      throw new Error(
+        `[datos_v9] actualizarPagoV9: monto inválido (${JSON.stringify(cambios.monto)}). ` +
+        'Debe ser un número entero positivo en CLP.'
+      );
+    }
+    patch.monto = Math.round(montoNum);
+  }
   if (cambios.fecha  !== undefined) patch.fecha  = cambios.fecha;
   if (cambios.medio  !== undefined) patch.medio  = cambios.medio;
   if (cambios.obs    !== undefined) patch.obs    = cambios.obs || null;
@@ -403,6 +430,17 @@ async function cargarSesionV9(authId, accessToken, cursoId) {
     : cursosRaw;
   DB.cursos = cursosFiltrados.map(_mapCurso);
 
+  // C15: validar cursoId pedido contra el conjunto autorizado ANTES de cargar.
+  // Si el caller pasa un cursoId ajeno a esta cuenta/membresía, se rechaza aquí
+  // sin esperar a que RLS lo filtre silenciosamente.
+  const idsAutorizados = new Set(cursosFiltrados.map(c => c.id));
+  if (cursoId && !idsAutorizados.has(cursoId)) {
+    throw new Error(
+      `[datos_v9] cargarSesionV9: cursoId "${cursoId}" no está autorizado para esta cuenta/membresía. ` +
+      `Cursos autorizados: [${[...idsAutorizados].join(', ')}]`
+    );
+  }
+
   const primerCursoId = cursoId || (cursosFiltrados[0] && cursosFiltrados[0].id) || null;
 
   // 3. Alumnos del primer curso (se recargan al cambiar de curso en selectCurso)
@@ -421,10 +459,11 @@ async function cargarSesionV9(authId, accessToken, cursoId) {
   const pagosRaw = await cargarPagos(cuentaId, accessToken);
   DB.pagos = pagosRaw.map(_mapPago);
 
-  // 5. Limpiar colecciones no relacionales para evitar datos fantasma
-  DB.movimientos = DB.movimientos || [];
-  DB.notas       = DB.notas       || [];
-  DB.colegios    = DB.colegios    || [];
+  // 5. C16: limpiar colecciones no relacionales (nunca preservar de sesión anterior).
+  // Usar || [] podría dejar datos de un usuario previo si el logout fue parcial.
+  DB.movimientos = [];
+  DB.notas       = [];
+  DB.colegios    = [];
 
   // Guardar cuentaId en S para que lo usen las funciones de guardado
   if (typeof S !== 'undefined') {
@@ -490,13 +529,16 @@ async function _v9RpcApoderado(nombre, params) {
   const base = _v9BaseUrl().replace('/rest/v1', '') + '/rest/v1';
   const url  = base + '/rpc/' + nombre;
 
+  // C08: las RPCs de apoderado son públicas (SECURITY DEFINER).
+  // Solo se necesita apikey (anon role). NO enviar Authorization: Bearer <anon_key>
+  // porque la anon key no es un JWT de usuario y el encabezado podría ser
+  // rechazado si el formato de la clave cambia (ej. sb_publishable_*).
   const res = await fetch(url, {
     method:  'POST',
     headers: {
-      'apikey':        SUPA_KEY,
-      'Authorization': 'Bearer ' + SUPA_KEY,
-      'Content-Type':  'application/json',
-      'Accept':        'application/json',
+      'apikey':       SUPA_KEY,
+      'Content-Type': 'application/json',
+      'Accept':       'application/json',
     },
     body: JSON.stringify(params),
   });
@@ -529,13 +571,13 @@ async function v9AluSelector(codigo) {
   const base = _v9BaseUrl().replace('/rest/v1', '') + '/rest/v1';
   const url  = base + '/rpc/apoderado_alumnos_curso';
 
+  // C08: acceso anónimo — solo apikey, sin Authorization Bearer
   const res = await fetch(url, {
     method: 'POST',
     headers: {
-      'apikey':        SUPA_KEY,
-      'Authorization': 'Bearer ' + SUPA_KEY,
-      'Content-Type':  'application/json',
-      'Accept':        'application/json',
+      'apikey':       SUPA_KEY,
+      'Content-Type': 'application/json',
+      'Accept':       'application/json',
     },
     body: JSON.stringify({ p_codigo: codigo }),
   });
