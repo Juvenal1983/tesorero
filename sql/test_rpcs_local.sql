@@ -1104,6 +1104,165 @@ BEGIN
 END;
 $$;
 
+-- ════════════════════════════════════════════════════════════════
+-- CC-ESC-R: Rechazos de alcance/rol en apoderado_cc_revocar
+-- Espejo exacto de CC-ESC1-CC-ESC5 pero llamando a revocar.
+-- Primero generamos un código válido como dueño para que haya algo que revocar.
+-- ════════════════════════════════════════════════════════════════
+
+-- CC-ESC-R0: generar código válido para cur-a-01 (dueño de cuenta_a) [LOCAL ONLY]
+DO $$
+DECLARE
+  cuenta_a  UUID   := '00000000-0000-0000-aaaa-000000000001'::uuid;
+  user_a    UUID   := 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  v_codigo  TEXT;
+BEGIN
+  PERFORM set_config('request.jwt.claims',
+    format('{"sub":"%s","role":"authenticated"}', user_a), true);
+  SET LOCAL ROLE authenticated;
+  SELECT apoderado_cc_generar(cuenta_a, 'cur-a-01')->>'codigo_cc' INTO v_codigo;
+  RESET ROLE;
+  PERFORM set_config('request.jwt.claims', '', true);
+  RAISE NOTICE '[setup] CC-ESC-R0: código generado para cur-a-01: %', v_codigo;
+END;
+$$;
+
+-- CC-ESC-R1: tesorero de cur-a-01 no puede revocar código de cur-a-02  [LOCAL ONLY]
+DO $$
+DECLARE
+  cuenta_a  UUID   := '00000000-0000-0000-aaaa-000000000001'::uuid;
+  sim_uuid  UUID   := 'cccccccc-cccc-cccc-cccc-000000000001';
+BEGIN
+  -- Insertar membresía tesorero scoped a cur-a-01
+  INSERT INTO usuarios_cuenta(cuenta_id, id, auth_id, email, rol, curso_id, desactivado)
+  VALUES (cuenta_a, 'uc-esc-r1', sim_uuid, 'esc-r1@test.local', 'tesorero', 'cur-a-01', false)
+  ON CONFLICT DO NOTHING;
+
+  PERFORM set_config('request.jwt.claims',
+    format('{"sub":"%s","role":"authenticated"}', sim_uuid), true);
+  SET LOCAL ROLE authenticated;
+  BEGIN
+    PERFORM apoderado_cc_revocar(cuenta_a, 'cur-a-02');
+    RESET ROLE;
+    RAISE EXCEPTION 'CC-ESC-R1 FAIL: tesorero de cur-a-01 pudo revocar código de cur-a-02'
+      USING ERRCODE = '45000';
+  EXCEPTION
+    WHEN insufficient_privilege THEN
+      RESET ROLE;
+      RAISE NOTICE '[OK] CC-ESC-R1: tesorero de cur-a-01 no puede revocar cur-a-02 (42501)';
+  END;
+  PERFORM set_config('request.jwt.claims', '', true);
+  DELETE FROM usuarios_cuenta WHERE cuenta_id = cuenta_a AND id = 'uc-esc-r1';
+END;
+$$;
+
+-- CC-ESC-R2: visor rechazado en revocar  [LOCAL ONLY]
+DO $$
+DECLARE
+  cuenta_a  UUID := '00000000-0000-0000-aaaa-000000000001'::uuid;
+  sim_uuid  UUID := 'bbbbbbbb-bbbb-bbbb-bbbb-000000000001';
+BEGIN
+  INSERT INTO usuarios_cuenta(cuenta_id, id, auth_id, email, rol, curso_id, desactivado)
+  VALUES (cuenta_a, 'uc-esc-r2', sim_uuid, 'esc-r2@test.local', 'visor', 'cur-a-01', false)
+  ON CONFLICT DO NOTHING;
+
+  PERFORM set_config('request.jwt.claims',
+    format('{"sub":"%s","role":"authenticated"}', sim_uuid), true);
+  SET LOCAL ROLE authenticated;
+  BEGIN
+    PERFORM apoderado_cc_revocar(cuenta_a, 'cur-a-01');
+    RESET ROLE;
+    RAISE EXCEPTION 'CC-ESC-R2 FAIL: visor pudo revocar código CC'
+      USING ERRCODE = '45000';
+  EXCEPTION
+    WHEN insufficient_privilege THEN
+      RESET ROLE;
+      RAISE NOTICE '[OK] CC-ESC-R2: visor rechazado en revocar (42501)';
+  END;
+  PERFORM set_config('request.jwt.claims', '', true);
+  DELETE FROM usuarios_cuenta WHERE cuenta_id = cuenta_a AND id = 'uc-esc-r2';
+END;
+$$;
+
+-- CC-ESC-R3: editor rechazado en revocar  [LOCAL ONLY]
+DO $$
+DECLARE
+  cuenta_a  UUID := '00000000-0000-0000-aaaa-000000000001'::uuid;
+  sim_uuid  UUID := 'bbbbbbbb-bbbb-bbbb-bbbb-000000000002';
+BEGIN
+  INSERT INTO usuarios_cuenta(cuenta_id, id, auth_id, email, rol, curso_id, desactivado)
+  VALUES (cuenta_a, 'uc-esc-r3', sim_uuid, 'esc-r3@test.local', 'editor', 'cur-a-01', false)
+  ON CONFLICT DO NOTHING;
+
+  PERFORM set_config('request.jwt.claims',
+    format('{"sub":"%s","role":"authenticated"}', sim_uuid), true);
+  SET LOCAL ROLE authenticated;
+  BEGIN
+    PERFORM apoderado_cc_revocar(cuenta_a, 'cur-a-01');
+    RESET ROLE;
+    RAISE EXCEPTION 'CC-ESC-R3 FAIL: editor pudo revocar código CC'
+      USING ERRCODE = '45000';
+  EXCEPTION
+    WHEN insufficient_privilege THEN
+      RESET ROLE;
+      RAISE NOTICE '[OK] CC-ESC-R3: editor rechazado en revocar (42501)';
+  END;
+  PERFORM set_config('request.jwt.claims', '', true);
+  DELETE FROM usuarios_cuenta WHERE cuenta_id = cuenta_a AND id = 'uc-esc-r3';
+END;
+$$;
+
+-- CC-ESC-R4: miembro desactivado rechazado en revocar  [LOCAL ONLY]
+DO $$
+DECLARE
+  cuenta_a  UUID := '00000000-0000-0000-aaaa-000000000001'::uuid;
+  sim_uuid  UUID := 'bbbbbbbb-bbbb-bbbb-bbbb-000000000003';
+BEGIN
+  INSERT INTO usuarios_cuenta(cuenta_id, id, auth_id, email, rol, curso_id, desactivado)
+  VALUES (cuenta_a, 'uc-esc-r4', sim_uuid, 'esc-r4@test.local', 'tesorero', 'cur-a-01', true)
+  ON CONFLICT DO NOTHING;
+
+  PERFORM set_config('request.jwt.claims',
+    format('{"sub":"%s","role":"authenticated"}', sim_uuid), true);
+  SET LOCAL ROLE authenticated;
+  BEGIN
+    PERFORM apoderado_cc_revocar(cuenta_a, 'cur-a-01');
+    RESET ROLE;
+    RAISE EXCEPTION 'CC-ESC-R4 FAIL: miembro desactivado pudo revocar código CC'
+      USING ERRCODE = '45000';
+  EXCEPTION
+    WHEN insufficient_privilege THEN
+      RESET ROLE;
+      RAISE NOTICE '[OK] CC-ESC-R4: miembro desactivado rechazado en revocar (42501)';
+  END;
+  PERFORM set_config('request.jwt.claims', '', true);
+  DELETE FROM usuarios_cuenta WHERE cuenta_id = cuenta_a AND id = 'uc-esc-r4';
+END;
+$$;
+
+-- CC-ESC-R5: usuario externo (cuenta B) rechazado en revocar  [LOCAL ONLY]
+DO $$
+DECLARE
+  cuenta_a UUID := '00000000-0000-0000-aaaa-000000000001'::uuid;
+  user_b   UUID := 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+BEGIN
+  PERFORM set_config('request.jwt.claims',
+    format('{"sub":"%s","role":"authenticated"}', user_b), true);
+  SET LOCAL ROLE authenticated;
+  BEGIN
+    PERFORM apoderado_cc_revocar(cuenta_a, 'cur-a-01');
+    RESET ROLE;
+    RAISE EXCEPTION 'CC-ESC-R5 FAIL: usuario externo pudo revocar código en cuenta_a'
+      USING ERRCODE = '45000';
+  EXCEPTION
+    WHEN insufficient_privilege THEN
+      RESET ROLE;
+      RAISE NOTICE '[OK] CC-ESC-R5: usuario externo rechazado en revocar (42501)';
+  END;
+  PERFORM set_config('request.jwt.claims', '', true);
+END;
+$$;
+
 -- ── Fin ────────────────────────────────────────────────────────
 DO $$
 BEGIN

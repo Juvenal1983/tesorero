@@ -713,7 +713,9 @@ async function v9CcResumenPagos(codigoCc) {
  */
 async function v9CcGenerar(cuentaId, cursoId) {
   const base  = _v9BaseUrl().replace('/rest/v1', '') + '/rest/v1';
-  const token = _authToken();   // JWT de Supabase del tesorero autenticado
+  // _authToken es una variable let, no una función.
+  const token = (typeof _authToken !== 'undefined' && _authToken) || null;
+  if (!token) throw new Error('[v9] v9CcGenerar: sin sesión activa (JWT no disponible)');
   const res   = await fetch(base + '/rpc/apoderado_cc_generar', {
     method:  'POST',
     headers: {
@@ -746,7 +748,8 @@ async function v9CcGenerar(cuentaId, cursoId) {
  */
 async function v9CcRevocar(cuentaId, cursoId) {
   const base  = _v9BaseUrl().replace('/rest/v1', '') + '/rest/v1';
-  const token = _authToken();
+  const token = (typeof _authToken !== 'undefined' && _authToken) || null;
+  if (!token) throw new Error('[v9] v9CcRevocar: sin sesión activa (JWT no disponible)');
   const res   = await fetch(base + '/rpc/apoderado_cc_revocar', {
     method:  'POST',
     headers: {
