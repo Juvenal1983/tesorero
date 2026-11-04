@@ -93,18 +93,27 @@ GRANT  EXECUTE ON FUNCTION apoderado_cc_verificar(TEXT) TO anon;
 -- Verifica el código en la propia función; si fue revocado devuelve vacío.
 -- Acepta únicamente el código CC como credencial; no admite cuenta+curso
 -- directamente, de modo que revocar el código corta el acceso de inmediato.
+--
+-- Lógica de obligaciones (idéntica al flujo privado):
+--   • Cuotas tipo='mensual' → se expanden en un período por mes del calendario
+--     (mes_inicio..mes_termino de la cuota o del curso como fallback).
+--     Un período sin pago registrado cuenta como pendiente.
+--   • Cuotas de otro tipo → una obligación simple por alumno.
+--   • alumnos.eximido = TRUE → el alumno tiene 0 obligaciones (aparece con
+--     monto_pendiente = 0 y num_cuotas_pendientes = 0).
+--   • Abonos de planes activos se deducen del pendiente sin duplicar pagos.
 -- ─────────────────────────────────────────────────────────────
 DROP FUNCTION IF EXISTS apoderado_cc_resumen_pagos(UUID, TEXT);  -- firma anterior
 DROP FUNCTION IF EXISTS apoderado_cc_resumen_pagos(TEXT);
 
 CREATE OR REPLACE FUNCTION apoderado_cc_resumen_pagos(p_codigo_cc TEXT)
 RETURNS TABLE(
-  alumno_id        TEXT,
-  nombre           TEXT,
-  monto_pagado     NUMERIC,
-  monto_abonado    NUMERIC,
-  monto_pendiente  NUMERIC,
-  num_cuotas_pagadas   INT,
+  alumno_id             TEXT,
+  nombre                TEXT,
+  monto_pagado          NUMERIC,
+  monto_abonado         NUMERIC,
+  monto_pendiente       NUMERIC,
+  num_cuotas_pagadas    INT,
   num_cuotas_pendientes INT
 )
 LANGUAGE plpgsql
@@ -132,53 +141,142 @@ BEGIN
   RETURN QUERY
   WITH
 
-  -- Alumnos activos del curso
+  -- Meses en español (array 0-based: Enero=0, …, Diciembre=11)
+  meses(idx, nombre) AS (
+    VALUES (0,'Enero'),(1,'Febrero'),(2,'Marzo'),(3,'Abril'),
+           (4,'Mayo'),(5,'Junio'),(6,'Julio'),(7,'Agosto'),
+           (8,'Septiembre'),(9,'Octubre'),(10,'Noviembre'),(11,'Diciembre')
+  ),
+
+  -- Alumnos activos del curso con flag de exención
   base AS (
     SELECT
-      a.id AS alumno_id,
+      a.id      AS alumno_id,
       COALESCE(NULLIF(TRIM(a.nombre), ''),
                TRIM(COALESCE(a.nombres,'') || ' ' || COALESCE(a.apellidos,'')),
-               a.id) AS nombre
+               a.id)       AS nombre,
+      a.eximido
     FROM alumnos a
     WHERE a.cuenta_id = v_cuenta_id
       AND a.curso_id  = v_curso_id
       AND a.estado    = 'activo'
   ),
 
-  -- Cuotas activas del curso
+  -- Cuotas activas del curso con calendario de mes (para expansión mensual)
   cuotas_activas AS (
-    SELECT cu.id AS cuota_id, cu.monto
+    SELECT
+      cu.id    AS cuota_id,
+      cu.monto,
+      cu.tipo,
+      COALESCE(cu.mes_inicio,  cur.mes_inicio_cuota,  0)                              AS mes_ini,
+      COALESCE(cu.mes_termino, cur.mes_termino_cuota, 11)                             AS mes_fin,
+      COALESCE(cu.anio, cur.anio,
+               EXTRACT(YEAR FROM CURRENT_DATE)::int)                                  AS anio
     FROM cuotas cu
+    JOIN cursos cur
+      ON  cur.cuenta_id = cu.cuenta_id
+      AND cur.id        = cu.curso_id
     WHERE cu.cuenta_id = v_cuenta_id
       AND cu.curso_id  = v_curso_id
       AND cu.activa    = TRUE
   ),
 
-  -- Pagos efectuados (estado = pagado)
-  pagos_ok AS (
-    SELECT p.alumno_id, COUNT(*)::INT AS n,
-           COALESCE(SUM(p.monto), 0::NUMERIC) AS total
-    FROM pagos p
-    WHERE p.cuenta_id = v_cuenta_id
-      AND p.alumno_id IN (SELECT b2.alumno_id FROM base b2)
-      AND p.cuota_id  IN (SELECT ca2.cuota_id  FROM cuotas_activas ca2)
-      AND p.estado    = 'pagado'
-    GROUP BY p.alumno_id
+  -- ── Obligaciones mensuales: una fila por (alumno × período) ──
+  -- Solo alumnos no eximidos. El período es "Mes AAAA" (ej. "Marzo 2025").
+  obligaciones_mensual AS (
+    SELECT
+      b.alumno_id,
+      ca.cuota_id,
+      ca.monto,
+      m.nombre || ' ' || ca.anio::text AS periodo
+    FROM base b
+    CROSS JOIN cuotas_activas ca
+    JOIN generate_series(0, 11) AS gs(mes)
+      ON gs.mes BETWEEN ca.mes_ini AND ca.mes_fin
+    JOIN meses m ON m.idx = gs.mes
+    WHERE ca.tipo = 'mensual'
+      AND NOT b.eximido
   ),
 
-  -- Abonos pagados de planes activos cuya cuota pertenece al curso
+  -- ── Obligaciones no-mensuales: una fila por (alumno × cuota) ──
+  obligaciones_otros AS (
+    SELECT
+      b.alumno_id,
+      ca.cuota_id,
+      ca.monto
+    FROM base b
+    CROSS JOIN cuotas_activas ca
+    WHERE ca.tipo IS DISTINCT FROM 'mensual'
+      AND NOT b.eximido
+  ),
+
+  -- ── Pagos realizados para cuotas mensuales ───────────────────
+  -- JOIN por cuota_id + alumno_id + periodo (coincidencia exacta de período).
+  pagos_mensual AS (
+    SELECT p.alumno_id, p.cuota_id, p.periodo, p.monto
+    FROM pagos p
+    WHERE p.cuenta_id = v_cuenta_id
+      AND p.estado    = 'pagado'
+      AND p.cuota_id  IN (SELECT om.cuota_id FROM obligaciones_mensual om)
+      AND p.alumno_id IN (SELECT bx.alumno_id FROM base bx)
+  ),
+
+  -- ── Pagos realizados para cuotas no-mensuales ────────────────
+  pagos_otros AS (
+    SELECT p.alumno_id, p.cuota_id, p.monto
+    FROM pagos p
+    WHERE p.cuenta_id = v_cuenta_id
+      AND p.estado    = 'pagado'
+      AND p.cuota_id  IN (SELECT oo.cuota_id FROM obligaciones_otros oo)
+      AND p.alumno_id IN (SELECT bx.alumno_id FROM base bx)
+  ),
+
+  -- ── Resumen mensual por alumno ───────────────────────────────
+  resumen_mensual AS (
+    SELECT
+      om.alumno_id,
+      COUNT(*)::INT                                              AS total_periodos,
+      COUNT(pm.periodo)::INT                                     AS periodos_pagados,
+      SUM(om.monto)                                             AS monto_obligado,
+      COALESCE(SUM(CASE WHEN pm.periodo IS NOT NULL
+                        THEN pm.monto ELSE 0::NUMERIC END),
+               0::NUMERIC)                                      AS monto_pagado
+    FROM obligaciones_mensual om
+    LEFT JOIN pagos_mensual pm
+      ON  pm.alumno_id = om.alumno_id
+      AND pm.cuota_id  = om.cuota_id
+      AND pm.periodo   = om.periodo
+    GROUP BY om.alumno_id
+  ),
+
+  -- ── Resumen no-mensual por alumno ───────────────────────────
+  resumen_otros AS (
+    SELECT
+      oo.alumno_id,
+      COUNT(*)::INT                                              AS total_obligaciones,
+      COUNT(po.cuota_id)::INT                                   AS obligaciones_pagadas,
+      SUM(oo.monto)                                             AS monto_obligado,
+      COALESCE(SUM(po.monto), 0::NUMERIC)                      AS monto_pagado
+    FROM obligaciones_otros oo
+    LEFT JOIN pagos_otros po
+      ON  po.alumno_id = oo.alumno_id
+      AND po.cuota_id  = oo.cuota_id
+    GROUP BY oo.alumno_id
+  ),
+
+  -- ── Abonos de planes activos cuya cuota pertenece al curso ───
   abonos_ok AS (
     SELECT ab.alumno_id,
            COALESCE(SUM(ab.monto), 0::NUMERIC) AS total
     FROM abonos ab
     JOIN planes_pago pp
-      ON pp.cuenta_id = ab.cuenta_id
-     AND pp.id        = ab.plan_id
+      ON  pp.cuenta_id = ab.cuenta_id
+      AND pp.id        = ab.plan_id
     JOIN cuotas cu
-      ON cu.cuenta_id = pp.cuenta_id
-     AND cu.id        = pp.cuota_id
+      ON  cu.cuenta_id = pp.cuenta_id
+      AND cu.id        = pp.cuota_id
     WHERE ab.cuenta_id = v_cuenta_id
-      AND ab.alumno_id IN (SELECT b3.alumno_id FROM base b3)
+      AND ab.alumno_id IN (SELECT bx.alumno_id FROM base bx)
       AND ab.pagado    = TRUE
       AND pp.activo    = TRUE
       AND cu.curso_id  = v_curso_id
@@ -188,22 +286,31 @@ BEGIN
   SELECT
     b.alumno_id,
     b.nombre,
-    COALESCE(po.total, 0::NUMERIC)                            AS monto_pagado,
-    COALESCE(ao.total, 0::NUMERIC)                            AS monto_abonado,
-    GREATEST(
-      0::NUMERIC,
-      (SELECT COALESCE(SUM(cu.monto), 0::NUMERIC) FROM cuotas_activas cu)
-      - COALESCE(po.total, 0::NUMERIC)
+    -- Pagado = suma de pagos reales (mensual + no-mensual)
+    (COALESCE(rm.monto_pagado, 0::NUMERIC)
+     + COALESCE(ro.monto_pagado, 0::NUMERIC))                  AS monto_pagado,
+    -- Abonado = créditos de planes de pago
+    COALESCE(ao.total, 0::NUMERIC)                             AS monto_abonado,
+    -- Pendiente = obligado − pagado − abonado (mínimo 0)
+    GREATEST(0::NUMERIC,
+      COALESCE(rm.monto_obligado, 0::NUMERIC)
+      + COALESCE(ro.monto_obligado, 0::NUMERIC)
+      - COALESCE(rm.monto_pagado, 0::NUMERIC)
+      - COALESCE(ro.monto_pagado, 0::NUMERIC)
       - COALESCE(ao.total, 0::NUMERIC)
-    )                                                          AS monto_pendiente,
-    COALESCE(po.n, 0)                                         AS num_cuotas_pagadas,
-    GREATEST(
-      0,
-      (SELECT COUNT(*)::INT FROM cuotas_activas) - COALESCE(po.n, 0)
-    )                                                          AS num_cuotas_pendientes
+    )                                                           AS monto_pendiente,
+    -- Cuotas pagadas = períodos mensuales pagados + obligaciones no-mensual pagadas
+    (COALESCE(rm.periodos_pagados, 0)
+     + COALESCE(ro.obligaciones_pagadas, 0))::INT              AS num_cuotas_pagadas,
+    -- Cuotas pendientes = total_obligaciones − pagadas
+    GREATEST(0,
+      (COALESCE(rm.total_periodos, 0) + COALESCE(ro.total_obligaciones, 0))
+      - (COALESCE(rm.periodos_pagados, 0) + COALESCE(ro.obligaciones_pagadas, 0))
+    )::INT                                                     AS num_cuotas_pendientes
   FROM base b
-  LEFT JOIN pagos_ok  po ON po.alumno_id = b.alumno_id
-  LEFT JOIN abonos_ok ao ON ao.alumno_id = b.alumno_id
+  LEFT JOIN resumen_mensual rm ON rm.alumno_id = b.alumno_id
+  LEFT JOIN resumen_otros   ro ON ro.alumno_id = b.alumno_id
+  LEFT JOIN abonos_ok       ao ON ao.alumno_id = b.alumno_id
   ORDER BY b.nombre;
 END;
 $$;
@@ -216,7 +323,9 @@ GRANT  EXECUTE ON FUNCTION apoderado_cc_resumen_pagos(TEXT) TO anon;
 -- Genera un código CC-XXXX para un curso.
 -- Requiere JWT autenticado; el llamante debe ser:
 --   • dueño de la cuenta (tesorero_cuentas.auth_id = auth.uid()), o
---   • usuario con rol 'tesorero' o 'admin' en usuarios_cuenta, no desactivado.
+--   • usuario con rol 'tesorero' o 'admin' en usuarios_cuenta, no desactivado,
+--     CON acceso al curso específico (curso_id = p_curso_id OR curso_id IS NULL).
+-- Esto impide que un tesorero asignado solo al curso A gestione el curso B.
 -- ─────────────────────────────────────────────────────────────
 DROP FUNCTION IF EXISTS apoderado_cc_generar(UUID, TEXT, TEXT, TEXT);  -- firma anterior (con PIN)
 DROP FUNCTION IF EXISTS apoderado_cc_generar(UUID, TEXT);
@@ -238,18 +347,15 @@ DECLARE
   v_seg2   TEXT := '';
   i        INT;
 BEGIN
-  -- Verificar autorización: dueño de la cuenta o tesorero/admin
+  -- Verificar autorización con scope de curso:
+  --   • dueño de la cuenta (acceso total), o
+  --   • tiene_rol_en_curso() → tesorero/admin con curso_id = p_curso_id OR NULL
+  -- Un tesorero asignado a 'cur-a-01' no puede gestionar 'cur-a-02'.
   IF NOT (
     es_dueno(p_cuenta_id)
-    OR EXISTS (
-      SELECT 1 FROM usuarios_cuenta
-      WHERE cuenta_id = p_cuenta_id
-        AND auth_id   = auth.uid()
-        AND rol IN ('tesorero', 'admin')
-        AND NOT desactivado
-    )
+    OR tiene_rol_en_curso(p_cuenta_id, p_curso_id, ARRAY['tesorero','admin'])
   ) THEN
-    RAISE EXCEPTION 'No autorizado: se requiere rol tesorero o admin de la cuenta'
+    RAISE EXCEPTION 'No autorizado: se requiere rol tesorero o admin con acceso al curso'
       USING ERRCODE = '42501';
   END IF;
 
@@ -290,7 +396,8 @@ GRANT  EXECUTE ON FUNCTION apoderado_cc_generar(UUID, TEXT) TO authenticated;
 
 -- ── 4. apoderado_cc_revocar ──────────────────────────────────
 -- Elimina el código CC del curso.
--- Mismo requisito de autorización que apoderado_cc_generar.
+-- Mismo requisito de autorización que apoderado_cc_generar:
+--   dueño de la cuenta, o tesorero/admin con acceso al curso específico.
 -- Tras revocar, apoderado_cc_resumen_pagos devuelve vacío.
 -- ─────────────────────────────────────────────────────────────
 DROP FUNCTION IF EXISTS apoderado_cc_revocar(UUID, TEXT, TEXT, TEXT);  -- firma anterior (con PIN)
@@ -307,18 +414,12 @@ SECURITY DEFINER
 SET search_path = public, extensions
 AS $$
 BEGIN
-  -- Verificar autorización: dueño de la cuenta o tesorero/admin
+  -- Verificar autorización con scope de curso (igual que apoderado_cc_generar)
   IF NOT (
     es_dueno(p_cuenta_id)
-    OR EXISTS (
-      SELECT 1 FROM usuarios_cuenta
-      WHERE cuenta_id = p_cuenta_id
-        AND auth_id   = auth.uid()
-        AND rol IN ('tesorero', 'admin')
-        AND NOT desactivado
-    )
+    OR tiene_rol_en_curso(p_cuenta_id, p_curso_id, ARRAY['tesorero','admin'])
   ) THEN
-    RAISE EXCEPTION 'No autorizado: se requiere rol tesorero o admin de la cuenta'
+    RAISE EXCEPTION 'No autorizado: se requiere rol tesorero o admin con acceso al curso'
       USING ERRCODE = '42501';
   END IF;
 

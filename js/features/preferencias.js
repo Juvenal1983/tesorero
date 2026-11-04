@@ -86,6 +86,9 @@ async function generarCodigoCompartido(){
     try {
       const res = await v9CcGenerar(S._v9CuentaId, S.cursoId);
       if(!res || !res.codigo_cc) throw new Error('Respuesta inesperada del servidor');
+      // Sincronizar DB en memoria para que renderConfig muestre el código inmediatamente.
+      const ci = (DB.cursos||[]).findIndex(c=>c.id===S.cursoId);
+      if(ci>=0) DB.cursos[ci].codigoCompartido = res.codigo_cc;
       showToast('✅ Código compartido generado: ' + res.codigo_cc);
       go('config', S.params);
     } catch(err) {
@@ -118,6 +121,9 @@ async function desactivarCodigoCompartido(){
     // recibirá un conjunto vacío (el servidor verifica en cada consulta).
     try {
       await v9CcRevocar(S._v9CuentaId, S.cursoId);
+      // Limpiar DB en memoria para que renderConfig no muestre el código revocado.
+      const ci = (DB.cursos||[]).findIndex(c=>c.id===S.cursoId);
+      if(ci>=0) DB.cursos[ci].codigoCompartido = null;
       showToast('Código compartido desactivado');
       go('config', S.params);
     } catch(err) {

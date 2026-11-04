@@ -686,6 +686,8 @@ DECLARE
   cc_02    TEXT;
 BEGIN
   -- ── CC1: código CC-TEST-0001 debe encontrar cur-a-01 ─────────
+-- (CC1-CC4 son independientes de la identidad del usuario → funcionan en staging)
+-- (CC5-CC8 usan UUID simulado → LOCAL ONLY: ver sección de scope al final)
   SELECT * INTO fila FROM apoderado_cc_verificar('CC-TEST-0001');
   ASSERT fila IS NOT NULL,
     'CC1 FAIL: CC-TEST-0001 no encontró ningún curso';
@@ -726,6 +728,8 @@ BEGIN
   WHERE cuenta_id = cuenta_a AND id = 'cur-a-02';
 
   -- ── CC5: generar código CC con JWT de tesorero ───────────────
+  -- [LOCAL ONLY] Usa UUID simulado aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
+  -- que solo existe en el fixture local 09d. En staging omitir CC5-CC8.
   -- Simular JWT del tesorero (auth_id = aaaaaaaa-…-01 es dueño de cuenta_a)
   PERFORM set_config('request.jwt.claims',
     '{"sub":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","role":"authenticated"}',
@@ -774,7 +778,8 @@ BEGIN
       RAISE NOTICE '[OK] CC6: anon no puede llamar apoderado_cc_generar (42501)';
   END;
 
-  -- ── CC7: revocar código CC con JWT de tesorero ───────────────
+  -- ── CC7: revocar código CC con JWT de tesorero ──────────────
+  -- [LOCAL ONLY] idem CC5
   PERFORM set_config('request.jwt.claims',
     '{"sub":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","role":"authenticated"}',
     true);
@@ -803,6 +808,299 @@ BEGIN
   UPDATE cursos SET codigo_compartido = 'CC-TEST-0001'
   WHERE cuenta_id = cuenta_a AND id = 'cur-a-01';
 
+END;
+$$;
+
+-- ══════════════════════════════════════════════════════════════
+-- Sección CC-PER: Resumen compartido con lógica por período
+-- ══════════════════════════════════════════════════════════════
+-- CC9:  cuota mensual 4 meses (mar-jun), solo marzo pagado por alu-a-01.
+--       Verifica deuda exacta y períodos pendientes.
+-- CC10: alumno eximido aparece con 0 obligaciones.
+-- CC11: abono en plan de pago reduce monto_pendiente sin duplicar pagos.
+--
+-- Nota: CC9-CC11 crean datos temporales dentro de la transacción
+-- (ROLLBACK al final) para no afectar los fixtures permanentes.
+-- Son independientes del UUID simulado → funcionan en LOCAL y en STAGING.
+-- ══════════════════════════════════════════════════════════════
+DO $$
+DECLARE
+  cuenta_a UUID := '00000000-0000-0000-aaaa-000000000001'::uuid;
+  fila     RECORD;
+  r_a01    RECORD;
+  r_a02    RECORD;
+  r_a04    RECORD;
+BEGIN
+
+  -- ── Datos temporales para CC9-CC11 ───────────────────────────
+  -- Usamos cur-a-02 (un alumno: alu-a-03, cuota-a-03 no mensual sin pagos)
+  -- para evitar interferencia con los fixtures de cur-a-01.
+  -- Código CC temporal para cur-a-02:
+  UPDATE cursos SET codigo_compartido = 'CC-TEST-PER'
+  WHERE cuenta_id = cuenta_a AND id = 'cur-a-02';
+
+  -- Cuota mensual nueva: mar-jun 2025 (4 períodos, $10 000 c/u)
+  INSERT INTO cuotas (cuenta_id, id, curso_id, nombre, tipo, monto, anio,
+                      mes_inicio, mes_termino, activa)
+  VALUES (cuenta_a, 'cuota-mens-cc9', 'cur-a-02',
+          'Cuota mensual CC9 mar-jun', 'mensual', 10000, 2025, 2, 5, true)
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  -- Alumno extra (eximido para CC10) en cur-a-02
+  INSERT INTO alumnos (cuenta_id, id, curso_id, nombres, apellidos, estado, eximido)
+  VALUES (cuenta_a, 'alu-cc9-b', 'cur-a-02', 'Alumno', 'Eximido', 'activo', false)
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  -- Pago de alu-a-03 para Marzo 2025 únicamente
+  INSERT INTO pagos (cuenta_id, id, alumno_id, cuota_id, monto, fecha,
+                     medio, estado, periodo)
+  VALUES (cuenta_a, 'pago-cc9-01', 'alu-a-03', 'cuota-mens-cc9',
+          10000, '2025-03-05', 'transferencia', 'pagado', 'Marzo 2025')
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  -- ── CC9: período exacto para alu-a-03 ────────────────────────
+  -- cur-a-02 tiene:
+  --   cuota-a-03 (NULL tipo = no mensual, $12000, sin pago)
+  --   cuota-mens-cc9 (mensual, 4 meses, $10000, Marzo pagado)
+  -- alu-a-03: 1 cuota pagada (Marzo), 4 pendientes (3 mens + 1 no-mensual)
+  -- monto_pagado = 10000, monto_pendiente = 12000 + 30000 = 42000
+  SELECT * INTO r_a01
+  FROM apoderado_cc_resumen_pagos('CC-TEST-PER')
+  WHERE alumno_id = 'alu-a-03';
+
+  ASSERT r_a01 IS NOT NULL,
+    'CC9 FAIL: alu-a-03 no apareció en resumen CC-TEST-PER';
+  ASSERT r_a01.num_cuotas_pagadas = 1,
+    format('CC9 FAIL: alu-a-03 esperaba 1 período pagado (Marzo), obtuvo %s',
+           r_a01.num_cuotas_pagadas);
+  ASSERT r_a01.num_cuotas_pendientes = 4,
+    format('CC9 FAIL: alu-a-03 esperaba 4 pendientes (3 mens + 1 anual), obtuvo %s',
+           r_a01.num_cuotas_pendientes);
+  ASSERT r_a01.monto_pendiente = 42000,
+    format('CC9 FAIL: alu-a-03 monto_pendiente esperado 42000, obtuvo %s',
+           r_a01.monto_pendiente);
+  RAISE NOTICE '[OK] CC9: alu-a-03 — 1 pagada (Marzo), 4 pendientes, monto_pendiente=42000';
+
+  -- ── CC10: alumno eximido tiene 0 obligaciones ────────────────
+  -- Marcar alu-cc9-b como eximido
+  UPDATE alumnos SET eximido = true WHERE cuenta_id = cuenta_a AND id = 'alu-cc9-b';
+
+  SELECT * INTO r_a02
+  FROM apoderado_cc_resumen_pagos('CC-TEST-PER')
+  WHERE alumno_id = 'alu-cc9-b';
+
+  ASSERT r_a02 IS NOT NULL,
+    'CC10 FAIL: alu-cc9-b (eximido) no apareció en resumen';
+  ASSERT r_a02.num_cuotas_pagadas = 0,
+    format('CC10 FAIL: alumno eximido debería tener 0 pagadas, obtuvo %s',
+           r_a02.num_cuotas_pagadas);
+  ASSERT r_a02.num_cuotas_pendientes = 0,
+    format('CC10 FAIL: alumno eximido debería tener 0 pendientes, obtuvo %s',
+           r_a02.num_cuotas_pendientes);
+  ASSERT r_a02.monto_pendiente = 0,
+    format('CC10 FAIL: alumno eximido monto_pendiente esperado 0, obtuvo %s',
+           r_a02.monto_pendiente);
+  RAISE NOTICE '[OK] CC10: alu-cc9-b (eximido) — 0 pagadas, 0 pendientes, 0 deuda';
+
+  -- ── CC11: abono reduce monto_pendiente sin duplicar pagos ────
+  -- alu-cc9-b (eximido=true), quitamos exención y añadimos abono
+  UPDATE alumnos SET eximido = false WHERE cuenta_id = cuenta_a AND id = 'alu-cc9-b';
+
+  -- Plan de pago y abono para cuota-mens-cc9 de alu-cc9-b
+  INSERT INTO planes_pago (cuenta_id, id, alumno_id, cuota_id, monto_total, activo)
+  VALUES (cuenta_a, 'plan-cc9-01', 'alu-cc9-b', 'cuota-mens-cc9', 40000, true)
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  INSERT INTO abonos (cuenta_id, id, alumno_id, cuota_id, plan_id, monto, pagado)
+  VALUES (cuenta_a, 'abono-cc9-01', 'alu-cc9-b', 'cuota-mens-cc9', 'plan-cc9-01',
+          15000, true)
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  -- alu-cc9-b: cuota-a-03 ($12000 no-mens) + cuota-mens-cc9 (4 × $10000 = $40000)
+  --   total obligado = 52000, abono = 15000
+  --   monto_pendiente = 52000 - 15000 = 37000, num_cuotas_pendientes = 5 (abiertos)
+  SELECT * INTO r_a04
+  FROM apoderado_cc_resumen_pagos('CC-TEST-PER')
+  WHERE alumno_id = 'alu-cc9-b';
+
+  ASSERT r_a04 IS NOT NULL,
+    'CC11 FAIL: alu-cc9-b no apareció en resumen';
+  ASSERT r_a04.monto_abonado = 15000,
+    format('CC11 FAIL: monto_abonado esperado 15000, obtuvo %s', r_a04.monto_abonado);
+  ASSERT r_a04.monto_pendiente = 37000,
+    format('CC11 FAIL: monto_pendiente esperado 37000, obtuvo %s', r_a04.monto_pendiente);
+  ASSERT r_a04.num_cuotas_pendientes = 5,  -- abono no cierra períodos
+    format('CC11 FAIL: num_cuotas_pendientes esperado 5, obtuvo %s',
+           r_a04.num_cuotas_pendientes);
+  RAISE NOTICE '[OK] CC11: alu-cc9-b — abono 15000 reduce pendiente a 37000 (5 períodos siguen abiertos)';
+
+  -- ── Limpieza de datos temporales ─────────────────────────────
+  DELETE FROM abonos      WHERE cuenta_id = cuenta_a AND id = 'abono-cc9-01';
+  DELETE FROM planes_pago WHERE cuenta_id = cuenta_a AND id = 'plan-cc9-01';
+  DELETE FROM pagos       WHERE cuenta_id = cuenta_a AND id = 'pago-cc9-01';
+  DELETE FROM alumnos     WHERE cuenta_id = cuenta_a AND id = 'alu-cc9-b';
+  DELETE FROM cuotas      WHERE cuenta_id = cuenta_a AND id = 'cuota-mens-cc9';
+  UPDATE cursos SET codigo_compartido = NULL
+  WHERE cuenta_id = cuenta_a AND id = 'cur-a-02';
+
+END;
+$$;
+
+-- ══════════════════════════════════════════════════════════════
+-- Sección CC-ESC: Scope de curso en generar/revocar
+-- [LOCAL ONLY] Los tests CC-ESC1-CC-ESC5 usan JWT simulado con el
+-- UUID aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa (solo existe en fixture 09d).
+-- En staging, usar credenciales reales de Supabase: obtener token JWT
+-- de un usuario real y probarlo contra /rpc/apoderado_cc_generar
+-- sin modificar sus datos existentes.
+--
+-- CC-ESC1: tesorero de cur-a-01 no puede gestionar cur-a-02 (misma cuenta)
+-- CC-ESC2: visor rechazado (42501)
+-- CC-ESC3: editor rechazado (42501)
+-- CC-ESC4: miembro desactivado rechazado (42501)
+-- CC-ESC5: usuario externo (cuenta distinta) rechazado (42501)
+-- ══════════════════════════════════════════════════════════════
+-- CC-ESC1: tesorero scoped a cur-a-01 NO puede gestionar cur-a-02
+-- [LOCAL ONLY] Usa un UUID diferente al del dueño para evitar que
+-- es_dueno() anule el check de scope de curso.
+DO $$
+DECLARE
+  cuenta_a   UUID := '00000000-0000-0000-aaaa-000000000001'::uuid;
+  -- UUID distinto al dueño (aaaaaaaa-…) → NO es dueño de cuenta_a
+  tes_scoped UUID := 'cccccccc-cccc-cccc-cccc-000000000001';
+BEGIN
+  -- Membresía: tesorero solo en cur-a-01
+  INSERT INTO usuarios_cuenta (cuenta_id, id, auth_id, email, nombre, rol, curso_id, desactivado)
+  VALUES (cuenta_a, 'uc-esc-tesorero-01', tes_scoped,
+          'esc-test@local.test', 'Tesorero ESC Test', 'tesorero', 'cur-a-01', false)
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  -- Intentar generar código para cur-a-02 (distinto al curso asignado)
+  PERFORM set_config('request.jwt.claims',
+    format('{"sub":"%s","role":"authenticated"}', tes_scoped), true);
+  SET LOCAL ROLE authenticated;
+  BEGIN
+    PERFORM apoderado_cc_generar(cuenta_a, 'cur-a-02');
+    RESET ROLE;
+    RAISE EXCEPTION 'CC-ESC1 FAIL: tesorero de cur-a-01 pudo generar código para cur-a-02'
+      USING ERRCODE = '45000';
+  EXCEPTION
+    WHEN insufficient_privilege THEN   -- 42501
+      RESET ROLE;
+      RAISE NOTICE '[OK] CC-ESC1: tesorero de cur-a-01 no puede gestionar cur-a-02 (42501)';
+  END;
+  PERFORM set_config('request.jwt.claims', '', true);
+
+  DELETE FROM usuarios_cuenta WHERE cuenta_id = cuenta_a AND id = 'uc-esc-tesorero-01';
+END;
+$$;
+
+-- CC-ESC2: visor rechazado  [LOCAL ONLY]
+DO $$
+DECLARE
+  cuenta_a UUID := '00000000-0000-0000-aaaa-000000000001'::uuid;
+  visor_id UUID := 'bbbbbbbb-bbbb-bbbb-bbbb-000000000001';
+BEGIN
+  INSERT INTO usuarios_cuenta (cuenta_id, id, auth_id, email, nombre, rol, desactivado)
+  VALUES (cuenta_a, 'uc-esc-visor', visor_id, 'visor@local.test', 'Visor', 'visor', false)
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  PERFORM set_config('request.jwt.claims',
+    format('{"sub":"%s","role":"authenticated"}', visor_id), true);
+  SET LOCAL ROLE authenticated;
+  BEGIN
+    PERFORM apoderado_cc_generar(cuenta_a, 'cur-a-01');
+    RESET ROLE;
+    RAISE EXCEPTION 'CC-ESC2 FAIL: visor pudo generar código CC'
+      USING ERRCODE = '45000';
+  EXCEPTION
+    WHEN insufficient_privilege THEN
+      RESET ROLE;
+      RAISE NOTICE '[OK] CC-ESC2: visor rechazado en generar (42501)';
+  END;
+  PERFORM set_config('request.jwt.claims', '', true);
+  DELETE FROM usuarios_cuenta WHERE cuenta_id = cuenta_a AND id = 'uc-esc-visor';
+END;
+$$;
+
+-- CC-ESC3: editor rechazado  [LOCAL ONLY]
+DO $$
+DECLARE
+  cuenta_a  UUID := '00000000-0000-0000-aaaa-000000000001'::uuid;
+  editor_id UUID := 'bbbbbbbb-bbbb-bbbb-bbbb-000000000002';
+BEGIN
+  INSERT INTO usuarios_cuenta (cuenta_id, id, auth_id, email, nombre, rol, desactivado)
+  VALUES (cuenta_a, 'uc-esc-editor', editor_id, 'editor@local.test', 'Editor', 'editor', false)
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  PERFORM set_config('request.jwt.claims',
+    format('{"sub":"%s","role":"authenticated"}', editor_id), true);
+  SET LOCAL ROLE authenticated;
+  BEGIN
+    PERFORM apoderado_cc_generar(cuenta_a, 'cur-a-01');
+    RESET ROLE;
+    RAISE EXCEPTION 'CC-ESC3 FAIL: editor pudo generar código CC'
+      USING ERRCODE = '45000';
+  EXCEPTION
+    WHEN insufficient_privilege THEN
+      RESET ROLE;
+      RAISE NOTICE '[OK] CC-ESC3: editor rechazado en generar (42501)';
+  END;
+  PERFORM set_config('request.jwt.claims', '', true);
+  DELETE FROM usuarios_cuenta WHERE cuenta_id = cuenta_a AND id = 'uc-esc-editor';
+END;
+$$;
+
+-- CC-ESC4: miembro desactivado rechazado  [LOCAL ONLY]
+DO $$
+DECLARE
+  cuenta_a  UUID := '00000000-0000-0000-aaaa-000000000001'::uuid;
+  desact_id UUID := 'bbbbbbbb-bbbb-bbbb-bbbb-000000000003';
+BEGIN
+  INSERT INTO usuarios_cuenta (cuenta_id, id, auth_id, email, nombre, rol, desactivado)
+  VALUES (cuenta_a, 'uc-esc-desact', desact_id, 'desact@local.test',
+          'Desactivado', 'tesorero', true)
+  ON CONFLICT (cuenta_id, id) DO NOTHING;
+
+  PERFORM set_config('request.jwt.claims',
+    format('{"sub":"%s","role":"authenticated"}', desact_id), true);
+  SET LOCAL ROLE authenticated;
+  BEGIN
+    PERFORM apoderado_cc_generar(cuenta_a, 'cur-a-01');
+    RESET ROLE;
+    RAISE EXCEPTION 'CC-ESC4 FAIL: miembro desactivado pudo generar código CC'
+      USING ERRCODE = '45000';
+  EXCEPTION
+    WHEN insufficient_privilege THEN
+      RESET ROLE;
+      RAISE NOTICE '[OK] CC-ESC4: miembro desactivado rechazado en generar (42501)';
+  END;
+  PERFORM set_config('request.jwt.claims', '', true);
+  DELETE FROM usuarios_cuenta WHERE cuenta_id = cuenta_a AND id = 'uc-esc-desact';
+END;
+$$;
+
+-- CC-ESC5: usuario externo (cuenta B) rechazado  [LOCAL ONLY]
+DO $$
+DECLARE
+  cuenta_a UUID := '00000000-0000-0000-aaaa-000000000001'::uuid;
+  user_b   UUID := 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';  -- dueño de cuenta_b
+BEGIN
+  -- user_b es dueño de cuenta_b, NO tiene membresía en cuenta_a
+  PERFORM set_config('request.jwt.claims',
+    format('{"sub":"%s","role":"authenticated"}', user_b), true);
+  SET LOCAL ROLE authenticated;
+  BEGIN
+    PERFORM apoderado_cc_generar(cuenta_a, 'cur-a-01');
+    RESET ROLE;
+    RAISE EXCEPTION 'CC-ESC5 FAIL: usuario externo pudo generar código en cuenta_a'
+      USING ERRCODE = '45000';
+  EXCEPTION
+    WHEN insufficient_privilege THEN
+      RESET ROLE;
+      RAISE NOTICE '[OK] CC-ESC5: usuario externo rechazado en cuenta_a (42501)';
+  END;
+  PERFORM set_config('request.jwt.claims', '', true);
 END;
 $$;
 

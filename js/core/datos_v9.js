@@ -216,6 +216,7 @@ function _mapCurso(row) {
     cuotaAnual:       row.cuota_anual,
     mesInicioCuota:   row.mes_inicio_cuota,
     mesTerminoCuota:  row.mes_termino_cuota,
+    codigoCompartido: row.codigo_compartido || null,
     // cursor relacional — no presente en blob legado, ignorado por render actual
     _v9: true,
   };
