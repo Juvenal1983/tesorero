@@ -162,6 +162,11 @@ async function saveToCloud(userId){
         datos: datosParaNube,
         actualizado_en: ahora
       })});
+    // G02-fix: solo actualizar timestamp si el servidor realmente confirmó la escritura.
+    if (!res || !res.ok) {
+      console.warn('saveToCloud: el servidor rechazó la escritura (status', res?.status, ')');
+      return;
+    }
     _lastCloudTimestamp = ahora;
     // Guardar timestamp de última subida exitosa para comparar en loadFromCloud
     previewStorage.setItem('tesorero_ts_'+userId, ahora);
@@ -308,6 +313,9 @@ function _setSyncStatus(status){
 function saveDB(){
   // Guard: apoderado_v9 opera sobre datos del servidor (RPCs), nunca sobre el storage local del tesorero.
   if (S && S.session && S.session.rol === 'apoderado_v9') return;
+  // Guard G02: en modo relacional v9 la fuente de verdad son las tablas de Supabase;
+  // serializar DB al blob legacy provocaría divergencia y posibles doble-escrituras.
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) return;
   const ahora = new Date().toISOString();
   DB._lastSaved = ahora;
   previewStorage.setItem(KEY, JSON.stringify(DB));
@@ -328,6 +336,8 @@ function saveDB(){
 // fetch con keepalive=true garantiza el envío aunque se cierre la ventana,
 // a diferencia de sendBeacon que no permite cabeceras personalizadas (Supabase las requiere).
 window.addEventListener('beforeunload', ()=>{
+  // G02-fix: en modo relacional v9 no escribir blob legacy al cerrar la pestaña.
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) return;
   const u = S && S.session;
   if(u && _saveCloudTimer){
     clearTimeout(_saveCloudTimer);

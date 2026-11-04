@@ -41,16 +41,30 @@ function renderPagos(){
             <thead><tr><th>Período</th><th>Estado</th><th>Monto</th><th style="display:none" class="hide-mobile">Fecha</th><th style="display:none" class="hide-mobile">Medio</th><th></th></tr></thead>
             <tbody>
               ${periodos.map(periodo=>{
-                const pago=pagosQ.find(p=>p.periodo===periodo);
+                // G06-fix: sumar TODOS los pagos del período (puede haber más de uno en v9).
+                // Usar reduce para obtener monto total y find solo para el último registro
+                // (fecha/medio del pago más reciente para mostrar en tabla).
+                const pagosDelPeriodo = pagosQ.filter(p=>p.periodo===periodo);
+                const montoSumado = pagosDelPeriodo.reduce((s,p)=>s+(Number(p.monto)||0), 0);
+                const pagoRef = pagosDelPeriodo[pagosDelPeriodo.length-1] || null; // más reciente
+                const obligado = Number(q.monto) || 0;
+                const esParcial = pagosDelPeriodo.length > 0 && montoSumado < obligado;
+                const esPagado  = pagosDelPeriodo.length > 0 && montoSumado >= obligado;
+                // Para compatibilidad con código que usa variable "pago" (botones editar/eliminar),
+                // exponer el último registro como referencia, pero mostrar monto sumado.
+                const pago = pagoRef;
                 return `<tr>
                   <td style="font-weight:500;white-space:nowrap">${periodo}</td>
-                  <td><span class="badge ${pago?'bgg':alu?.eximido?'':'bgr'}" style="white-space:nowrap;background:${!pago&&alu?.eximido?'#FFF8E7':''};color:${!pago&&alu?.eximido?'#B8860B':''}">${pago?'✓ Pagado':alu?.eximido?'🟡 Eximido':'Pendiente'}</span></td>
-                  <td style="color:${pago?'var(--g)':alu?.eximido?'#B8860B':'var(--t3)'};white-space:nowrap;font-weight:${pago||alu?.eximido?'600':'400'}">${pago?clp(pago.monto):alu?.eximido?'—':'—'}</td>
+                  <td><span class="badge ${esPagado?'bgg':esParcial?'':''}${!esPagado&&!esParcial&&!alu?.eximido?'bgr':''}" style="white-space:nowrap;background:${esParcial?'#FFF8E7':!esPagado&&alu?.eximido?'#FFF8E7':''};color:${esParcial?'#B8860B':!esPagado&&alu?.eximido?'#B8860B':''}">${esPagado?'✓ Pagado':esParcial?'⚠ Parcial':alu?.eximido?'🟡 Eximido':'Pendiente'}</span></td>
+                  <td style="color:${esPagado?'var(--g)':esParcial?'#B8860B':alu?.eximido?'#B8860B':'var(--t3)'};white-space:nowrap;font-weight:${esPagado||esParcial||alu?.eximido?'600':'400'}">${pagosDelPeriodo.length>0?clp(montoSumado)+(esParcial?` / ${clp(obligado)}`:''):alu?.eximido?'—':'—'}</td>
                   <td style="color:var(--t3);font-size:12px;white-space:nowrap">${pago?fmtDate(pago.fecha):'—'}</td>
                   <td style="color:var(--t3);font-size:12px;white-space:nowrap">${pago?escHtml(pago.medio):'—'}</td>
                   <td style="white-space:nowrap">${(()=>{
-                    if(pago) {
-                      if(puedeEscribir()) return `<div style="display:flex;gap:4px"><button class="btn bs" onclick="showModal('editPago',{pagoId:'${pago.id}'})" title="Editar pago" style="font-size:11px;padding:3px 7px">✏️</button><button class="btn bs bd" onclick="delPago('${pago.id}')" title="Eliminar pago" style="font-size:11px;padding:3px 7px">✕</button></div>`;
+                    if(pagosDelPeriodo.length>0) {
+                      if(puedeEscribir()) {
+                        // Mostrar controles para cada pago del período
+                        return pagosDelPeriodo.map(p=>`<div style="display:flex;gap:4px;margin-bottom:2px"><button class="btn bs" onclick="showModal('editPago',{pagoId:'${p.id}'})" title="Editar pago" style="font-size:11px;padding:3px 7px">✏️</button><button class="btn bs bd" onclick="delPago('${p.id}')" title="Eliminar pago" style="font-size:11px;padding:3px 7px">✕</button></div>`).join('');
+                      }
                       return ''; // visor: pago registrado pero sin controles de edición
                     }
                     if(!puedeEscribir()) return ''; // visor: sin pago y sin botón de registrar

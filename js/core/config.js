@@ -149,6 +149,31 @@ function V(key){ return vocab()[key] || key; }
 const PLANTILLA_PAGO_DEFAULT = 'Estimado/a {apoderado} 👋\n\nLe informamos que se ha registrado exitosamente el siguiente pago:\n\n👤 {miembro}: {alumno}\n📋 Cuota: {cuota}\n📅 Período: {periodo}\n💰 Monto: {monto}\n📆 Fecha de pago: {fecha}\n💳 Medio de pago: {medio}\n\n🏢 {grupo}: {curso} · {colegio}\n\nGracias por su puntualidad.\n\n— {tesorero}';
 const VERSION_KEY = 'tesorero_version';
 
+// G07-fix: guard de startup — abortar si la URL apunta a producción o no es el staging esperado.
+// Esto previene que un despliegue accidental con credenciales equivocadas afecte producción.
+(function _guardarUrlStagingCheck(){
+  const PROD_HOST = 'tmjqzaakzhecbldebyeg.supabase.co';
+  const STAGING_REF = 'rucgmytyxpfowznowxwd';
+  if (!SUPA_URL || SUPA_URL.includes('STAGING_URL_PENDIENTE') || SUPA_URL.includes('placeholder')) {
+    // URL de staging no configurada — es un despliegue de desarrollo sin credenciales.
+    // Se permite arrancar pero sin autenticación real (authClient quedará null o no-op).
+    console.warn('[config] SUPA_URL de staging no configurada — modo sin servidor.');
+    return;
+  }
+  if (SUPA_URL.includes(PROD_HOST)) {
+    const msg = '[TesorerApp] ¡ERROR CRÍTICO! La URL de Supabase apunta a PRODUCCIÓN en esta rama de staging. La aplicación no puede iniciar. Revisa config.js y las variables de entorno.';
+    console.error(msg);
+    // Bloquear todo renderizado mostrando pantalla de error.
+    document.addEventListener('DOMContentLoaded', function(){
+      document.body.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;min-height:100vh;background:#fef2f2;font-family:sans-serif"><div style="max-width:480px;padding:32px;background:#fff;border:2px solid #ef4444;border-radius:12px;text-align:center"><div style="font-size:32px;margin-bottom:12px">🚫</div><h2 style="color:#dc2626;margin:0 0 12px">URL de producción detectada</h2><p style="color:#374151">Esta rama de staging está configurada con una URL de producción. La aplicación no puede iniciar para proteger los datos reales.</p><p style="color:#6b7280;font-size:12px;font-family:monospace">${SUPA_URL}</p><p style="color:#374151;font-size:13px">Corrige <code>SUPA_URL</code> en config.js o las variables de entorno y vuelve a cargar.</p></div></div>`;
+    });
+    throw new Error(msg);
+  }
+  if (V9_RELACIONAL && !SUPA_URL.includes(STAGING_REF)) {
+    console.warn('[config] ADVERTENCIA: en modo V9_RELACIONAL la URL no contiene el project ref de staging esperado (' + STAGING_REF + '). URL actual: ' + SUPA_URL + '. Verifica que sea el staging correcto.');
+  }
+})();
+
 const authClient = (window.supabase && window.supabase.createClient)
   ? window.supabase.createClient(SUPA_URL, SUPA_KEY)
   : null;

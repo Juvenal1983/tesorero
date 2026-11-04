@@ -469,7 +469,9 @@ async function doLogin(){
 
     // Intento 2: reusar sesión Supabase cacheada si el email coincide
     // (el usuario tiene JWT válido pero no recuerda su contraseña de Supabase)
-    if(authClient){
+    // G03-fix: en modo V9_RELACIONAL omitir la carga de datos legacy (blob) —
+    // la fuente de verdad son las tablas relacionales, no tesorero_datos.
+    if(authClient && !(typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL)){
       try{
         const { data: sd } = await authClient.auth.getSession();
         if(sd?.session?.user?.email?.toLowerCase()===email){
@@ -485,10 +487,14 @@ async function doLogin(){
     }
 
     // Intento 3: fallback local — contraseña guardada en previewStorage (u.pass)
-    const uLocal=(DB.usuarios||[]).find(u=>
-      String(u.email||'').toLowerCase()===email && u.pass===pass
-    );
-    if(uLocal){ _finalizarLogin(uLocal,errEl); return; }
+    // G03-fix: completamente deshabilitado en V9_RELACIONAL para evitar autenticación
+    // fuera del modelo relacional (evita bypass de Supabase Auth con credenciales legadas).
+    if(!(typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL)){
+      const uLocal=(DB.usuarios||[]).find(u=>
+        String(u.email||'').toLowerCase()===email && u.pass===pass
+      );
+      if(uLocal){ _finalizarLogin(uLocal,errEl); return; }
+    }
 
     // Traducir el error real de Supabase a un mensaje útil
     if(errEl){
