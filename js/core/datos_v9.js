@@ -211,7 +211,10 @@ async function actualizarPagoV9(cuentaId, pagoId, cambios, accessToken) {
     },
     accessToken
   );
-  return Array.isArray(rows) && rows.length > 0 ? rows[0] : { cuenta_id: cuentaId, id: pagoId, ...patch };
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new Error(`Pago ${pagoId} no encontrado en la base de datos (ninguna fila modificada)`);
+  }
+  return rows[0];
 }
 
 /**

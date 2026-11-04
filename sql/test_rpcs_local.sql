@@ -1453,6 +1453,130 @@ BEGIN
   DELETE FROM cuotas  WHERE cuenta_id = cuenta_a AND id = 'cuota-esc7-c1';
   DELETE FROM cursos  WHERE cuenta_id = cuenta_a AND id = 'cur-esc7';
 
+  -- ════════════════════════════════════════════════════════════════
+  -- CC-ESC-8: Sobrepago mensual NO reduce el pendiente de otro período
+  --
+  -- Escenario: 1 cuota mensual, 2 períodos (Marzo y Abril, $10.000 c/u).
+  --   • Pago Marzo = $15.000 (sobrepago de $5.000)
+  --   • Pago Abril = $0
+  -- Resultado esperado:
+  --   pendiente = $10.000  (solo Abril; el exceso de Marzo no cubre Abril)
+  --   pagadas   = 1        (solo Marzo está cubierto)
+  --   pendientes= 1        (Abril sigue sin pagar)
+  -- ════════════════════════════════════════════════════════════════
+  RAISE NOTICE '-- CC-ESC-8: Sobrepago mensual no cubre otro período --';
+
+  INSERT INTO cursos  (cuenta_id, id, nombre, activo, codigo_compartido)
+  VALUES (cuenta_a, 'cur-esc8', 'Curso ESC8 temp', true, 'CC-ESC8-TEST');
+
+  INSERT INTO alumnos (cuenta_id, id, nombres, apellidos, curso_id)
+  VALUES (cuenta_a, 'alu-esc8', 'Alumno', 'ESC8', 'cur-esc8');
+
+  -- Cuota mensual Marzo–Abril $10.000/período
+  INSERT INTO cuotas (cuenta_id, id, nombre, tipo, monto, anio, mes_inicio, mes_termino, curso_id)
+  VALUES (cuenta_a, 'cuota-esc8-c1', 'Mensualidad ESC8', 'mensual', 10000, 2025, 2, 3, 'cur-esc8');
+
+  -- Obligaciones mensuales: Marzo y Abril
+  INSERT INTO obligaciones (cuenta_id, id, alumno_id, cuota_id, periodo, monto)
+  VALUES
+    (cuenta_a, 'ob-esc8-mar', 'alu-esc8', 'cuota-esc8-c1', 'Marzo 2025',  10000),
+    (cuenta_a, 'ob-esc8-abr', 'alu-esc8', 'cuota-esc8-c1', 'Abril 2025',  10000);
+
+  -- Solo se pagó Marzo, con sobrepago de $5.000
+  INSERT INTO pagos (cuenta_id, id, alumno_id, cuota_id, periodo, monto, fecha, medio, estado)
+  VALUES (cuenta_a, 'pago-esc8-mar', 'alu-esc8', 'cuota-esc8-c1', 'Marzo 2025', 15000,
+          CURRENT_DATE, 'Transferencia', 'pagado');
+
+  DECLARE esc8 RECORD;
+  SELECT * INTO esc8
+  FROM apoderado_cc_resumen_pagos('CC-ESC8-TEST')
+  WHERE alumno_id = 'alu-esc8';
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'CC-ESC-8 FAIL: alu-esc8 no apareció en resumen';
+  END IF;
+  IF esc8.monto_pendiente <> 10000 THEN
+    RAISE EXCEPTION 'CC-ESC-8 FAIL: pendiente esperado 10000 (solo Abril), obtuvo % — '
+      'el sobrepago de Marzo NO debe reducir Abril', esc8.monto_pendiente;
+  END IF;
+  IF esc8.num_cuotas_pagadas <> 1 THEN
+    RAISE EXCEPTION 'CC-ESC-8 FAIL: num_cuotas_pagadas esperado 1 (Marzo), obtuvo %',
+      esc8.num_cuotas_pagadas;
+  END IF;
+  IF esc8.num_cuotas_pendientes <> 1 THEN
+    RAISE EXCEPTION 'CC-ESC-8 FAIL: num_cuotas_pendientes esperado 1 (Abril), obtuvo %',
+      esc8.num_cuotas_pendientes;
+  END IF;
+  RAISE NOTICE '[OK] CC-ESC-8: sobrepago mensual no reduce otro período — '
+               'pagado=15000, pendiente=10000, pagadas=1, pendientes=1';
+
+  -- Limpieza CC-ESC-8
+  DELETE FROM pagos        WHERE cuenta_id = cuenta_a AND id = 'pago-esc8-mar';
+  DELETE FROM obligaciones WHERE cuenta_id = cuenta_a AND id IN ('ob-esc8-mar','ob-esc8-abr');
+  DELETE FROM alumnos      WHERE cuenta_id = cuenta_a AND id = 'alu-esc8';
+  DELETE FROM cuotas       WHERE cuenta_id = cuenta_a AND id = 'cuota-esc8-c1';
+  DELETE FROM cursos       WHERE cuenta_id = cuenta_a AND id = 'cur-esc8';
+
+  -- ════════════════════════════════════════════════════════════════
+  -- CC-ESC-9: Pago parcial en cuota no-mensual NO cuenta como "pagada"
+  --
+  -- Escenario: 1 cuota no-mensual $12.000. Pago registrado = $5.000.
+  -- Resultado esperado:
+  --   pendiente = $7.000  (12000 - 5000)
+  --   pagadas   = 0       (parcial ≠ cubierta)
+  --   pendientes= 1
+  -- ════════════════════════════════════════════════════════════════
+  RAISE NOTICE '-- CC-ESC-9: Pago parcial cuota no-mensual no cuenta como pagada --';
+
+  INSERT INTO cursos  (cuenta_id, id, nombre, activo, codigo_compartido)
+  VALUES (cuenta_a, 'cur-esc9', 'Curso ESC9 temp', true, 'CC-ESC9-TEST');
+
+  INSERT INTO alumnos (cuenta_id, id, nombres, apellidos, curso_id)
+  VALUES (cuenta_a, 'alu-esc9', 'Alumno', 'ESC9', 'cur-esc9');
+
+  -- Cuota no-mensual (anual) $12.000
+  INSERT INTO cuotas (cuenta_id, id, nombre, tipo, monto, anio, curso_id)
+  VALUES (cuenta_a, 'cuota-esc9-c1', 'Matrícula ESC9', 'anual', 12000, 2025, 'cur-esc9');
+
+  -- Obligación no-mensual
+  INSERT INTO obligaciones (cuenta_id, id, alumno_id, cuota_id, monto)
+  VALUES (cuenta_a, 'ob-esc9-01', 'alu-esc9', 'cuota-esc9-c1', 12000);
+
+  -- Pago parcial: solo $5.000 de $12.000
+  INSERT INTO pagos (cuenta_id, id, alumno_id, cuota_id, monto, fecha, medio, estado)
+  VALUES (cuenta_a, 'pago-esc9-01', 'alu-esc9', 'cuota-esc9-c1', 5000,
+          CURRENT_DATE, 'Efectivo', 'pagado');
+
+  DECLARE esc9 RECORD;
+  SELECT * INTO esc9
+  FROM apoderado_cc_resumen_pagos('CC-ESC9-TEST')
+  WHERE alumno_id = 'alu-esc9';
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'CC-ESC-9 FAIL: alu-esc9 no apareció en resumen';
+  END IF;
+  IF esc9.monto_pendiente <> 7000 THEN
+    RAISE EXCEPTION 'CC-ESC-9 FAIL: pendiente esperado 7000 (12000-5000), obtuvo %',
+      esc9.monto_pendiente;
+  END IF;
+  IF esc9.num_cuotas_pagadas <> 0 THEN
+    RAISE EXCEPTION 'CC-ESC-9 FAIL: num_cuotas_pagadas esperado 0 (pago parcial ≠ pagada), obtuvo %',
+      esc9.num_cuotas_pagadas;
+  END IF;
+  IF esc9.num_cuotas_pendientes <> 1 THEN
+    RAISE EXCEPTION 'CC-ESC-9 FAIL: num_cuotas_pendientes esperado 1, obtuvo %',
+      esc9.num_cuotas_pendientes;
+  END IF;
+  RAISE NOTICE '[OK] CC-ESC-9: pago parcial no-mensual no cuenta como pagada — '
+               'pagado=5000, pendiente=7000, pagadas=0, pendientes=1';
+
+  -- Limpieza CC-ESC-9
+  DELETE FROM pagos        WHERE cuenta_id = cuenta_a AND id = 'pago-esc9-01';
+  DELETE FROM obligaciones WHERE cuenta_id = cuenta_a AND id = 'ob-esc9-01';
+  DELETE FROM alumnos      WHERE cuenta_id = cuenta_a AND id = 'alu-esc9';
+  DELETE FROM cuotas       WHERE cuenta_id = cuenta_a AND id = 'cuota-esc9-c1';
+  DELETE FROM cursos       WHERE cuenta_id = cuenta_a AND id = 'cur-esc9';
+
 END;
 $$;
 

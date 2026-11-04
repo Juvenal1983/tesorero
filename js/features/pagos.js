@@ -99,21 +99,25 @@ function renderPagos(){
   </div>`:''}
   ${detalleHtml||'<div class="empty-state"><div>Selecciona un alumno para ver sus pagos.</div></div>'}`;
 }
-function delPago(id){
+async function delPago(id){
   if(!confirm('¿Eliminar este pago? Esta acción no se puede deshacer.')) return;
-  DB.pagos=(DB.pagos||[]).filter(p=>p.id!==id);
 
-  // ── FLUJO RELACIONAL v9 ──────────────────────────────────────────
+  // ── FLUJO RELACIONAL v9: primero eliminar en DB, luego actualizar local ──
   if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
     const cuentaId = (typeof S!=='undefined' && S._v9CuentaId) || null;
     if(cuentaId){
-      eliminarPagoV9(cuentaId, id, _authToken).catch(err=>{
+      try {
+        await eliminarPagoV9(cuentaId, id, _authToken);
+      } catch(err) {
         console.error('[v9] Error eliminando pago:', err);
-      });
+        alert('Error al eliminar el pago en la base de datos: ' + (err.message || err));
+        return; // No actualizar estado local si falla la DB
+      }
     }
   }
-  // ────────────────────────────────────────────────────────────────
+  // ── Solo actualizar estado local si v9 tuvo éxito (o no aplica) ──
 
+  DB.pagos=(DB.pagos||[]).filter(p=>p.id!==id);
   saveDB(); go('pagos',S.params);
 }
 
@@ -153,7 +157,7 @@ function modalEditPago(data){
   </div>`;
 }
 
-function saveEditPago(pagoId){
+async function saveEditPago(pagoId){
   const p = (DB.pagos||[]).find(x=>x.id===pagoId);
   if(!p) return;
   const monto = parseInt(document.getElementById('ep-monto').value)||0;
@@ -162,21 +166,30 @@ function saveEditPago(pagoId){
   const obs    = document.getElementById('ep-obs').value.trim();
   if(!monto) return alert('Ingresa el monto.');
   if(!fecha)  return alert('Ingresa la fecha.');
+
+  // ── FLUJO RELACIONAL v9: primero actualizar en DB, luego estado local ──
+  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
+    const cuentaId = (typeof S!=='undefined' && S._v9CuentaId) || null;
+    if(cuentaId){
+      // Deshabilitar botón para evitar doble envío
+      const btn = document.querySelector('.modal .btn.bp');
+      if(btn){ btn.disabled = true; btn.textContent = 'Guardando…'; }
+      try {
+        await actualizarPagoV9(cuentaId, pagoId, { monto, fecha, medio, obs }, _authToken);
+      } catch(err) {
+        console.error('[v9] Error actualizando pago:', err);
+        if(btn){ btn.disabled = false; btn.textContent = '💾 Guardar'; }
+        alert('Error al guardar el pago en la base de datos: ' + (err.message || err));
+        return; // No actualizar estado local si falla la DB
+      }
+    }
+  }
+  // ── Solo actualizar estado local si v9 tuvo éxito (o no aplica) ──
+
   p.monto = monto;
   p.fecha = fecha;
   p.medio = medio;
   p.obs   = obs;
-
-  // ── FLUJO RELACIONAL v9 ──────────────────────────────────────────
-  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
-    const cuentaId = (typeof S!=='undefined' && S._v9CuentaId) || null;
-    if(cuentaId){
-      actualizarPagoV9(cuentaId, pagoId, { monto, fecha, medio, obs }, _authToken)
-        .catch(err=>{ console.error('[v9] Error actualizando pago:', err); });
-    }
-  }
-  // ────────────────────────────────────────────────────────────────
-
   saveDB();
   closeModal();
   go('pagos', S.params);
