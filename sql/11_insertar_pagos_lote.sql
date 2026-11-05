@@ -185,68 +185,90 @@ BEGIN
     IF v_idem_key IS NOT NULL THEN
       -- ── Camino con idempotencia ───────────────────────────────────────────
 
-      -- ── ÍTEM 2: Buscar registro de operación durable (separado del pago) ──
+      -- ── CONCURRENCIA: Serializar con advisory lock ────────────────────────
+      -- Previene race condition donde dos sesiones simultáneas ambas ven NOT
+      -- FOUND en operaciones_pagos y ambas intentan INSERT pagos por separado.
+      -- pg_advisory_xact_lock bloquea hasta que la transacción anterior con
+      -- la misma clave haga COMMIT o ROLLBACK, luego la libera automáticamente.
+      -- hashtext() devuelve INTEGER (int4); la firma de dos argumentos es correcta.
+      PERFORM pg_advisory_xact_lock(
+        hashtext(p_cuenta_id::TEXT),
+        hashtext(v_idem_key)
+      );
+
+      -- ── ÍTEM 2: Reservar slot de operación ANTES de insertar el pago ─────
+      -- INSERT primero con pago_id=NULL (slot vacío).
+      -- ON CONFLICT DO NOTHING: si ya existe (reintento), el INSERT es silencioso.
+      -- La sesión que gana el advisory lock inserta; las siguientes encuentran
+      -- la fila ya completa con pago_id real.
+      INSERT INTO operaciones_pagos (
+        cuenta_id, idempotency_key, auth_id,
+        alumno_id, cuota_id, monto, periodo, fecha, medio, estado,
+        pago_id
+      )
+      VALUES (
+        p_cuenta_id, v_idem_key, v_caller_uid,
+        v_alumno_id, v_cuota_id, v_monto, v_periodo_in, v_fecha_in, v_medio_in, v_estado_in,
+        NULL   -- slot vacío: pago_id se establece después de INSERT pagos
+      )
+      ON CONFLICT (cuenta_id, idempotency_key) DO NOTHING;
+
+      -- Leer el slot (recién insertado o ya existente) — siempre encuentra fila
       SELECT * INTO v_op
         FROM operaciones_pagos
-       WHERE cuenta_id = p_cuenta_id
+       WHERE cuenta_id       = p_cuenta_id
          AND idempotency_key = v_idem_key;
 
-      IF FOUND THEN
-        -- ── ÍTEM 1: Verificar identidad de autor ────────────────────────────
-        IF v_op.auth_id IS DISTINCT FROM v_caller_uid THEN
-          RAISE EXCEPTION
-            'insertar_pagos_lote: idempotency_key=% fue creada por otra sesión; '
-            'operación rechazada (identidad de autor no coincide)',
-            v_idem_key
-            USING ERRCODE = '42501';
-        END IF;
+      -- ── ÍTEM 1: Verificar identidad de autor ─────────────────────────────
+      IF v_op.auth_id IS DISTINCT FROM v_caller_uid THEN
+        RAISE EXCEPTION
+          'insertar_pagos_lote: idempotency_key=% fue creada por otra sesión; '
+          'operación rechazada (identidad de autor no coincide)',
+          v_idem_key
+          USING ERRCODE = '42501';
+      END IF;
 
-        -- ── ÍTEM 3: Verificar identidad de contenido completa ───────────────
-        -- Comparar todos los campos esenciales de la transacción.
-        -- obs y creado_por son anotaciones y no forman parte de la identidad.
-        IF v_op.alumno_id  IS DISTINCT FROM v_alumno_id
-        OR v_op.cuota_id   IS DISTINCT FROM v_cuota_id
-        OR v_op.monto      IS DISTINCT FROM v_monto
-        OR COALESCE(v_op.periodo, '') IS DISTINCT FROM COALESCE(v_periodo_in, '')
-        OR v_op.fecha      IS DISTINCT FROM v_fecha_in
-        OR v_op.medio      IS DISTINCT FROM v_medio_in
-        OR v_op.estado     IS DISTINCT FROM v_estado_in
-        THEN
+      -- ── ÍTEM 3: Verificar identidad de contenido completa ────────────────
+      -- Comparar todos los campos esenciales de la transacción.
+      -- obs y creado_por son anotaciones y no forman parte de la identidad.
+      IF v_op.alumno_id  IS DISTINCT FROM v_alumno_id
+      OR v_op.cuota_id   IS DISTINCT FROM v_cuota_id
+      OR v_op.monto      IS DISTINCT FROM v_monto
+      OR COALESCE(v_op.periodo, '') IS DISTINCT FROM COALESCE(v_periodo_in, '')
+      OR v_op.fecha      IS DISTINCT FROM v_fecha_in
+      OR v_op.medio      IS DISTINCT FROM v_medio_in
+      OR v_op.estado     IS DISTINCT FROM v_estado_in
+      THEN
+        RAISE EXCEPTION
+          'insertar_pagos_lote: idempotency_key=% ya existe con contenido distinto. '
+          'Los campos esenciales (alumno/cuota/monto/periodo/fecha/medio/estado) deben '
+          'coincidir en un reintento. Si el pago fue editado, recarga antes de reintentar.',
+          v_idem_key
+          USING ERRCODE = '23505';
+      END IF;
+
+      -- ── ÍTEM 2: Verificar si el pago ya fue creado ───────────────────────
+      -- Si pago_id IS NOT NULL, el slot ya tiene un pago vinculado.
+      IF v_op.pago_id IS NOT NULL THEN
+        SELECT * INTO v_fila
+          FROM pagos
+         WHERE cuenta_id = p_cuenta_id AND id = v_op.pago_id;
+
+        IF NOT FOUND THEN
           RAISE EXCEPTION
-            'insertar_pagos_lote: idempotency_key=% ya existe con contenido distinto. '
-            'Los campos esenciales (alumno/cuota/monto/periodo/fecha/medio/estado) deben '
-            'coincidir en un reintento. Si el pago fue editado, recarga antes de reintentar.',
-            v_idem_key
+            'insertar_pagos_lote: idempotency_key=% corresponde a un pago que fue '
+            'eliminado (pago_id=%). Un reintento no puede recrear un pago eliminado. '
+            'Si fue un error, crea una nueva operación con nueva clave.',
+            v_idem_key, v_op.pago_id
             USING ERRCODE = '23505';
         END IF;
 
-        -- ── ÍTEM 2: Verificar si el pago todavía existe ─────────────────────
-        -- Si fue eliminado después de insertarse, rechazar el reintento.
-        -- Una operación antigua NO puede recrear un pago eliminado.
-        IF v_op.pago_id IS NOT NULL THEN
-          SELECT * INTO v_fila
-            FROM pagos
-           WHERE cuenta_id = p_cuenta_id AND id = v_op.pago_id;
-
-          IF NOT FOUND THEN
-            RAISE EXCEPTION
-              'insertar_pagos_lote: idempotency_key=% corresponde a un pago que fue '
-              'eliminado (pago_id=%). Un reintento no puede recrear un pago eliminado. '
-              'Si fue un error, crea una nueva operación con nueva clave.',
-              v_idem_key, v_op.pago_id
-              USING ERRCODE = '23505';
-          END IF;
-
-          -- Pago existe: retornar idempotentemente
-          v_resultado := v_resultado || to_jsonb(v_fila);
-          CONTINUE;
-        END IF;
-
-        -- pago_id IS NULL: operación sin pago_id (raro — operación incompleta)
-        -- Continuar con la inserción
+        -- Pago existe: retornar idempotentemente
+        v_resultado := v_resultado || to_jsonb(v_fila);
+        CONTINUE;
       END IF;
 
-      -- ── Insertar pago ────────────────────────────────────────────────────
+      -- ── pago_id IS NULL: insertar pago y vincular al slot ────────────────
       INSERT INTO pagos (
         cuenta_id, id, alumno_id, cuota_id, monto, fecha, medio,
         estado, periodo, obs, creado_por, idempotency_key
@@ -267,22 +289,14 @@ BEGIN
       )
       RETURNING * INTO v_fila;
 
-      -- ── Registrar operación durable ──────────────────────────────────────
-      -- INSERT OR IGNORE: si ya existe un registro (pago_id=NULL de raza),
-      -- actualizar el pago_id con el recién insertado.
-      INSERT INTO operaciones_pagos (
-        cuenta_id, idempotency_key, auth_id,
-        alumno_id, cuota_id, monto, periodo, fecha, medio, estado,
-        pago_id
-      )
-      VALUES (
-        p_cuenta_id, v_idem_key, v_caller_uid,
-        v_alumno_id, v_cuota_id, v_monto, v_periodo_in, v_fecha_in, v_medio_in, v_estado_in,
-        v_fila.id
-      )
-      ON CONFLICT (cuenta_id, idempotency_key) DO UPDATE
-        SET pago_id = EXCLUDED.pago_id
-        WHERE operaciones_pagos.pago_id IS NULL;
+      -- Actualizar el slot con el pago_id real.
+      -- WHERE pago_id IS NULL: protección extra si dos sesiones llegaran aquí
+      -- (en la práctica el advisory lock lo impide; esto es defensa en profundidad).
+      UPDATE operaciones_pagos
+         SET pago_id = v_fila.id
+       WHERE cuenta_id       = p_cuenta_id
+         AND idempotency_key = v_idem_key
+         AND pago_id         IS NULL;
 
     ELSE
       -- ── Camino sin idempotencia: INSERT directo ───────────────────────────

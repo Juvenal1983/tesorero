@@ -2,22 +2,26 @@
 function modalPago({aluId,cuotaId,periodo}){
   // ÍTEM 3: Detectar operación de resultado incierto al reabrir el modal.
   // Si el modal se cerró después de un error de red (resultado desconocido),
-  // la clave y el payload se guardaron en sessionStorage. Al reabrir,
+  // la clave y el payload se guardaron en localStorage. Al reabrir,
   // reutilizamos la misma clave para que el RPC use idempotencia y retorne
   // el pago existente si llegó a guardarse, o lo inserte si no llegó.
-  // La operación pendiente expira en 5 minutos para evitar falsos positivos.
+  //
+  // REGLAS DE PERSISTENCIA:
+  //   • Se usa localStorage (no sessionStorage) → sobrevive cierre del navegador.
+  //   • Sin TTL: un resultado incierto sigue siendo incierto sin importar el tiempo.
+  //   • NO se borra al Cancelar: cancelar el modal no resuelve la incertidumbre.
+  //   • Se borra SOLO al: (a) confirmar éxito del servidor, (b) click explícito
+  //     en "✕ Descartar" dentro del banner de alerta del modal.
   const _PENDING_KEY = 'tesorero_pending_op';
-  const _MAX_AGE_MS  = 5 * 60 * 1000; // 5 minutos
   let pendingOp = null;
   try {
-    const raw = sessionStorage.getItem(_PENDING_KEY);
+    const raw = localStorage.getItem(_PENDING_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (parsed && parsed.aluId === aluId && parsed.cuotaId === cuotaId
-          && (Date.now() - parsed.timestamp) < _MAX_AGE_MS) {
+      // Restaurar solo si coincide exactamente con este alumno y cuota.
+      // Si es para otro alumno/cuota, dejar en storage para cuando se abra ese modal.
+      if (parsed && parsed.aluId === aluId && parsed.cuotaId === cuotaId) {
         pendingOp = parsed;
-      } else {
-        sessionStorage.removeItem(_PENDING_KEY);
       }
     }
   } catch(e) {}
@@ -82,7 +86,7 @@ function modalPago({aluId,cuotaId,periodo}){
         Hay un pago registrado hace ${Math.round((Date.now()-pendingOp.timestamp)/1000)}s cuyo resultado no fue confirmado.
         Al guardar ahora se reintentará con la misma clave — el servidor descartará duplicados automáticamente.
         <a href="#" style="display:block;margin-top:4px;font-size:12px;color:#856404"
-           onclick="try{sessionStorage.removeItem('tesorero_pending_op')}catch(e){}this.closest('.alert').remove();return false">
+           onclick="try{localStorage.removeItem('tesorero_pending_op')}catch(e){}this.closest('.alert').remove();return false">
           ✕ Descartar y comenzar operación nueva
         </a>
       </div>`
@@ -109,7 +113,7 @@ function modalPago({aluId,cuotaId,periodo}){
       </div>
     </div>
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px">
-      <button class="btn" onclick="_submitSessionId=null;try{sessionStorage.removeItem('tesorero_pending_op')}catch(e){};closeModal()">Cancelar</button>
+      <button class="btn" onclick="_submitSessionId=null;closeModal()">Cancelar</button>
       <button class="btn bp" onclick="savePago('${aluId}','${cuotaId}','${esMensual?'multi':'single'}')">Registrar y notificar →</button>
     </div>
   </div>`;
@@ -501,7 +505,7 @@ async function savePago(aluId,cuotaId,modo){
         // Si el modal se cierra y reabre, la clave se recupera automáticamente
         // para que el reintento use la misma idempotency_key (evita duplicados).
         try {
-          sessionStorage.setItem('tesorero_pending_op', JSON.stringify({
+          localStorage.setItem('tesorero_pending_op', JSON.stringify({
             submitSessionId,
             aluId,
             cuotaId,
@@ -577,7 +581,7 @@ async function savePago(aluId,cuotaId,modo){
 
     // Pago exitoso: resetear la clave de sesión y limpiar operación pendiente.
     _submitSessionId = null;
-    try { sessionStorage.removeItem('tesorero_pending_op'); } catch(e) {}
+    try { localStorage.removeItem('tesorero_pending_op'); } catch(e) {}
     S.modal={type:'notificacion',data:{ap,alu,cuota,periodo,monto,fecha,medio,cur,aluId,msgDefault}};
     render();
     return;
