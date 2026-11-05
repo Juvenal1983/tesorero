@@ -1,5 +1,12 @@
 // js/features/pagos-formularios.js — extraído de la copia de demostración.
 function modalPago({aluId,cuotaId,periodo}){
+  // Generar submitSessionId UNA VEZ por apertura de modal.
+  // Los reintentos de este submit reutilizarán esta clave para idempotencia.
+  // Si ya hay uno activo (reapertura antes de cerrar), lo reemplazamos.
+  _submitSessionId = (typeof crypto !== 'undefined' && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+
   const cuota=(DB.cuotas||[]).find(q=>q.id===cuotaId);
   const alu=(DB.alumnos||[]).find(a=>a.id===aluId);
   const aps=(DB.apoderados||[]).filter(x=>x.alumnoId===aluId&&x.estado!=='inactivo');
@@ -61,7 +68,7 @@ function modalPago({aluId,cuotaId,periodo}){
       </div>
     </div>
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px">
-      <button class="btn" onclick="closeModal()">Cancelar</button>
+      <button class="btn" onclick="_submitSessionId=null;closeModal()">Cancelar</button>
       <button class="btn bp" onclick="savePago('${aluId}','${cuotaId}','${esMensual?'multi':'single'}')">Registrar y notificar →</button>
     </div>
   </div>`;
@@ -357,8 +364,16 @@ function eliminarPlanPago(planId){
 }
 
 
-// ── Bandera anti-doble-envío para el flujo v9 ───────────────────────────────
-let _savePagoEnCurso = false;
+// ── Control de estado del flujo v9 ──────────────────────────────────────────
+// _savePagoEnCurso: bloquea envío simultáneo mientras la petición está en vuelo.
+// _submitSessionId: UUID generado UNA VEZ cuando se abre el modal de pago.
+//   - Se reutiliza en reintentos del mismo envío (idempotencia estable).
+//   - Se resetea a null cuando el modal se cierra (nuevo modal = nueva clave).
+//   Esto garantiza que reintentos de red envíen la misma idempotency_key y el RPC
+//   retorne la fila existente sin duplicar. Una clave nueva por envío (bug previo)
+//   hacía que un reintento se tratara como un pago distinto.
+let _savePagoEnCurso  = false;
+let _submitSessionId  = null;
 
 async function savePago(aluId,cuotaId,modo){
   const monto=parseInt(document.getElementById('p-monto').value);
@@ -404,12 +419,13 @@ async function savePago(aluId,cuotaId,modo){
       return;
     }
 
-    // B2-fix: UUID de idempotencia por operación de submit (no por período).
-    // Todos los períodos de este submit comparten la misma "sesión de submit",
-    // pero cada período obtiene su propio idempotency_key para que la unicidad
-    // sea a nivel de período individual (evita reintentos de red que dupliquen).
-    const submitSessionId = crypto.randomUUID ? crypto.randomUUID()
-      : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+    // B2-fix: UUID de idempotencia estable por modal.
+    // _submitSessionId fue generado cuando se abrió el modal (en modalPago()).
+    // Los reintentos de este envío reutilizan la misma clave, así el RPC
+    // devuelve la fila existente sin duplicar. Se resetea a null al cerrar.
+    // Fallback defensivo: si por alguna razón _submitSessionId es null, generar uno.
+    const submitSessionId = _submitSessionId
+      || (crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36)+Math.random().toString(36).slice(2)));
 
     // B3-fix: construir array de pagos para insertarPagosLote (todo-o-nada real en PostgreSQL).
     // Cada período tiene su propio idempotency_key = submitSessionId + '-' + periodo.
@@ -505,6 +521,8 @@ async function savePago(aluId,cuotaId,modo){
           .replace(/\{colegio\}/g,colegioNombre)
       : buildMsgDefault({alumNombre,cuota,periodo,montoFmt,fechaFmt,medio,curNombre,colegioNombre});
 
+    // Pago exitoso: resetear la clave de sesión — el modal se cerrará o navegará.
+    _submitSessionId = null;
     S.modal={type:'notificacion',data:{ap,alu,cuota,periodo,monto,fecha,medio,cur,aluId,msgDefault}};
     render();
     return;
