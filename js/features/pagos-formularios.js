@@ -381,23 +381,13 @@ async function savePago(aluId,cuotaId,modo){
 
   if(!DB.pagos) DB.pagos=[];
 
-  // Filtrar duplicados en memoria
-  const duplicados = [];
-  const nuevos = [];
-  periodos.forEach(periodo=>{
-    const existe = (DB.pagos||[]).find(p=>
-      (p.alumnoId||p.aluId)===aluId && p.cuotaId===cuotaId && p.periodo===periodo && p.estado==='pagado'
-    );
-    if(existe) duplicados.push(periodo);
-    else nuevos.push(periodo);
-  });
-
-  if(duplicados.length){
-    alert('⚠️ Los siguientes meses ya tenían pago registrado y se omitieron:\n'+duplicados.join(', '));
-  }
-  if(!nuevos.length) return;
-
   // ── FLUJO RELACIONAL v9 ──────────────────────────────────────────────────
+  // En v9 NO filtramos por períodos ya pagados en memoria: el servidor admite
+  // pagos parciales sucesivos sobre el mismo período. La idempotencia se
+  // garantiza por idempotency_key en el RPC, no por chequeo previo en cliente.
+  // La UI (checkboxes) ya refleja qué seleccionó el usuario; respetamos su elección.
+  const nuevos = periodos; // todos los períodos seleccionados van al servidor
+
   if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
     // Bloquear doble envío mientras la petición al servidor está en curso
     if (_savePagoEnCurso) { return; }
@@ -406,10 +396,11 @@ async function savePago(aluId,cuotaId,modo){
     if (btnGuardar) { btnGuardar.disabled = true; btnGuardar.textContent = 'Guardando…'; }
 
     const cuentaId = (typeof S !== 'undefined' && S._v9CuentaId) || null;
-    if (!cuentaId) {
+    const authToken = (typeof _authToken !== 'undefined' && _authToken) || null;
+    if (!cuentaId || !authToken) {
       _savePagoEnCurso = false;
       if (btnGuardar) { btnGuardar.disabled = false; btnGuardar.textContent = 'Registrar y notificar →'; }
-      alert('Error: sesión v9 sin cuentaId — vuelve a iniciar sesión.');
+      alert('Error: sesión incompleta (sin cuenta o sin token) — vuelve a iniciar sesión.');
       return;
     }
 
@@ -438,13 +429,21 @@ async function savePago(aluId,cuotaId,modo){
 
     // B3: una sola llamada RPC transaccional — todo-o-nada real en PostgreSQL.
     // Si falla cualquier período, el RPC revierte la transacción completa.
+    // NOTA: en caso de error de red (fetch abort, connection reset) NO podemos
+    // afirmar que la transacción fue revertida — puede haberse confirmado.
+    // Por eso mostramos un mensaje de incertidumbre, no "transacción revertida".
     let registradosArr = [];
     try {
-      registradosArr = await insertarPagosLote(cuentaId, pagosLote, _authToken);
+      registradosArr = await insertarPagosLote(cuentaId, pagosLote, authToken);
     } catch (err) {
       _savePagoEnCurso = false;
       if (btnGuardar) { btnGuardar.disabled = false; btnGuardar.textContent = 'Registrar y notificar →'; }
-      alert(`❌ No se pudo guardar ningún período (transacción revertida).\n\nError: ${err?.message || err}`);
+      const esRedError = err && (err.name === 'AbortError' || err.name === 'TypeError' || !navigator.onLine);
+      if (esRedError) {
+        alert('⚠️ Error de red al registrar el pago.\n\nEl estado del pago es INCIERTO: puede haberse guardado o no. Recarga la página para verificar antes de volver a intentar.');
+      } else {
+        alert(`❌ No se pudo guardar el pago.\n\nError: ${err?.message || err}`);
+      }
       return;
     }
     // Mapear resultados por periodo para acceso rápido
@@ -453,8 +452,14 @@ async function savePago(aluId,cuotaId,modo){
     _savePagoEnCurso = false;
     if (btnGuardar) { btnGuardar.disabled = false; btnGuardar.textContent = 'Registrar y notificar →'; }
 
-    // Todos los períodos confirmados por el servidor — añadir a DB.pagos
+    // Todos los períodos confirmados por el servidor — añadir a DB.pagos.
+    // Usar el ID retornado por el servidor como fuente de verdad.
+    // Protección contra doble insert: si el mismo registro.id ya existe
+    // en DB.pagos (ej: reintento que devolvió la fila existente), no duplicar.
+    const idsExistentes = new Set((DB.pagos||[]).map(p => p.id));
     registrados.forEach(({ registro }) => {
+      if (idsExistentes.has(registro.id)) return; // idempotencia en memoria
+      idsExistentes.add(registro.id);
       DB.pagos.push({
         id:        registro.id,
         alumnoId:  aluId,
@@ -507,12 +512,22 @@ async function savePago(aluId,cuotaId,modo){
   // ── FIN FLUJO RELACIONAL v9 ──────────────────────────────────────────────
 
   // ── FLUJO LEGADO ─────────────────────────────────────────────────────────
-  nuevos.forEach(periodo=>{
-    DB.pagos.push({id:uid(),cuotaId,alumnoId:aluId,aluId,periodo,monto,fecha,estado:'pagado',medio,obs,creadoPor:S.session.id});
+  // En legado, filtramos períodos ya pagados para no duplicar en el blob.
+  const nuevosLegado = periodos.filter(periodo => {
+    return !(DB.pagos||[]).find(p =>
+      (p.alumnoId||p.aluId)===aluId && p.cuotaId===cuotaId && p.periodo===periodo && p.estado==='pagado'
+    );
+  });
+  if (!nuevosLegado.length) {
+    alert('⚠️ Todos los períodos seleccionados ya tienen pago registrado.');
+    return;
+  }
+  nuevosLegado.forEach(periodo=>{
+    DB.pagos.push({id:uid(),cuotaId,alumnoId:aluId,aluId,periodo,monto,fecha,estado:'pagado',medio,obs,creadoPor:S.session?.id||''});
   });
   saveDB();
 
-  const periodo = nuevos.length===1 ? nuevos[0] : nuevos.join(', ');
+  const periodo = nuevosLegado.length===1 ? nuevosLegado[0] : nuevosLegado.join(', ');
   const ap=apId?(DB.apoderados||[]).find(x=>x.id===apId):null;
   const alu=(DB.alumnos||[]).find(a=>a.id===aluId);
   const cuota=(DB.cuotas||[]).find(q=>q.id===cuotaId);

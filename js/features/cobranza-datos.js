@@ -58,28 +58,43 @@ function getDeudores(){
 
       if(q.tipo==='mensual'){
         for(let m=mesIni; m<=Math.min(mesFin, mesHoy); m++){
-          const periodo = MESES[m];
-          const pagado = pagos.find(p=>p.alumnoId===alu.id && p.cuotaId===q.id && p.periodo===periodo);
-          if(!pagado){
-            deudaTotal += q.monto;
-            periodosPendientes.push({ cuota:q.nombre, periodo, monto:q.monto });
+          // B1-fix: formato "Mes AAAA" — coincide con cómo los pagos registran el período.
+          // Antes usaba MESES[m] (sin año), lo que nunca encontraba pagos del formato nuevo.
+          const periodo = `${MESES[m]} ${q.anio||anioHoy}`;
+          // B10-fix: sumar TODOS los pagos del período (puede haber más de uno en v9).
+          // Antes usaba find() que solo veía el primero y no acumulaba pagos parciales.
+          const totalPagadoPeriodo = pagos
+            .filter(p=>p.alumnoId===alu.id && p.cuotaId===q.id && p.periodo===periodo)
+            .reduce((s,p)=>s+(Number(p.monto)||0), 0);
+          if(totalPagadoPeriodo < q.monto){
+            const pendiente = q.monto - totalPagadoPeriodo;
+            deudaTotal += pendiente;
+            periodosPendientes.push({ cuota:q.nombre, periodo, monto:pendiente, pagado:totalPagadoPeriodo });
           }
         }
       } else if(q.tipo==='anual'){
         const periodo = `Anual ${q.anio||anioHoy}`;
         if((q.anio||anioHoy) <= anioHoy){
-          const pagado = pagos.find(p=>p.alumnoId===alu.id && p.cuotaId===q.id);
-          if(!pagado){
-            deudaTotal += q.monto;
-            periodosPendientes.push({ cuota:q.nombre, periodo, monto:q.monto });
+          // B10-fix: sumar abonos para cuota anual también
+          const totalPagadoPeriodo = pagos
+            .filter(p=>p.alumnoId===alu.id && p.cuotaId===q.id && p.periodo===periodo)
+            .reduce((s,p)=>s+(Number(p.monto)||0), 0);
+          if(totalPagadoPeriodo < q.monto){
+            const pendiente = q.monto - totalPagadoPeriodo;
+            deudaTotal += pendiente;
+            periodosPendientes.push({ cuota:q.nombre, periodo, monto:pendiente, pagado:totalPagadoPeriodo });
           }
         }
       } else if(q.tipo==='extraordinaria'){
         const periodo = q.nombre;
-        const pagado = pagos.find(p=>p.alumnoId===alu.id && p.cuotaId===q.id);
-        if(!pagado){
-          deudaTotal += q.monto;
-          periodosPendientes.push({ cuota:q.nombre, periodo, monto:q.monto });
+        // B10-fix: sumar pagos de cuotas extraordinarias
+        const totalPagadoPeriodo = pagos
+          .filter(p=>p.alumnoId===alu.id && p.cuotaId===q.id)
+          .reduce((s,p)=>s+(Number(p.monto)||0), 0);
+        if(totalPagadoPeriodo < q.monto){
+          const pendiente = q.monto - totalPagadoPeriodo;
+          deudaTotal += pendiente;
+          periodosPendientes.push({ cuota:q.nombre, periodo, monto:pendiente, pagado:totalPagadoPeriodo });
         }
       }
     });

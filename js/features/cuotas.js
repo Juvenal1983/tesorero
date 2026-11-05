@@ -28,6 +28,12 @@ function renderCuotas(){
 }
 function delCuota(id){
   if(!puedeEscribir()){ showToast('⛔ Sin permisos para eliminar cuotas','#E24B4A'); return; }
+  // B4-fix: en modo relacional v9, la eliminación de cuotas debe ir a Supabase.
+  // Bloquear hasta implementar el CRUD relacional para cuotas.
+  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
+    alert('⚠️ La eliminación de cuotas no está disponible en el modo relacional v9 todavía.\n\nEsta función requiere integración con la tabla cuotas de Supabase (pendiente de implementar).');
+    return;
+  }
   if(!confirm('¿Eliminar esta cuota? Los pagos asociados también serán eliminados.')) return;
   DB.cuotas=(DB.cuotas||[]).filter(q=>q.id!==id);
   DB.pagos=(DB.pagos||[]).filter(p=>p.cuotaId!==id);

@@ -1,6 +1,11 @@
 // js/features/configuracion-acciones.js — extraído de la copia de demostración.
 function saveDatosBancarios(){
   if(!puedeConfigurar()){ showToast('⛔ Sin permisos para modificar los datos bancarios','#E24B4A'); return; }
+  // B4-fix: en modo relacional v9, los datos bancarios deben persistirse en la tabla cursos de Supabase.
+  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
+    alert('⚠️ La modificación de datos bancarios no está disponible en el modo relacional v9 todavía.\n\nEsta función requiere integración con la tabla cursos de Supabase (pendiente de implementar).');
+    return;
+  }
   const ci = (DB.cursos||[]).findIndex(c=>c.id===S.cursoId);
   if(ci<0) return;
   DB.cursos[ci].banco = {

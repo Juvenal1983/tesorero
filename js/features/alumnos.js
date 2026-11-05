@@ -275,6 +275,12 @@ function modalEnviarPin(aluId){
 }
 
 function delAlumno(id){
+  // B4-fix: en modo relacional v9, la eliminación de alumnos debe ir a Supabase.
+  // Bloquear hasta implementar el CRUD relacional para alumnos.
+  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
+    alert('⚠️ La eliminación de alumnos no está disponible en el modo relacional v9 todavía.\n\nEsta función requiere integración con la tabla alumnos de Supabase (pendiente de implementar).');
+    return;
+  }
   if(!confirm('¿Eliminar este alumno? Se eliminarán también sus pagos asociados.')) return;
   DB.alumnos=(DB.alumnos||[]).filter(a=>a.id!==id);
   DB.pagos=(DB.pagos||[]).filter(p=>p.alumnoId!==id);

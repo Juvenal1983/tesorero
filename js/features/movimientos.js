@@ -99,6 +99,11 @@ function renderMovimientos(){
 }
 function delMov(id){
   if(!puedeGestionarMovimientos()){ showToast('⛔ Sin permisos para eliminar movimientos','#E24B4A'); return; }
+  // B4-fix: en modo relacional v9, la eliminación de movimientos debe ir a Supabase.
+  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
+    alert('⚠️ La eliminación de movimientos no está disponible en el modo relacional v9 todavía.\n\nEsta función requiere integración con la tabla movimientos de Supabase (pendiente de implementar).');
+    return;
+  }
   if(!confirm('¿Eliminar este movimiento?')) return;
   DB.movimientos=(DB.movimientos||[]).filter(m=>m.id!==id);
   saveDB(); go('movimientos');
@@ -186,6 +191,11 @@ function modalEditMov(data){
 
 function saveEditMov(id){
   if(!puedeGestionarMovimientos()){ showToast('⛔ Sin permisos para editar movimientos','#E24B4A'); return; }
+  // B4-fix: en modo relacional v9, la edición de movimientos debe ir a Supabase.
+  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
+    alert('⚠️ La edición de movimientos no está disponible en el modo relacional v9 todavía.\n\nEsta función requiere integración con la tabla movimientos de Supabase (pendiente de implementar).');
+    return;
+  }
   const m=(DB.movimientos||[]).find(x=>x.id===id);
   if(!m) return;
   const desc=document.getElementById('em-desc').value.trim();
