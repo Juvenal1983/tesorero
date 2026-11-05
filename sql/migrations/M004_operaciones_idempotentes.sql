@@ -66,6 +66,20 @@ CREATE INDEX IF NOT EXISTS operaciones_pagos_pago_id_idx
   ON operaciones_pagos (cuenta_id, pago_id)
   WHERE pago_id IS NOT NULL;
 
+-- ── Protección de acceso ──────────────────────────────────────────────────────
+-- operaciones_pagos es una tabla de control interno de idempotencia.
+-- Solo service_role puede leerla/escribirla; authenticated y anon nunca acceden
+-- directamente (todo pasa por el RPC insertar_pagos_lote que corre como definer).
+
+ALTER TABLE operaciones_pagos ENABLE ROW LEVEL SECURITY;
+
+-- Sin políticas RLS definidas: ninguna fila es visible a sesiones que no sean
+-- service_role (que omite RLS) o el propio usuario dueño del RPC definer.
+REVOKE ALL ON operaciones_pagos FROM PUBLIC;
+REVOKE ALL ON operaciones_pagos FROM anon;
+REVOKE ALL ON operaciones_pagos FROM authenticated;
+GRANT  ALL ON operaciones_pagos TO   service_role;
+
 -- Verificación post-migración
 DO $$
 BEGIN

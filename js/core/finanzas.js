@@ -70,13 +70,17 @@ function calcFinanzas(){
         ? MESES.slice(mesIni1, mesFin1).map(m => `${m} ${q.anio||new Date().getFullYear()}`)
         : [`Anual ${q.anio||2026}`];
       periodos.forEach(periodo => {
-        totalEsperado += (q.monto||0);
+        const obligado = (q.monto||0);
+        totalEsperado += obligado;
         // B10-fix: usar filter+reduce para sumar TODOS los pagos del período
         // (antes: find() solo tomaba el primero; con pagos acumulables puede haber varios)
         const totalPeriodo = pagosPagados
           .filter(p => p.alumnoId===alu.id && p.cuotaId===q.id && p.periodo===periodo)
           .reduce((s, p) => s + (p.monto||0), 0);
-        totalPagado += totalPeriodo;
+        // F-EXC-fix: limitar al obligado para que excedentes no inflen pctCumpl.
+        // totPagos (ingresos brutos) ya recoge el excedente real;
+        // totalPagado solo mide cumplimiento de la obligación.
+        totalPagado += Math.min(totalPeriodo, obligado);
       });
     });
   });

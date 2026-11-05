@@ -1548,8 +1548,15 @@ async function doVerificarCodigoV9() {
 
   // ── Código CC-XXXX: acceso compartido sin PIN ──────────────
   if (code.startsWith('CC-')) {
+    // S08-fix: capturar epoch de sesión antes del await
+    const _snapSessionCC = (typeof _v9SessionId !== 'undefined') ? _v9SessionId : 0;
     try {
       const curso = await v9CcVerificar(code);
+      // S08-fix: guard post-await — descartar si logout/cambio de cuenta durante el RPC
+      if (typeof _v9SessionId !== 'undefined' && _snapSessionCC !== _v9SessionId) {
+        console.warn('[acceso] doVerificarCodigoV9 (CC): respuesta tardía descartada.');
+        return;
+      }
       if (!curso) {
         errEl.textContent = 'Código de acceso compartido inválido o expirado.';
         errEl.style.display = '';
@@ -1729,9 +1736,19 @@ async function doAccesoCodigoV9() {
   const alumnoId  = _v9ApState.alumnoId;
   const nombreAlu = _v9ApState.alumnoNombre || alumnoId;
 
+  // S08-fix: capturar epoch de sesión ANTES del await para detectar logout/cambio
+  // de cuenta ocurrido mientras el RPC viajaba.  Si la sesión cambió, descartar.
+  const _snapSessionPin = (typeof _v9SessionId !== 'undefined') ? _v9SessionId : 0;
+
   try {
     // El RPC valida PIN con bcrypt y retorna datos del alumno o error
     const resultado = await v9AluAcceso(cuentaId, alumnoId, pin);
+
+    // S08-fix: guard post-await — descartar respuesta tardía tras logout/cambio de cuenta.
+    if (typeof _v9SessionId !== 'undefined' && _snapSessionPin !== _v9SessionId) {
+      console.warn('[acceso] doAccesoCodigoV9: respuesta tardía descartada (sesión cambió durante el RPC del PIN).');
+      return; // No crear ni restaurar sesión
+    }
 
     if (resultado?.error) {
       const mensajes = {
