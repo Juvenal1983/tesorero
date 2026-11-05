@@ -160,14 +160,17 @@ LEFT JOIN cuotas cu
 WHERE p.periodo !~ '\d{4}$';   -- sin año al final
 
 -- ── 4. Actualizar solo los pagos que tienen cuota con año conocido ────────────
+-- NOTA: en UPDATE … FROM, no se puede referenciar la tabla objetivo (p) dentro
+-- de un JOIN de la cláusula FROM. El filtro de meses va en WHERE para evitar
+-- "invalid reference to FROM-clause entry for table p".
 UPDATE pagos p
    SET periodo = p.periodo || ' ' || cu.anio::TEXT
-  FROM cuotas cu
-  JOIN _meses_reconocidos mr ON mr.mes = p.periodo   -- solo meses canónicos
+  FROM cuotas cu, _meses_reconocidos mr
  WHERE cu.cuenta_id = p.cuenta_id
-   AND cu.id = p.cuota_id
-   AND p.periodo !~ '\d{4}$'    -- sin año al final
-   AND cu.anio IS NOT NULL;     -- solo si cuota tiene año autoritativo
+   AND cu.id        = p.cuota_id
+   AND mr.mes       = p.periodo   -- solo meses canónicos (en WHERE, no en JOIN)
+   AND p.periodo    !~ '\d{4}$'   -- sin año al final
+   AND cu.anio IS NOT NULL;       -- solo si cuota tiene año autoritativo
 
 -- ── 5. Migrar también planes_pago.periodo si existe la tabla ─────────────────
 DO $$
@@ -195,13 +198,15 @@ BEGIN
       AND pp.periodo !~ '\d{4}$';
 
     -- Actualizar planes_pago
+    -- (igual que pagos: filtro de meses en WHERE, no en JOIN, para evitar
+    -- "invalid reference to FROM-clause entry for table pp")
     UPDATE planes_pago pp
        SET periodo = pp.periodo || ' ' || cu.anio::TEXT
-      FROM cuotas cu
-      JOIN _meses_reconocidos mr ON mr.mes = pp.periodo
+      FROM cuotas cu, _meses_reconocidos mr
      WHERE cu.cuenta_id = pp.cuenta_id
-       AND cu.id = pp.cuota_id
-       AND pp.periodo !~ '\d{4}$'
+       AND cu.id        = pp.cuota_id
+       AND mr.mes       = pp.periodo   -- filtro en WHERE
+       AND pp.periodo   !~ '\d{4}$'
        AND cu.anio IS NOT NULL;
 
     RAISE NOTICE 'M003: planes_pago.periodo también normalizado (entity_type=plan_pago en auditoría).';

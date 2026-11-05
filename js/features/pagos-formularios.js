@@ -18,9 +18,20 @@ function modalPago({aluId,cuotaId,periodo}){
     const raw = localStorage.getItem(_PENDING_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      // Restaurar solo si coincide exactamente con este alumno y cuota.
-      // Si es para otro alumno/cuota, dejar en storage para cuando se abra ese modal.
-      if (parsed && parsed.aluId === aluId && parsed.cuotaId === cuotaId) {
+      // Restaurar solo si coincide exactamente con este alumno, cuota Y cuenta.
+      //
+      // Aislamiento por cuenta: si el navegador tiene un pendingOp de otra cuenta
+      // (ej: el operador cambió de cuenta sin cerrar el navegador), no recuperar.
+      //
+      // Aislamiento por usuario: aunque otro usuario vea el pendingOp y lo reintente,
+      // el RPC rechazará con error 42501 (identidad de autor no coincide) porque
+      // auth.uid() del reintento difiere del auth_id guardado en operaciones_pagos.
+      // El aislamiento en cliente es UX (no mostrar el banner a quien no corresponde);
+      // la garantía de seguridad real está en el servidor.
+      const currentCuentaId = (typeof S !== 'undefined' && S._v9CuentaId) || null;
+      const cuentaCoincide = !currentCuentaId || !parsed.cuentaId
+                             || parsed.cuentaId === currentCuentaId;
+      if (parsed && parsed.aluId === aluId && parsed.cuotaId === cuotaId && cuentaCoincide) {
         pendingOp = parsed;
       }
     }
