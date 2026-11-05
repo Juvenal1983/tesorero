@@ -167,6 +167,11 @@ function modalEditMovFondo(data){
 }
 
 function guardarEditMovFondo(id){
+  // B4-fix: bloquear en modo V9_RELACIONAL
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    alert('⚠️ Función no disponible en modo V9: la edición de movimientos de fondos requiere implementación CRUD relacional.');
+    return;
+  }
   const m = (DB.fondoMovimientos||[]).find(x=>x.id===id);
   if(!m) return;
   const nombre = document.getElementById('emov-nombre').value.trim();
@@ -190,6 +195,11 @@ function guardarEditMovFondo(id){
 }
 
 function eliminarMovFondo(id){
+  // B4-fix: bloquear en modo V9_RELACIONAL
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    alert('⚠️ Función no disponible en modo V9: la eliminación de movimientos de fondos requiere implementación CRUD relacional.');
+    return;
+  }
   if(!confirm('¿Eliminar este movimiento? Los saldos de los alumnos se recalcularán automáticamente.')) return;
   if(!confirm('Segunda confirmación: ¿Seguro que deseas eliminar este movimiento?')) return;
   DB.fondoMovimientos = (DB.fondoMovimientos||[]).filter(m=>m.id!==id);
@@ -298,6 +308,11 @@ function calcPreviewFondo(){
 }
 
 function saveMovFondo(){
+  // B4-fix: en modo V9_RELACIONAL bloquear escrituras sin CRUD relacional para fondos.
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    alert('⚠️ Función no disponible en modo V9: el registro de movimientos de fondos requiere implementación CRUD relacional.');
+    return;
+  }
   const tipo   = document.getElementById('fmov-tipo').value;
   const nombre = document.getElementById('fmov-nombre').value.trim();
   const fecha  = document.getElementById('fmov-fecha').value;
@@ -499,6 +514,11 @@ function seleccionarTodosAct(sel){
 }
 
 function saveActividad(id){
+  // B4-fix: bloquear en modo V9_RELACIONAL
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    alert('⚠️ Función no disponible en modo V9: la gestión de actividades requiere implementación CRUD relacional.');
+    return;
+  }
   const nombre = document.getElementById('act-nombre').value.trim();
   const monto  = parseInt(document.getElementById('act-monto').value)||0;
   const fecha  = document.getElementById('act-fecha').value;
@@ -518,6 +538,11 @@ function saveActividad(id){
 }
 
 function eliminarActividad(id){
+  // B4-fix: bloquear en modo V9_RELACIONAL
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    alert('⚠️ Función no disponible en modo V9: la eliminación de actividades requiere implementación CRUD relacional.');
+    return;
+  }
   if(!confirm('¿Eliminar esta actividad? Se perderán los fondos asignados.')) return;
   DB.actividades=(DB.actividades||[]).filter(x=>x.id!==id);
   saveDB(); go('actividades');

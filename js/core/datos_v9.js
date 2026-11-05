@@ -158,17 +158,20 @@ async function registrarPagoV9(pago, cuentaId, accessToken) {
   const monto = Math.round(montoNum); // CLP no tiene decimales
 
   const payload = {
-    cuenta_id:  cuentaId,
+    cuenta_id:       cuentaId,
     id,
-    alumno_id:  pago.alumno_id,
-    cuota_id:   pago.cuota_id,
+    alumno_id:       pago.alumno_id,
+    cuota_id:        pago.cuota_id,
     monto,
-    fecha:      pago.fecha || new Date().toISOString().slice(0, 10),
-    medio:      pago.medio || 'efectivo',
-    estado:     pago.estado || 'pagado',
-    periodo:    pago.periodo || null,
-    obs:        pago.obs || null,
-    creado_por: pago.creado_por || null,
+    fecha:           pago.fecha || new Date().toISOString().slice(0, 10),
+    medio:           pago.medio || 'efectivo',
+    estado:          pago.estado || 'pagado',
+    periodo:         pago.periodo || null,
+    obs:             pago.obs || null,
+    creado_por:      pago.creado_por || null,
+    // B2-fix: idempotency_key permite que reintentos de red no dupliquen filas.
+    // La clave viene del caller (UUID único por operación de submit).
+    idempotency_key: pago.idempotency_key || null,
   };
 
   const rows = await _v9Fetch(
@@ -192,15 +195,65 @@ async function registrarPagoV9(pago, cuentaId, accessToken) {
 }
 
 /**
+ * B3: Inserta múltiples pagos en una sola transacción PostgreSQL (todo-o-nada).
+ * Llama al RPC insertar_pagos_lote definido en sql/11_insertar_pagos_lote.sql.
+ *
+ * Garantías:
+ *  - Atomicidad real en PostgreSQL: si falla cualquier inserción, ninguna queda.
+ *  - Idempotencia: si llega el mismo idempotency_key de un reintento, el RPC
+ *    devuelve la fila existente sin duplicar ni lanzar error.
+ *
+ * @param {string} cuentaId
+ * @param {Array<Object>} pagos — array de objetos pago con idempotency_key por elemento
+ * @param {string} accessToken
+ * @returns {Array<Object>} filas insertadas o ya existentes
+ */
+async function insertarPagosLote(cuentaId, pagos, accessToken) {
+  if (!Array.isArray(pagos) || pagos.length === 0) return [];
+
+  const result = await _v9Fetch(
+    '/rpc/insertar_pagos_lote',
+    {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ p_cuenta_id: cuentaId, p_pagos: pagos }),
+    },
+    accessToken
+  );
+
+  if (!Array.isArray(result)) {
+    throw new Error(
+      '[datos_v9] insertarPagosLote: el RPC no devolvió un array. ' +
+      'Verifica que insertar_pagos_lote esté desplegado en el proyecto de staging.'
+    );
+  }
+  return result;
+}
+
+/**
  * Elimina un pago por su id (PK compuesta: cuenta_id + id).
  * No lanza error si ya no existe (idempotente).
  */
 async function eliminarPagoV9(cuentaId, pagoId, accessToken) {
-  await _v9Fetch(
-    `/pagos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(pagoId)}`,
-    { method: 'DELETE' },
+  // B6-fix: Prefer: return=representation para detectar filas afectadas.
+  // PostgREST no distingue "no existe" de "RLS lo bloqueó"; si devuelve array
+  // vacío emitimos advertencia de consola. No lanzamos error para mantener
+  // la UX actual (el caller mostrará su propio mensaje si lo necesita).
+  const rows = await _v9Fetch(
+    `/pagos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(pagoId)}&select=*`,
+    {
+      method:  'DELETE',
+      headers: { 'Prefer': 'return=representation' },
+    },
     accessToken
   );
+  if (!Array.isArray(rows) || rows.length === 0) {
+    console.warn(
+      `[datos_v9] eliminarPagoV9: DELETE de pago ${pagoId} no afectó ninguna fila. ` +
+      'El pago puede no existir o RLS pudo haberlo bloqueado.'
+    );
+  }
+  return rows;
 }
 
 /**

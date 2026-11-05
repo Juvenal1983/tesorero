@@ -5,7 +5,10 @@ function modalPago({aluId,cuotaId,periodo}){
   const aps=(DB.apoderados||[]).filter(x=>x.alumnoId===aluId&&x.estado!=='inactivo');
   const mesIniP = (cuota?.mesInicio !== undefined && cuota?.mesInicio !== null) ? cuota.mesInicio : 2;
   const mesFinP = (cuota?.mesTermino !== undefined && cuota?.mesTermino !== null) ? cuota.mesTermino + 1 : 12;
-  const periodos = cuota?.tipo==='mensual' ? MESES.slice(mesIniP, mesFinP) : [`Anual ${cuota?.anio||2026}`];
+  // B1-fix: formato "Mes AAAA" usando cuota.anio como fuente autoritativa
+  const periodos = cuota?.tipo==='mensual'
+    ? MESES.slice(mesIniP, mesFinP).map(m => `${m} ${cuota.anio||new Date().getFullYear()}`)
+    : [`Anual ${cuota?.anio||2026}`];
   const esMensual = cuota?.tipo==='mensual';
   const apSel = aps.length===1 ? aps[0].id : '';
   const apOpts = aps.length===0
@@ -410,41 +413,42 @@ async function savePago(aluId,cuotaId,modo){
       return;
     }
 
-    // Construir payload por período (sin añadir a DB.pagos aún)
-    const payloads = nuevos.map(periodo => ({
-      _periodo: periodo,
-      id:         'p-' + Date.now() + '-' + Math.random().toString(36).slice(2,7),
-      alumno_id:  aluId,
-      cuota_id:   cuotaId,
+    // B2-fix: UUID de idempotencia por operación de submit (no por período).
+    // Todos los períodos de este submit comparten la misma "sesión de submit",
+    // pero cada período obtiene su propio idempotency_key para que la unicidad
+    // sea a nivel de período individual (evita reintentos de red que dupliquen).
+    const submitSessionId = crypto.randomUUID ? crypto.randomUUID()
+      : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+
+    // B3-fix: construir array de pagos para insertarPagosLote (todo-o-nada real en PostgreSQL).
+    // Cada período tiene su propio idempotency_key = submitSessionId + '-' + periodo.
+    const pagosLote = nuevos.map(periodo => ({
+      id:              'p-' + Date.now() + '-' + Math.random().toString(36).slice(2,7),
+      alumno_id:       aluId,
+      cuota_id:        cuotaId,
       monto,
       fecha,
       medio,
-      estado:     'pagado',
-      periodo:    periodo || null,
-      obs:        obs || null,
-      creado_por: (S && S.session && S.session.id) || null,
+      estado:          'pagado',
+      periodo:         periodo || null,
+      obs:             obs || null,
+      creado_por:      (S && S.session && S.session.id) || null,
+      idempotency_key: `${submitSessionId}-${periodo||'unico'}`,  // B2
     }));
 
-    // G04-fix: insertar períodos de forma secuencial y atómica (todo-o-nada).
-    // Si cualquier período falla, se aborta sin escribir ninguno en DB.pagos.
-    // Esto evita éxito parcial silencioso con Promise.allSettled.
-    const registrados = [];
+    // B3: una sola llamada RPC transaccional — todo-o-nada real en PostgreSQL.
+    // Si falla cualquier período, el RPC revierte la transacción completa.
+    let registradosArr = [];
     try {
-      for (const payload of payloads) {
-        const registrado = await registrarPagoV9(payload, cuentaId, _authToken);
-        registrados.push({ registro: registrado, periodo: payload._periodo });
-      }
+      registradosArr = await insertarPagosLote(cuentaId, pagosLote, _authToken);
     } catch (err) {
       _savePagoEnCurso = false;
       if (btnGuardar) { btnGuardar.disabled = false; btnGuardar.textContent = 'Registrar y notificar →'; }
-      const periodoFallido = registrados.length < payloads.length ? payloads[registrados.length]?._periodo : '?';
-      const totalOk = registrados.length;
-      const aviso = totalOk > 0
-        ? `❌ Error al guardar el período "${periodoFallido}".\n\nLos ${totalOk} períodos anteriores YA SE GUARDARON en el servidor pero no se mostraron — recarga la página para ver el estado real.\n\nError: ${err?.message || err}`
-        : `❌ No se pudo guardar ningún período.\n\nError: ${err?.message || err}`;
-      alert(aviso);
+      alert(`❌ No se pudo guardar ningún período (transacción revertida).\n\nError: ${err?.message || err}`);
       return;
     }
+    // Mapear resultados por periodo para acceso rápido
+    const registrados = (registradosArr||[]).map(reg => ({ registro: reg, periodo: reg.periodo }));
 
     _savePagoEnCurso = false;
     if (btnGuardar) { btnGuardar.disabled = false; btnGuardar.textContent = 'Registrar y notificar →'; }

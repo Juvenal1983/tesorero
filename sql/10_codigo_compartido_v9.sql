@@ -195,7 +195,7 @@ BEGIN
       ON gs.mes BETWEEN ca.mes_ini AND ca.mes_fin
     JOIN meses m ON m.idx = gs.mes
     WHERE ca.tipo = 'mensual'
-      AND NOT b.eximido
+      AND NOT COALESCE(b.eximido, false)  -- B12-fix: COALESCE para eximido=NULL
   ),
 
   -- ── Obligaciones no-mensuales: una fila por (alumno × cuota) ──
@@ -207,7 +207,7 @@ BEGIN
     FROM base b
     CROSS JOIN cuotas_activas ca
     WHERE ca.tipo IS DISTINCT FROM 'mensual'
-      AND NOT b.eximido
+      AND NOT COALESCE(b.eximido, false)  -- B12-fix: COALESCE para eximido=NULL
   ),
 
   -- ── Pagos realizados para cuotas mensuales (pre-agregados) ──
@@ -237,11 +237,49 @@ BEGIN
     GROUP BY p.alumno_id, p.cuota_id
   ),
 
+  -- ── B5-fix: abonos por período mensual ───────────────────────
+  -- Agrupa abonos por (alumno, cuota, periodo) uniéndose a través de
+  -- planes_pago.periodo.  Esto garantiza que un abono registrado para
+  -- "Marzo 2025" solo reduzca la obligación de ese período, nunca la de
+  -- "Abril 2025" aunque ambos sean de la misma cuota.
+  --
+  -- B5-fix: se eliminó el filtro AND pp.activo = TRUE.
+  --   Los planes completados (activo=false) siguen contando: sus abonos
+  --   ya fueron pagados y no deben desaparecer del cálculo de pendiente.
+  --
+  -- Nota: solo aplica a cuotas de tipo 'mensual'; los no-mensuales
+  -- conservan su abono a nivel de cuota en abonos_por_cuota (más abajo).
+  abonos_por_periodo AS (
+    SELECT
+      ab.alumno_id,
+      pp.cuota_id,
+      pp.periodo,
+      COALESCE(SUM(ab.monto), 0::NUMERIC) AS total
+    FROM abonos ab
+    JOIN planes_pago pp
+      ON  pp.cuenta_id = ab.cuenta_id
+      AND pp.id        = ab.plan_id
+    JOIN cuotas cu
+      ON  cu.cuenta_id = pp.cuenta_id
+      AND cu.id        = pp.cuota_id
+    WHERE ab.cuenta_id = v_cuenta_id
+      AND ab.alumno_id IN (SELECT bx.alumno_id FROM base bx)
+      AND ab.pagado    = TRUE
+      -- B5-fix: sin filtro activo=TRUE; planes completados siguen contando
+      AND cu.curso_id  = v_curso_id
+      AND cu.tipo      = 'mensual'
+    GROUP BY ab.alumno_id, pp.cuota_id, pp.periodo
+  ),
+
   -- ── Pendiente por período mensual ───────────────────────────
   -- REGLA CLAVE: MAX(0, ob−pa) se aplica POR PERÍODO, no por cuota.
   -- Un sobrepago en Marzo (pagado $15k / obligado $10k → pendiente 0)
   -- no puede reducir el pendiente de Abril ($10k).
-  -- Una cuota se considera "pagada" solo si pagado >= obligado en ese período.
+  -- Una cuota se considera "pagada" solo si pagado + abonado >= obligado.
+  --
+  -- B5-fix: se agrega abonado_efectivo por período (desde abonos_por_periodo).
+  --   El abono se cappea al pendiente_gross del período para no crear
+  --   crédito negativo ni cross-period contamination.
   mensual_por_periodo AS (
     SELECT
       om.alumno_id,
@@ -249,10 +287,20 @@ BEGIN
       om.periodo,
       om.monto                                                  AS obligado,
       COALESCE(pm.monto, 0::NUMERIC)                           AS pagado,
-      -- período pagado = pago cubre íntegramente la obligación
-      CASE WHEN COALESCE(pm.monto, 0::NUMERIC) >= om.monto
+      -- Abono efectivo: capeado al pendiente_gross para no pasar de 0
+      LEAST(
+        COALESCE(abp.total, 0::NUMERIC),
+        GREATEST(0::NUMERIC, om.monto - COALESCE(pm.monto, 0::NUMERIC))
+      )                                                         AS abonado_efectivo,
+      -- Período pagado = pago + abono cubren íntegramente la obligación
+      CASE WHEN COALESCE(pm.monto, 0::NUMERIC)
+                + LEAST(
+                    COALESCE(abp.total, 0::NUMERIC),
+                    GREATEST(0::NUMERIC, om.monto - COALESCE(pm.monto, 0::NUMERIC))
+                  ) >= om.monto
            THEN 1 ELSE 0 END                                   AS periodo_pagado,
-      -- pendiente del período: nunca negativo aunque haya sobrepago
+      -- Pendiente GROSS del período (sin descontar abono, para identidad algebraica).
+      -- pendiente_neto = pendiente_gross - abonado_efectivo (ver mensual_por_cuota).
       GREATEST(0::NUMERIC,
         om.monto - COALESCE(pm.monto, 0::NUMERIC))            AS pendiente
     FROM obligaciones_mensual om
@@ -260,21 +308,30 @@ BEGIN
       ON  pm.alumno_id = om.alumno_id
       AND pm.cuota_id  = om.cuota_id
       AND pm.periodo   = om.periodo
+    LEFT JOIN abonos_por_periodo abp
+      ON  abp.alumno_id = om.alumno_id
+      AND abp.cuota_id  = om.cuota_id
+      AND abp.periodo   = om.periodo
   ),
 
   -- ── Resumen mensual por (alumno × cuota) ─────────────────────
-  -- pendiente_bruto = SUM de pendientes por período (ya capeados en 0).
-  -- Esto preserva la integridad: sobrepago en un período ≠ crédito
-  -- para otro período de la misma cuota.
+  -- pendiente_bruto = SUM de pendientes GROSS por período (ya capeados en 0
+  --   respecto a pagos, pero SIN descontar abono todavía).
+  -- abonado_total   = SUM de abonos efectivos por período.
+  -- pendiente_neto  = pendiente_bruto − abonado_total (lo que el alumno debe)
+  --
+  -- Se mantienen separados para permitir que con_abono aplique la identidad:
+  --   monto_pendiente = pendiente_bruto − abonado (consistent con otros_por_cuota).
   mensual_por_cuota AS (
     SELECT
       alumno_id,
       cuota_id,
-      COUNT(*)::INT           AS total_periodos,
+      COUNT(*)::INT            AS total_periodos,
       SUM(periodo_pagado)::INT AS periodos_pagados,
-      SUM(obligado)           AS obligado,
-      SUM(pagado)             AS pagado,
-      SUM(pendiente)          AS pendiente_bruto
+      SUM(obligado)            AS obligado,
+      SUM(pagado)              AS pagado,
+      SUM(abonado_efectivo)    AS abonado_total,
+      SUM(pendiente)           AS pendiente_bruto  -- gross (sin descontar abono)
     FROM mensual_por_periodo
     GROUP BY alumno_id, cuota_id
   ),
@@ -299,10 +356,14 @@ BEGIN
       AND po.cuota_id  = oo.cuota_id
   ),
 
-  -- ── Abonos de planes activos agrupados por (alumno × cuota) ──
-  -- Agrupar por cuota permite limitar cada abono al pendiente bruto
-  -- de su propia obligación: un abono en cuota X ya cubierta por pagos
-  -- no se "derrama" hacia el pendiente de otra cuota Y.
+  -- ── B5-fix: abonos de cuotas NO mensuales por (alumno × cuota) ─
+  -- Para cuotas mensuales, el abono ya se aplicó por período en
+  -- abonos_por_periodo + mensual_por_periodo (arriba).  Este CTE
+  -- cubre únicamente los tipos distintos de 'mensual' (anual, extraordinaria).
+  --
+  -- B5-fix: se eliminó el filtro AND pp.activo = TRUE.
+  --   Los planes completados (activo=false) siguen contando: sus abonos
+  --   ya fueron pagados y no deben desaparecer del cálculo de pendiente.
   abonos_por_cuota AS (
     SELECT ab.alumno_id, pp.cuota_id,
            COALESCE(SUM(ab.monto), 0::NUMERIC) AS total
@@ -316,30 +377,42 @@ BEGIN
     WHERE ab.cuenta_id = v_cuenta_id
       AND ab.alumno_id IN (SELECT bx.alumno_id FROM base bx)
       AND ab.pagado    = TRUE
-      AND pp.activo    = TRUE
+      -- B5-fix: sin filtro activo=TRUE; planes completados siguen contando
       AND cu.curso_id  = v_curso_id
+      AND cu.tipo IS DISTINCT FROM 'mensual'  -- B5-fix: solo no-mensuales
     GROUP BY ab.alumno_id, pp.cuota_id
   ),
 
   -- ── Unión mensual + no-mensual por (alumno × cuota) ──────────
+  -- Para mensual: abonado_total viene de mensual_por_cuota (período-level).
+  -- Para otros:   abonado_total=0 (se aplicará en con_abono desde abonos_por_cuota).
   todos_por_cuota AS (
     SELECT alumno_id, cuota_id,
            total_periodos    AS total_obs,
            periodos_pagados  AS obs_pagadas,
-           obligado, pagado, pendiente_bruto
+           obligado, pagado,
+           abonado_total,       -- B5: período-level abono ya calculado
+           pendiente_bruto      -- gross (sin abono) para identidad algebraica
     FROM mensual_por_cuota
     UNION ALL
     SELECT alumno_id, cuota_id,
            total_obligaciones,
            obligaciones_pagadas,
-           obligado, pagado, pendiente_bruto
+           obligado, pagado,
+           0::NUMERIC AS abonado_total,  -- para otros, abono se aplica en con_abono
+           pendiente_bruto
     FROM otros_por_cuota
   ),
 
   -- ── Aplicar abono limitado al pendiente bruto de su cuota ─────
-  -- abonado_efectivo = MIN(abono_registrado, pendiente_bruto_cuota)
-  -- pendiente_bruto ya incorpora el MAX(0,...) por período, así que
-  -- el abono no puede crear un pendiente negativo ni cruzar cuotas.
+  -- Para cuotas mensuales:
+  --   abonado = abonado_total (período-level, ya calculado)
+  --   abonos_por_cuota.total = NULL para mensuales → COALESCE = 0
+  --   resultado: abonado = abonado_total + 0 = abonado_total  ✓
+  -- Para cuotas no-mensuales:
+  --   abonado_total = 0
+  --   abonado = 0 + LEAST(apc.total, pendiente_bruto)  ✓
+  -- Identidad: monto_pendiente = pendiente_bruto − abonado
   con_abono AS (
     SELECT
       tpc.alumno_id,
@@ -348,9 +421,10 @@ BEGIN
       tpc.obligado,
       tpc.pagado,
       tpc.pendiente_bruto,
-      LEAST(
+      -- Abono total = período-level (mensual) + cuota-level (otros, capeado)
+      tpc.abonado_total + LEAST(
         COALESCE(apc.total, 0::NUMERIC),
-        tpc.pendiente_bruto
+        tpc.pendiente_bruto                -- cap al pendiente bruto restante
       )                                                         AS abonado
     FROM todos_por_cuota tpc
     LEFT JOIN abonos_por_cuota apc

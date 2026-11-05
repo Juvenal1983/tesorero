@@ -169,8 +169,26 @@ const VERSION_KEY = 'tesorero_version';
     });
     throw new Error(msg);
   }
-  if (V9_RELACIONAL && !SUPA_URL.includes(STAGING_REF)) {
-    console.warn('[config] ADVERTENCIA: en modo V9_RELACIONAL la URL no contiene el project ref de staging esperado (' + STAGING_REF + '). URL actual: ' + SUPA_URL + '. Verifica que sea el staging correcto.');
+  // B8-fix: verificación exacta de hostname (not just includes).
+  // `includes(STAGING_REF)` podría ser satisfecho por una URL manipulada como
+  // "rucgmytyxpfowznowxwd.atacante.com".  El hostname debe ser EXACTAMENTE el esperado.
+  // Un proyecto desconocido queda bloqueado (no solo advertido) para evitar
+  // que un staging.example.com arrange en modo V9 con credenciales no verificadas.
+  if (V9_RELACIONAL) {
+    let _stagingHostname = '';
+    try { _stagingHostname = new URL(SUPA_URL).hostname; } catch(e) { _stagingHostname = ''; }
+    if (_stagingHostname !== 'rucgmytyxpfowznowxwd.supabase.co') {
+      const msgUnknown = '[TesorerApp] ALERTA DE SEGURIDAD: en modo V9_RELACIONAL la URL de Supabase ' +
+        'no coincide exactamente con el staging autorizado.\n' +
+        'Esperado: rucgmytyxpfowznowxwd.supabase.co\n' +
+        'Actual: ' + (_stagingHostname || SUPA_URL) + '\n\n' +
+        'La aplicación no puede iniciar en V9_RELACIONAL con un proyecto no autorizado.';
+      console.error(msgUnknown);
+      document.addEventListener('DOMContentLoaded', function(){
+        document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;min-height:100vh;background:#fef2f2;font-family:sans-serif"><div style="max-width:520px;padding:32px;background:#fff;border:2px solid #ef4444;border-radius:12px;text-align:center"><div style="font-size:32px;margin-bottom:12px">🔒</div><h2 style="color:#dc2626;margin:0 0 12px">Proyecto Supabase no autorizado</h2><p style="color:#374151">En modo V9_RELACIONAL solo está autorizado el proyecto de staging conocido.<br>No se puede conectar a un proyecto desconocido.</p><p style="color:#6b7280;font-size:12px;font-family:monospace">' + (_stagingHostname || SUPA_URL) + '</p><p style="color:#374151;font-size:13px">Corrige <code>SUPA_URL</code> en config.js o las variables de entorno y vuelve a cargar.</p></div></div>';
+      });
+      throw new Error(msgUnknown);
+    }
   }
 })();
 

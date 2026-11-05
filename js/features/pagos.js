@@ -29,7 +29,10 @@ function renderPagos(){
       const pagosQ = pagos.filter(p=>p.cuotaId===q.id&&p.alumnoId===sel);
       const mesIni1 = (q.mesInicio !== undefined && q.mesInicio !== null) ? q.mesInicio : vocab().mesInicioDefault;
       const mesFin1 = (q.mesTermino !== undefined && q.mesTermino !== null) ? q.mesTermino + 1 : vocab().mesFinDefault + 1;
-      const periodos = q.tipo==='mensual' ? MESES.slice(mesIni1, mesFin1) : [`Anual ${q.anio||2026}`];
+      // B1-fix: formato "Mes AAAA" usando cuota.anio como fuente autoritativa
+      const periodos = q.tipo==='mensual'
+        ? MESES.slice(mesIni1, mesFin1).map(m => `${m} ${q.anio||new Date().getFullYear()}`)
+        : [`Anual ${q.anio||2026}`];
       detalleHtml += `
         <div class="card" style="margin-bottom:14px">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px">

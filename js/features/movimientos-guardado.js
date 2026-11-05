@@ -1,5 +1,10 @@
 // js/features/movimientos-guardado.js — extraído de la copia de demostración.
 function saveMov(){
+  // B4-fix: en modo V9_RELACIONAL bloquear escrituras sin CRUD relacional para movimientos.
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    alert('⚠️ Función no disponible en modo V9: el registro de movimientos requiere implementación CRUD relacional.');
+    return;
+  }
   const desc=document.getElementById('mv-desc').value.trim();
   const monto=parseInt(document.getElementById('mv-monto').value);
   if(!desc||!monto){alert('Completa descripción y monto.');return;}

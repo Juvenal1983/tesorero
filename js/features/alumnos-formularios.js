@@ -55,6 +55,13 @@ function generarPinAleatorio(){
 }
 
 function saveAlumno(id){
+  // B4-fix: en modo V9_RELACIONAL el blob local NO es la fuente de verdad.
+  // Sin implementación CRUD relacional para alumnos, bloquear para evitar
+  // divergencia silenciosa entre el blob local y la DB.
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    alert('⚠️ Función no disponible en modo V9: la gestión de alumnos requiere implementación CRUD relacional. Por ahora, los cambios de alumnos deben hacerse directamente en Supabase.');
+    return;
+  }
   const nombres=document.getElementById('m-nombres').value.trim();
   const apellidos=document.getElementById('m-apellidos').value.trim();
   const pin=document.getElementById('m-pin').value.trim();
@@ -119,6 +126,10 @@ function modalEditApoderadoTesorero({apId, alumnoId}){
 }
 
 function saveEditApTesorero(apId, alumnoId){
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    alert('⚠️ Función no disponible en modo V9: la edición de apoderados requiere implementación CRUD relacional.');
+    return;
+  }
   const nombre=document.getElementById('eapt-nombre')?.value.trim();
   if(!nombre){ alert('El nombre es obligatorio.'); return; }
   const relacion=document.getElementById('eapt-rel')?.value;
@@ -168,6 +179,10 @@ function modalApoderados(alumnoId){
   </div>`;
 }
 function saveAp(alumnoId){
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    alert('⚠️ Función no disponible en modo V9: el alta de apoderados requiere implementación CRUD relacional.');
+    return;
+  }
   const nombre=document.getElementById('ap-nombre').value.trim();
   if(!nombre){alert('Ingresa el nombre del apoderado.');return;}
   if(!DB.apoderados) DB.apoderados=[];
@@ -175,6 +190,10 @@ function saveAp(alumnoId){
   saveDB(); showModal('apoderadosAlumno',{id:alumnoId});
 }
 function delAp(id){
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    alert('⚠️ Función no disponible en modo V9: la eliminación de apoderados requiere implementación CRUD relacional.');
+    return;
+  }
   if(!confirm('¿Eliminar este apoderado?')) return;
   const ap=(DB.apoderados||[]).find(x=>x.id===id);
   DB.apoderados=(DB.apoderados||[]).filter(x=>x.id!==id);

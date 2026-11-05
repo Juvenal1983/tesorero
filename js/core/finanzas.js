@@ -65,12 +65,18 @@ function calcFinanzas(){
       // Períodos esperados según tipo de cuota
       const mesIni1 = (q.mesInicio !== undefined && q.mesInicio !== null) ? q.mesInicio : vocab().mesInicioDefault;
       const mesFin1 = (q.mesTermino !== undefined && q.mesTermino !== null) ? q.mesTermino + 1 : vocab().mesFinDefault + 1;
-      const periodos = q.tipo==='mensual' ? MESES.slice(mesIni1, mesFin1) : [`Anual ${q.anio||2026}`];
+      // B1-fix: formato "Mes AAAA" usando cuota.anio como fuente autoritativa
+      const periodos = q.tipo==='mensual'
+        ? MESES.slice(mesIni1, mesFin1).map(m => `${m} ${q.anio||new Date().getFullYear()}`)
+        : [`Anual ${q.anio||2026}`];
       periodos.forEach(periodo => {
         totalEsperado += (q.monto||0);
-        // Buscar si existe pago para este alumno, cuota y período
-        const pago = pagosPagados.find(p=>p.alumnoId===alu.id && p.cuotaId===q.id && p.periodo===periodo);
-        if(pago) totalPagado += (pago.monto||0);
+        // B10-fix: usar filter+reduce para sumar TODOS los pagos del período
+        // (antes: find() solo tomaba el primero; con pagos acumulables puede haber varios)
+        const totalPeriodo = pagosPagados
+          .filter(p => p.alumnoId===alu.id && p.cuotaId===q.id && p.periodo===periodo)
+          .reduce((s, p) => s + (p.monto||0), 0);
+        totalPagado += totalPeriodo;
       });
     });
   });
