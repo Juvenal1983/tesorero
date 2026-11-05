@@ -6,18 +6,21 @@
 -- Garantías:
 --   • Todo-o-nada: si falla cualquier inserción, ningún pago queda
 --     guardado. El cliente recibe el error y puede reintentar.
---   • Idempotencia: ON CONFLICT con cláusula WHERE correcta retorna
---     la fila existente sin error. Reintentos de red son seguros.
---   • Idempotencia estricta: el reintento DEBE enviar el mismo
---     contenido esencial (alumno_id, cuota_id, monto, periodo).
---     Si difiere, el RPC lanza error 23505 para detectar uso
---     indebido de la clave o payload corrupto.
---   • Autorización por curso: el tesorero debe tener acceso
---     explícito al curso de la cuota (usuarios_cuenta.curso_id).
---     NULL en curso_id = todos los cursos de la cuenta (admin).
---   • Integridad de identidad: una idempotency_key solo puede
---     recuperar datos de la misma cuenta. Cross-cuenta → error.
---   • Propiedad de alumno/cuota dentro de la cuenta verificada.
+--   • Idempotencia durable: la identidad de la operación se guarda en
+--     operaciones_pagos, independiente del pago editable/eliminable.
+--     Un reintento antiguo no puede recrear un pago eliminado.
+--   • Identidad de contenido completa: el reintento debe enviar los
+--     mismos campos esenciales (alumno, cuota, monto, periodo, fecha,
+--     medio, estado). Si difiere → error 23505.
+--   • Identidad de autor: solo el mismo auth.uid() que originó la
+--     operación puede reintentarla. Otra sesión con la misma clave
+--     es rechazada → error 42501.
+--   • Autorización por curso (ítem 1):
+--     – es_dueno() tiene acceso total (bypass de curso).
+--     – Rol 'admin' con curso_id IS NOT NULL está acotado como tesorero.
+--     – La función tiene_rol_en_curso() (esquema real) maneja la lógica.
+--   • Integridad cross-cuenta: una idempotency_key de otra cuenta no
+--     puede afectar esta (clave compuesta en operaciones_pagos).
 --
 -- Parámetros:
 --   p_cuenta_id UUID
@@ -35,21 +38,11 @@
 --       idempotency_key: TEXT (UUID único por operación; nulo = sin idempotencia)
 --     }]
 --
--- Retorno: JSONB array con las filas insertadas o ya existentes.
+-- Retorno: JSONB array con las filas de pagos insertadas o ya existentes.
 --
--- Dependencias: M001_idempotency_key.sql debe ejecutarse primero.
---
--- NOTA sobre ON CONFLICT con índice parcial:
---   El índice pagos_idempotency_key_unico es parcial:
---     ON pagos (idempotency_key) WHERE idempotency_key IS NOT NULL
---   PostgreSQL requiere repetir la cláusula WHERE en el ON CONFLICT.
---
--- NOTA sobre reintento con pago editado/eliminado:
---   Si la fila fue ELIMINADA después de insertarse, el conflicto no
---   se activa y se inserta de nuevo (nuevo comportamiento seguro).
---   El cliente puede detectar el cambio comparando IDs entre reintentos.
---   Si la fila fue EDITADA, el RPC detecta discrepancia de contenido
---   y lanza error 23505 — el cliente debe recargar antes de reintentar.
+-- Dependencias:
+--   M001_idempotency_key.sql      — índice parcial en pagos.idempotency_key
+--   M004_operaciones_idempotentes.sql — tabla operaciones_pagos
 -- ============================================================
 
 BEGIN;
@@ -72,6 +65,7 @@ DECLARE
   v_resultado    JSONB := '[]'::JSONB;
   v_item         JSONB;
   v_fila         pagos%ROWTYPE;
+  v_op           operaciones_pagos%ROWTYPE;
   v_id           TEXT;
   v_monto        INT;
   v_monto_num    NUMERIC;
@@ -80,26 +74,24 @@ DECLARE
   v_curso_id     TEXT;
   v_idem_key     TEXT;
   v_caller_uid   UUID;
-  v_es_admin     BOOLEAN;
+  v_es_dueno     BOOLEAN;
   v_periodo_in   TEXT;
+  v_fecha_in     DATE;
+  v_medio_in     TEXT;
+  v_estado_in    TEXT;
 BEGIN
   -- ── 1. Capturar identidad del llamante ────────────────────────────────────
   v_caller_uid := auth.uid();
 
   -- ── 2. Verificar autorización a nivel de cuenta ───────────────────────────
-  -- El llamante debe ser dueño de la cuenta O tener rol tesorero/admin.
-  -- La verificación de alcance por curso se hace pago a pago (paso 3c).
-  v_es_admin := es_dueno(p_cuenta_id)
-    OR EXISTS (
-      SELECT 1 FROM usuarios_cuenta uc
-       WHERE uc.cuenta_id   = p_cuenta_id
-         AND uc.auth_id     = v_caller_uid
-         AND uc.rol         IN ('admin')
-         AND uc.desactivado IS DISTINCT FROM TRUE
-    );
+  -- ÍTEM 1: Solo es_dueno() tiene bypass total de curso.
+  -- Rol 'admin' con curso_id IS NOT NULL está acotado como tesorero.
+  -- La función tiene_rol_en_curso() del esquema real maneja ambos casos.
+  v_es_dueno := es_dueno(p_cuenta_id);
 
-  IF NOT v_es_admin THEN
-    -- Verificar al menos que tiene rol tesorero en algún curso de esta cuenta
+  IF NOT v_es_dueno THEN
+    -- Verificar que tiene al menos rol tesorero o admin en algún curso de la cuenta
+    -- (tiene_rol_en_curso con curso_id NULL = cualquier curso, en la función real)
     IF NOT EXISTS (
       SELECT 1 FROM usuarios_cuenta uc
        WHERE uc.cuenta_id   = p_cuenta_id
@@ -126,8 +118,8 @@ BEGIN
   FOR v_item IN SELECT * FROM jsonb_array_elements(p_pagos)
   LOOP
     -- Campos obligatorios
-    v_alumno_id := v_item->>'alumno_id';
-    v_cuota_id  := v_item->>'cuota_id';
+    v_alumno_id  := v_item->>'alumno_id';
+    v_cuota_id   := v_item->>'cuota_id';
     v_periodo_in := NULLIF(v_item->>'periodo', '');
 
     IF v_alumno_id IS NULL OR v_cuota_id IS NULL THEN
@@ -149,26 +141,20 @@ BEGIN
       FROM cuotas cu
      WHERE cu.cuenta_id = p_cuenta_id AND cu.id = v_cuota_id;
 
-    IF v_curso_id IS NULL THEN
+    IF NOT FOUND THEN
       RAISE EXCEPTION 'insertar_pagos_lote: cuota_id=% no pertenece a la cuenta', v_cuota_id
         USING ERRCODE = '42501';
     END IF;
 
-    -- ── 3c. Verificación de alcance por curso ────────────────────────────────
-    -- El tesorero puede operar solo en los cursos asignados (usuarios_cuenta.curso_id).
-    -- NULL en curso_id = todos los cursos (admin/dueno).
-    IF NOT v_es_admin THEN
-      IF NOT EXISTS (
-        SELECT 1 FROM usuarios_cuenta uc
-         WHERE uc.cuenta_id   = p_cuenta_id
-           AND uc.auth_id     = v_caller_uid
-           AND uc.rol         IN ('tesorero', 'admin')
-           AND uc.desactivado IS DISTINCT FROM TRUE
-           AND (uc.curso_id IS NULL OR uc.curso_id = v_curso_id)
-      ) THEN
+    -- ── ÍTEM 1: Autorización por curso ───────────────────────────────────────
+    -- es_dueno() bypasea la comprobación de curso.
+    -- Cualquier otro rol (tesorero O admin) usa tiene_rol_en_curso(), que respeta
+    -- curso_id IS NULL (acceso total) o curso_id = v_curso_id (acotado).
+    IF NOT v_es_dueno THEN
+      IF NOT tiene_rol_en_curso(p_cuenta_id, v_curso_id, ARRAY['tesorero', 'admin']) THEN
         RAISE EXCEPTION
-          'insertar_pagos_lote: el tesorero no tiene acceso al curso=% de esta cuota',
-          v_curso_id
+          'insertar_pagos_lote: sin acceso al curso=% de esta cuota (usuario=%)',
+          v_curso_id, v_caller_uid
           USING ERRCODE = '42501';
       END IF;
     END IF;
@@ -182,19 +168,85 @@ BEGIN
     END IF;
     v_monto := ROUND(v_monto_num)::INT;
 
+    -- Normalizar campos de identidad
+    v_fecha_in  := COALESCE(NULLIF(v_item->>'fecha', ''), CURRENT_DATE::TEXT)::DATE;
+    v_medio_in  := COALESCE(NULLIF(v_item->>'medio', ''), 'efectivo');
+    v_estado_in := COALESCE(NULLIF(v_item->>'estado', ''), 'pagado');
+
     -- Generar id si no viene
     v_id := COALESCE(
       NULLIF(TRIM(v_item->>'id'), ''),
       'p-' || EXTRACT(EPOCH FROM NOW())::BIGINT::TEXT || '-' || SUBSTR(gen_random_uuid()::TEXT, 1, 8)
     );
 
-    -- Idempotency key (puede ser NULL: en ese caso no hay protección de idempotencia)
+    -- Idempotency key
     v_idem_key := NULLIF(TRIM(v_item->>'idempotency_key'), '');
 
     IF v_idem_key IS NOT NULL THEN
       -- ── Camino con idempotencia ───────────────────────────────────────────
-      -- ON CONFLICT repite la condición del índice parcial (WHERE idempotency_key IS NOT NULL).
-      -- DO UPDATE con WHERE cuenta_id garantiza aislamiento cross-cuenta.
+
+      -- ── ÍTEM 2: Buscar registro de operación durable (separado del pago) ──
+      SELECT * INTO v_op
+        FROM operaciones_pagos
+       WHERE cuenta_id = p_cuenta_id
+         AND idempotency_key = v_idem_key;
+
+      IF FOUND THEN
+        -- ── ÍTEM 1: Verificar identidad de autor ────────────────────────────
+        IF v_op.auth_id IS DISTINCT FROM v_caller_uid THEN
+          RAISE EXCEPTION
+            'insertar_pagos_lote: idempotency_key=% fue creada por otra sesión; '
+            'operación rechazada (identidad de autor no coincide)',
+            v_idem_key
+            USING ERRCODE = '42501';
+        END IF;
+
+        -- ── ÍTEM 3: Verificar identidad de contenido completa ───────────────
+        -- Comparar todos los campos esenciales de la transacción.
+        -- obs y creado_por son anotaciones y no forman parte de la identidad.
+        IF v_op.alumno_id  IS DISTINCT FROM v_alumno_id
+        OR v_op.cuota_id   IS DISTINCT FROM v_cuota_id
+        OR v_op.monto      IS DISTINCT FROM v_monto
+        OR COALESCE(v_op.periodo, '') IS DISTINCT FROM COALESCE(v_periodo_in, '')
+        OR v_op.fecha      IS DISTINCT FROM v_fecha_in
+        OR v_op.medio      IS DISTINCT FROM v_medio_in
+        OR v_op.estado     IS DISTINCT FROM v_estado_in
+        THEN
+          RAISE EXCEPTION
+            'insertar_pagos_lote: idempotency_key=% ya existe con contenido distinto. '
+            'Los campos esenciales (alumno/cuota/monto/periodo/fecha/medio/estado) deben '
+            'coincidir en un reintento. Si el pago fue editado, recarga antes de reintentar.',
+            v_idem_key
+            USING ERRCODE = '23505';
+        END IF;
+
+        -- ── ÍTEM 2: Verificar si el pago todavía existe ─────────────────────
+        -- Si fue eliminado después de insertarse, rechazar el reintento.
+        -- Una operación antigua NO puede recrear un pago eliminado.
+        IF v_op.pago_id IS NOT NULL THEN
+          SELECT * INTO v_fila
+            FROM pagos
+           WHERE cuenta_id = p_cuenta_id AND id = v_op.pago_id;
+
+          IF NOT FOUND THEN
+            RAISE EXCEPTION
+              'insertar_pagos_lote: idempotency_key=% corresponde a un pago que fue '
+              'eliminado (pago_id=%). Un reintento no puede recrear un pago eliminado. '
+              'Si fue un error, crea una nueva operación con nueva clave.',
+              v_idem_key, v_op.pago_id
+              USING ERRCODE = '23505';
+          END IF;
+
+          -- Pago existe: retornar idempotentemente
+          v_resultado := v_resultado || to_jsonb(v_fila);
+          CONTINUE;
+        END IF;
+
+        -- pago_id IS NULL: operación sin pago_id (raro — operación incompleta)
+        -- Continuar con la inserción
+      END IF;
+
+      -- ── Insertar pago ────────────────────────────────────────────────────
       INSERT INTO pagos (
         cuenta_id, id, alumno_id, cuota_id, monto, fecha, medio,
         estado, periodo, obs, creado_por, idempotency_key
@@ -205,51 +257,36 @@ BEGIN
         v_alumno_id,
         v_cuota_id,
         v_monto,
-        COALESCE(NULLIF(v_item->>'fecha', ''), CURRENT_DATE::TEXT)::DATE,
-        COALESCE(NULLIF(v_item->>'medio', ''), 'efectivo'),
-        COALESCE(NULLIF(v_item->>'estado', ''), 'pagado'),
+        v_fecha_in,
+        v_medio_in,
+        v_estado_in,
         v_periodo_in,
         NULLIF(v_item->>'obs', ''),
         NULLIF(v_item->>'creado_por', ''),
         v_idem_key
       )
-      ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO UPDATE
-        -- No modificamos campos de negocio.
-        -- SET disparará RETURNING con la fila actual (para verificación posterior).
-        -- WHERE garantiza aislamiento: una key de otra cuenta no afecta esta.
-        SET idempotency_key = EXCLUDED.idempotency_key
-        WHERE pagos.cuenta_id = EXCLUDED.cuenta_id
       RETURNING * INTO v_fila;
 
-      -- ── Verificar aislamiento cross-cuenta ───────────────────────────────
-      IF v_fila IS NULL THEN
-        RAISE EXCEPTION
-          'insertar_pagos_lote: idempotency_key=% ya existe en otra cuenta; operación rechazada',
-          v_idem_key
-          USING ERRCODE = '23505';
-      END IF;
-
-      -- ── Verificar identidad de contenido ────────────────────────────────
-      -- En un reintento legítimo, el payload debe ser idéntico al original.
-      -- Si difiere, puede ser: (a) payload corrupto, (b) reutilización indebida de key,
-      -- (c) el pago fue editado tras la primera inserción.
-      -- En cualquier caso, rechazar — el cliente debe recargar antes de reintentar.
-      IF v_fila.alumno_id  != v_alumno_id
-         OR v_fila.cuota_id   != v_cuota_id
-         OR v_fila.monto       != v_monto
-         OR COALESCE(v_fila.periodo, '') != COALESCE(v_periodo_in, '')
-      THEN
-        RAISE EXCEPTION
-          'insertar_pagos_lote: idempotency_key=% ya existe con contenido distinto '
-          '(alumno/cuota/monto/periodo difieren). '
-          'Si el pago fue editado, recarga la página antes de reintentar.',
-          v_idem_key
-          USING ERRCODE = '23505';
-      END IF;
+      -- ── Registrar operación durable ──────────────────────────────────────
+      -- INSERT OR IGNORE: si ya existe un registro (pago_id=NULL de raza),
+      -- actualizar el pago_id con el recién insertado.
+      INSERT INTO operaciones_pagos (
+        cuenta_id, idempotency_key, auth_id,
+        alumno_id, cuota_id, monto, periodo, fecha, medio, estado,
+        pago_id
+      )
+      VALUES (
+        p_cuenta_id, v_idem_key, v_caller_uid,
+        v_alumno_id, v_cuota_id, v_monto, v_periodo_in, v_fecha_in, v_medio_in, v_estado_in,
+        v_fila.id
+      )
+      ON CONFLICT (cuenta_id, idempotency_key) DO UPDATE
+        SET pago_id = EXCLUDED.pago_id
+        WHERE operaciones_pagos.pago_id IS NULL;
 
     ELSE
       -- ── Camino sin idempotencia: INSERT directo ───────────────────────────
-      -- Permite dos pagos legítimos iguales (ej: una segunda cuota parcial)
+      -- Permite dos pagos legítimos iguales (ej: segunda cuota parcial)
       -- sin ninguna protección de duplicados — el operador es responsable.
       INSERT INTO pagos (
         cuenta_id, id, alumno_id, cuota_id, monto, fecha, medio,
@@ -261,13 +298,13 @@ BEGIN
         v_alumno_id,
         v_cuota_id,
         v_monto,
-        COALESCE(NULLIF(v_item->>'fecha', ''), CURRENT_DATE::TEXT)::DATE,
-        COALESCE(NULLIF(v_item->>'medio', ''), 'efectivo'),
-        COALESCE(NULLIF(v_item->>'estado', ''), 'pagado'),
+        v_fecha_in,
+        v_medio_in,
+        v_estado_in,
         v_periodo_in,
         NULLIF(v_item->>'obs', ''),
         NULLIF(v_item->>'creado_por', ''),
-        NULL   -- sin idempotency_key
+        NULL
       )
       RETURNING * INTO v_fila;
     END IF;

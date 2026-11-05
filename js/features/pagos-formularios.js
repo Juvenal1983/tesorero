@@ -1,11 +1,38 @@
 // js/features/pagos-formularios.js — extraído de la copia de demostración.
 function modalPago({aluId,cuotaId,periodo}){
-  // Generar submitSessionId UNA VEZ por apertura de modal.
-  // Los reintentos de este submit reutilizarán esta clave para idempotencia.
-  // Si ya hay uno activo (reapertura antes de cerrar), lo reemplazamos.
-  _submitSessionId = (typeof crypto !== 'undefined' && crypto.randomUUID)
-    ? crypto.randomUUID()
-    : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+  // ÍTEM 3: Detectar operación de resultado incierto al reabrir el modal.
+  // Si el modal se cerró después de un error de red (resultado desconocido),
+  // la clave y el payload se guardaron en sessionStorage. Al reabrir,
+  // reutilizamos la misma clave para que el RPC use idempotencia y retorne
+  // el pago existente si llegó a guardarse, o lo inserte si no llegó.
+  // La operación pendiente expira en 5 minutos para evitar falsos positivos.
+  const _PENDING_KEY = 'tesorero_pending_op';
+  const _MAX_AGE_MS  = 5 * 60 * 1000; // 5 minutos
+  let pendingOp = null;
+  try {
+    const raw = sessionStorage.getItem(_PENDING_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.aluId === aluId && parsed.cuotaId === cuotaId
+          && (Date.now() - parsed.timestamp) < _MAX_AGE_MS) {
+        pendingOp = parsed;
+      } else {
+        sessionStorage.removeItem(_PENDING_KEY);
+      }
+    }
+  } catch(e) {}
+
+  if (pendingOp) {
+    // Reutilizar la clave de la operación incierta anterior.
+    _submitSessionId = pendingOp.submitSessionId;
+    // El banner de alerta se muestra en el HTML del modal (ver abajo).
+  } else {
+    // Generar submitSessionId UNA VEZ por apertura de modal.
+    // Los reintentos de este submit reutilizarán esta clave para idempotencia.
+    _submitSessionId = (typeof crypto !== 'undefined' && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+  }
 
   const cuota=(DB.cuotas||[]).find(q=>q.id===cuotaId);
   const alu=(DB.alumnos||[]).find(a=>a.id===aluId);
@@ -48,8 +75,22 @@ function modalPago({aluId,cuotaId,periodo}){
       </div>`
     : `<div class="fg"><label class="fl">Período</label><select class="fs" id="p-periodo">${periodos.map(p=>`<option${p===periodo?' selected':''}>${p}</option>`).join('')}</select></div>`;
 
+  // Banner de operación incierta: visible solo si hay pendingOp
+  const pendingBanner = pendingOp
+    ? `<div class="alert" style="background:#fff3cd;color:#856404;border:1px solid #ffc107;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-size:13px">
+        ⚠️ <strong>Operación anterior con resultado incierto.</strong><br>
+        Hay un pago registrado hace ${Math.round((Date.now()-pendingOp.timestamp)/1000)}s cuyo resultado no fue confirmado.
+        Al guardar ahora se reintentará con la misma clave — el servidor descartará duplicados automáticamente.
+        <a href="#" style="display:block;margin-top:4px;font-size:12px;color:#856404"
+           onclick="try{sessionStorage.removeItem('tesorero_pending_op')}catch(e){}this.closest('.alert').remove();return false">
+          ✕ Descartar y comenzar operación nueva
+        </a>
+      </div>`
+    : '';
+
   return `<div class="modal" style="max-width:500px">
     <div class="modal-hdr"><div class="modal-title">Registrar pago</div><button class="close-btn" onclick="closeModal()">×</button></div>
+    ${pendingBanner}
     <div class="alert ag">Alumno: <strong>${escHtml((alu?.nombres||'')+' '+(alu?.apellidos||''))}</strong> · ${escHtml(cuota?.nombre||'')}</div>
     ${periodosHtml}
     <div class="fg-row">
@@ -68,7 +109,7 @@ function modalPago({aluId,cuotaId,periodo}){
       </div>
     </div>
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px">
-      <button class="btn" onclick="_submitSessionId=null;closeModal()">Cancelar</button>
+      <button class="btn" onclick="_submitSessionId=null;try{sessionStorage.removeItem('tesorero_pending_op')}catch(e){};closeModal()">Cancelar</button>
       <button class="btn bp" onclick="savePago('${aluId}','${cuotaId}','${esMensual?'multi':'single'}')">Registrar y notificar →</button>
     </div>
   </div>`;
@@ -456,7 +497,20 @@ async function savePago(aluId,cuotaId,modo){
       if (btnGuardar) { btnGuardar.disabled = false; btnGuardar.textContent = 'Registrar y notificar →'; }
       const esRedError = err && (err.name === 'AbortError' || err.name === 'TypeError' || !navigator.onLine);
       if (esRedError) {
-        alert('⚠️ Error de red al registrar el pago.\n\nEl estado del pago es INCIERTO: puede haberse guardado o no. Recarga la página para verificar antes de volver a intentar.');
+        // ÍTEM 3: Persistir la clave y el payload a sessionStorage.
+        // Si el modal se cierra y reabre, la clave se recupera automáticamente
+        // para que el reintento use la misma idempotency_key (evita duplicados).
+        try {
+          sessionStorage.setItem('tesorero_pending_op', JSON.stringify({
+            submitSessionId,
+            aluId,
+            cuotaId,
+            pagosLote,
+            cuentaId,
+            timestamp: Date.now()
+          }));
+        } catch(e) {}
+        alert('⚠️ Error de red al registrar el pago.\n\nEl estado del pago es INCIERTO: puede haberse guardado o no.\n\nSi vuelves a abrir este formulario, se reintentará con la misma clave automáticamente. También puedes recargar la página para verificar.');
       } else {
         alert(`❌ No se pudo guardar el pago.\n\nError: ${err?.message || err}`);
       }
@@ -521,8 +575,9 @@ async function savePago(aluId,cuotaId,modo){
           .replace(/\{colegio\}/g,colegioNombre)
       : buildMsgDefault({alumNombre,cuota,periodo,montoFmt,fechaFmt,medio,curNombre,colegioNombre});
 
-    // Pago exitoso: resetear la clave de sesión — el modal se cerrará o navegará.
+    // Pago exitoso: resetear la clave de sesión y limpiar operación pendiente.
     _submitSessionId = null;
+    try { sessionStorage.removeItem('tesorero_pending_op'); } catch(e) {}
     S.modal={type:'notificacion',data:{ap,alu,cuota,periodo,monto,fecha,medio,cur,aluId,msgDefault}};
     render();
     return;

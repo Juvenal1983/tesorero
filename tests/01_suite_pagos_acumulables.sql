@@ -34,6 +34,10 @@
 \pset format unaligned
 
 -- ── Preparar fixtures de prueba ───────────────────────────────────────────────
+-- ÍTEM 4: Fixtures completos para el esquema real (01_schema.sql).
+-- tesorero_cuentas requiere email TEXT NOT NULL y auth_id para es_dueno().
+-- usuarios_cuenta requiere id TEXT NOT NULL y email TEXT NOT NULL.
+
 DO $$
 BEGIN
   PERFORM set_config('app.test_es_dueno', 'true', true);
@@ -42,12 +46,18 @@ END;
 $$;
 
 -- Cuentas
-INSERT INTO tesorero_cuentas (id) VALUES
-  ('aaaaaaaa-0000-0000-0000-000000000001'::UUID)
-  ON CONFLICT DO NOTHING;
-INSERT INTO tesorero_cuentas (id) VALUES
-  ('bbbbbbbb-0000-0000-0000-000000000001'::UUID)
-  ON CONFLICT DO NOTHING;
+-- auth_id = '...0001' → es_dueno() retorna true cuando test_user_id = '...0001'
+INSERT INTO tesorero_cuentas (id, auth_id, email) VALUES
+  ('aaaaaaaa-0000-0000-0000-000000000001'::UUID,
+   '00000000-0000-0000-0000-000000000001'::UUID,
+   'owner-a@test.cl')
+  ON CONFLICT (id) DO UPDATE SET auth_id = EXCLUDED.auth_id, email = EXCLUDED.email;
+
+INSERT INTO tesorero_cuentas (id, auth_id, email) VALUES
+  ('bbbbbbbb-0000-0000-0000-000000000001'::UUID,
+   '00000000-0000-0000-0000-000000000099'::UUID,
+   'owner-b@test.cl')
+  ON CONFLICT (id) DO UPDATE SET auth_id = EXCLUDED.auth_id, email = EXCLUDED.email;
 
 -- Cursos (dos cursos en cuenta A, un curso en cuenta B)
 INSERT INTO cursos (cuenta_id, id, nombre, anio) VALUES
@@ -61,17 +71,31 @@ INSERT INTO cursos (cuenta_id, id, nombre, anio) VALUES
   ON CONFLICT DO NOTHING;
 
 -- Tesorero global (curso_id IS NULL = todos los cursos)
-INSERT INTO usuarios_cuenta (cuenta_id, auth_id, rol, curso_id) VALUES
+-- id requerido por PRIMARY KEY (cuenta_id, id) del esquema real
+INSERT INTO usuarios_cuenta (cuenta_id, id, auth_id, email, rol, curso_id) VALUES
   ('aaaaaaaa-0000-0000-0000-000000000001'::UUID,
+   'uc-tglobal',
    '00000000-0000-0000-0000-000000000001'::UUID,
+   'tesorero-global@test.cl',
    'tesorero', NULL)
   ON CONFLICT DO NOTHING;
 
 -- Tesorero acotado solo a curso-test-1
-INSERT INTO usuarios_cuenta (cuenta_id, auth_id, rol, curso_id) VALUES
+INSERT INTO usuarios_cuenta (cuenta_id, id, auth_id, email, rol, curso_id) VALUES
   ('aaaaaaaa-0000-0000-0000-000000000001'::UUID,
+   'uc-tacotado',
    '00000000-0000-0000-0000-000000000002'::UUID,
+   'tesorero-acotado@test.cl',
    'tesorero', 'curso-test-1')
+  ON CONFLICT DO NOTHING;
+
+-- Admin acotado a curso-test-1 (ÍTEM 1: debe respetar alcance de curso)
+INSERT INTO usuarios_cuenta (cuenta_id, id, auth_id, email, rol, curso_id) VALUES
+  ('aaaaaaaa-0000-0000-0000-000000000001'::UUID,
+   'uc-admin-acotado',
+   '00000000-0000-0000-0000-000000000003'::UUID,
+   'admin-acotado@test.cl',
+   'admin', 'curso-test-1')
   ON CONFLICT DO NOTHING;
 
 -- Alumnos
@@ -99,7 +123,11 @@ INSERT INTO cuotas (cuenta_id, id, curso_id, nombre, tipo, monto, anio) VALUES
    'Cuota B', 'mensual', 20000, 2025)
   ON CONFLICT DO NOTHING;
 
--- Limpiar pagos de pruebas anteriores
+-- Limpiar pagos y operaciones de pruebas anteriores
+DELETE FROM operaciones_pagos WHERE cuenta_id IN (
+  'aaaaaaaa-0000-0000-0000-000000000001'::UUID,
+  'bbbbbbbb-0000-0000-0000-000000000001'::UUID
+);
 DELETE FROM pagos WHERE cuenta_id IN (
   'aaaaaaaa-0000-0000-0000-000000000001'::UUID,
   'bbbbbbbb-0000-0000-0000-000000000001'::UUID
@@ -183,6 +211,7 @@ DECLARE
   v_res  JSONB;
 BEGIN
   PERFORM set_config('app.test_es_dueno', 'true', true);
+  DELETE FROM operaciones_pagos WHERE idempotency_key IN ('t3-reintento');
   DELETE FROM pagos WHERE idempotency_key IN ('t3-reintento');
 
   v_res := insertar_pagos_lote('aaaaaaaa-0000-0000-0000-000000000001'::UUID,
@@ -214,6 +243,7 @@ DECLARE
   v_error_capturado BOOLEAN := false;
 BEGIN
   PERFORM set_config('app.test_es_dueno', 'true', true);
+  DELETE FROM operaciones_pagos WHERE idempotency_key = 't4-cross-cuenta';
   DELETE FROM pagos WHERE idempotency_key = 't4-cross-cuenta';
 
   PERFORM insertar_pagos_lote('aaaaaaaa-0000-0000-0000-000000000001'::UUID,
@@ -243,6 +273,7 @@ DECLARE
   v_cnt INT;
 BEGIN
   PERFORM set_config('app.test_es_dueno', 'true', true);
+  DELETE FROM operaciones_pagos WHERE idempotency_key IN ('t5-conc-a', 't5-conc-b');
   DELETE FROM pagos WHERE idempotency_key IN ('t5-conc-a', 't5-conc-b');
 
   -- Sesión 1: inserta con t5-conc-a
@@ -446,6 +477,7 @@ DECLARE
   v_error_capturado   BOOLEAN := false;
 BEGIN
   PERFORM set_config('app.test_es_dueno', 'true', true);
+  DELETE FROM operaciones_pagos WHERE idempotency_key IN ('t12-valido', 't12-invalido');
   DELETE FROM pagos WHERE idempotency_key IN ('t12-valido', 't12-invalido');
 
   BEGIN
@@ -481,6 +513,7 @@ DECLARE
   v_sqlstate        TEXT;
 BEGIN
   PERFORM set_config('app.test_es_dueno', 'true', true);
+  DELETE FROM operaciones_pagos WHERE idempotency_key = 't13-contenido';
   DELETE FROM pagos WHERE idempotency_key = 't13-contenido';
 
   -- Inserción original: monto = 10000
@@ -535,6 +568,7 @@ BEGIN
   PERFORM set_config('app.test_es_dueno', 'false', true);
   PERFORM set_config('app.test_user_id', '00000000-0000-0000-0000-000000000002', true);
 
+  DELETE FROM operaciones_pagos WHERE idempotency_key IN ('t15-curso1', 't15-curso2');
   DELETE FROM pagos WHERE idempotency_key IN ('t15-curso1', 't15-curso2');
 
   -- PERMITIDO: pago en cuota-test-1 (pertenece a curso-test-1)
@@ -566,6 +600,174 @@ BEGIN
 END;
 $$;
 
+-- ════════════════════════════════════════════════════════════
+-- PRUEBA 16: Autorización — admin acotado a curso-test-1
+--            NO puede registrar en curso-test-2 (ÍTEM 1)
+--            Solo es_dueno() tiene bypass total; rol 'admin'
+--            con curso_id IS NOT NULL queda acotado como tesorero.
+-- ════════════════════════════════════════════════════════════
+\echo 'PRUEBA 16: Admin acotado a curso-test-1 no puede en curso-test-2 (ítem 1)'
+DO $$
+DECLARE
+  v_error_capturado BOOLEAN := false;
+  v_cnt             INT;
+BEGIN
+  -- Cambiar a admin acotado (uid=…0003, solo curso-test-1)
+  PERFORM set_config('app.test_es_dueno', 'false', true);
+  PERFORM set_config('app.test_user_id', '00000000-0000-0000-0000-000000000003', true);
+
+  DELETE FROM operaciones_pagos WHERE idempotency_key IN ('t16-admin-c1', 't16-admin-c2');
+  DELETE FROM pagos WHERE idempotency_key IN ('t16-admin-c1', 't16-admin-c2');
+
+  -- PERMITIDO: pago en cuota-test-1 (pertenece a curso-test-1 — su alcance)
+  PERFORM insertar_pagos_lote('aaaaaaaa-0000-0000-0000-000000000001'::UUID,
+    '[{"alumno_id":"alu-test-1","cuota_id":"cuota-test-1","monto":5000,"fecha":"2025-01-20","medio":"efectivo","periodo":"Enero 2025","idempotency_key":"t16-admin-c1"}]'::JSONB);
+
+  SELECT COUNT(*) INTO v_cnt FROM pagos WHERE idempotency_key = 't16-admin-c1';
+  IF v_cnt != 1 THEN
+    RAISE EXCEPTION 'FAIL: Prueba 16a — admin acotado debería poder pagar en su propio curso';
+  END IF;
+
+  -- DENEGADO: pago en cuota-test-2 (pertenece a curso-test-2, fuera del alcance del admin)
+  BEGIN
+    PERFORM insertar_pagos_lote('aaaaaaaa-0000-0000-0000-000000000001'::UUID,
+      '[{"alumno_id":"alu-test-2","cuota_id":"cuota-test-2","monto":5000,"fecha":"2025-01-20","medio":"efectivo","periodo":"Enero 2025","idempotency_key":"t16-admin-c2"}]'::JSONB);
+  EXCEPTION WHEN OTHERS THEN
+    v_error_capturado := true;
+  END;
+
+  -- Restaurar a dueño
+  PERFORM set_config('app.test_es_dueno', 'true', true);
+  PERFORM set_config('app.test_user_id', '00000000-0000-0000-0000-000000000001', true);
+
+  IF NOT v_error_capturado THEN
+    RAISE EXCEPTION
+      'FAIL: Prueba 16 — admin acotado a curso-test-1 pudo registrar en curso-test-2 '
+      '(el rol admin con curso_id IS NOT NULL debe respetar el alcance; solo es_dueno() tiene bypass)';
+  END IF;
+  RAISE NOTICE 'PASS: Prueba 16 — admin acotado: OK en curso-test-1, rechazado en curso-test-2';
+END;
+$$;
+
+-- ════════════════════════════════════════════════════════════
+-- PRUEBA 17: Reintento no recrea pago eliminado (ÍTEM 2)
+--            La operación queda en operaciones_pagos incluso
+--            cuando el pago se elimina. Un reintento posterior
+--            con la misma clave debe ser rechazado, no reinsertar.
+-- ════════════════════════════════════════════════════════════
+\echo 'PRUEBA 17: Reintento con misma clave no recrea pago eliminado (ítem 2)'
+DO $$
+DECLARE
+  v_error_capturado BOOLEAN := false;
+  v_cnt_pagos       INT;
+  v_cnt_ops         INT;
+  v_pago_id         TEXT;
+  v_res             JSONB;
+BEGIN
+  PERFORM set_config('app.test_es_dueno', 'true', true);
+  PERFORM set_config('app.test_user_id', '00000000-0000-0000-0000-000000000001', true);
+
+  DELETE FROM operaciones_pagos WHERE idempotency_key = 't17-eliminado';
+  DELETE FROM pagos WHERE idempotency_key = 't17-eliminado';
+
+  -- Paso 1: Insertar pago original
+  v_res := insertar_pagos_lote('aaaaaaaa-0000-0000-0000-000000000001'::UUID,
+    '[{"alumno_id":"alu-test-1","cuota_id":"cuota-test-1","monto":5000,"fecha":"2025-02-01","medio":"efectivo","periodo":"Febrero 2025","idempotency_key":"t17-eliminado"}]'::JSONB);
+  v_pago_id := (v_res->0)->>'id';
+
+  SELECT COUNT(*) INTO v_cnt_ops FROM operaciones_pagos WHERE idempotency_key = 't17-eliminado';
+  IF v_cnt_ops != 1 THEN
+    RAISE EXCEPTION 'FAIL: Prueba 17 — operaciones_pagos debería tener 1 registro tras inserción (tiene %)', v_cnt_ops;
+  END IF;
+
+  -- Paso 2: Eliminar el pago (simula eliminación legítima por operador)
+  DELETE FROM pagos WHERE id = v_pago_id;
+
+  SELECT COUNT(*) INTO v_cnt_pagos FROM pagos WHERE idempotency_key = 't17-eliminado';
+  IF v_cnt_pagos != 0 THEN
+    RAISE EXCEPTION 'FAIL: Prueba 17 — el pago debería haberse eliminado (quedan %)', v_cnt_pagos;
+  END IF;
+
+  -- El registro de operación debe seguir existiendo (identidad durable)
+  SELECT COUNT(*) INTO v_cnt_ops FROM operaciones_pagos WHERE idempotency_key = 't17-eliminado';
+  IF v_cnt_ops != 1 THEN
+    RAISE EXCEPTION 'FAIL: Prueba 17 — operaciones_pagos debe sobrevivir a la eliminación del pago (tiene %)', v_cnt_ops;
+  END IF;
+
+  -- Paso 3: Reintento con la misma clave — DEBE SER RECHAZADO
+  BEGIN
+    PERFORM insertar_pagos_lote('aaaaaaaa-0000-0000-0000-000000000001'::UUID,
+      '[{"alumno_id":"alu-test-1","cuota_id":"cuota-test-1","monto":5000,"fecha":"2025-02-01","medio":"efectivo","periodo":"Febrero 2025","idempotency_key":"t17-eliminado"}]'::JSONB);
+  EXCEPTION WHEN OTHERS THEN
+    v_error_capturado := true;
+  END;
+
+  -- El pago NO debe haber sido recreado
+  SELECT COUNT(*) INTO v_cnt_pagos FROM pagos WHERE idempotency_key = 't17-eliminado';
+
+  IF NOT v_error_capturado THEN
+    RAISE EXCEPTION
+      'FAIL: Prueba 17 — reintento con misma clave NO fue rechazado; '
+      'el pago eliminado fue recreado (viola ítem 2: identidad durable)';
+  END IF;
+  IF v_cnt_pagos != 0 THEN
+    RAISE EXCEPTION
+      'FAIL: Prueba 17 — se creó % pago(s) a pesar del error (el error fue superficial)', v_cnt_pagos;
+  END IF;
+
+  RAISE NOTICE 'PASS: Prueba 17 — pago eliminado + reintento rechazado; operaciones_pagos preservado';
+END;
+$$;
+
+-- ════════════════════════════════════════════════════════════
+-- PRUEBA 18: Identidad de autor — otra sesión con la misma
+--            clave es rechazada aunque el contenido sea igual
+--            (ÍTEM 1 + ÍTEM 3: identidad autorizada del autor)
+-- ════════════════════════════════════════════════════════════
+\echo 'PRUEBA 18: Reintento de otra sesión/usuario con la misma clave es rechazado (ítem 1+3)'
+DO $$
+DECLARE
+  v_error_capturado BOOLEAN := false;
+BEGIN
+  -- Sesión A (uid=…0001): inserta el pago original
+  PERFORM set_config('app.test_es_dueno', 'true', true);
+  PERFORM set_config('app.test_user_id', '00000000-0000-0000-0000-000000000001', true);
+
+  DELETE FROM operaciones_pagos WHERE idempotency_key = 't18-autor';
+  DELETE FROM pagos WHERE idempotency_key = 't18-autor';
+
+  PERFORM insertar_pagos_lote('aaaaaaaa-0000-0000-0000-000000000001'::UUID,
+    '[{"alumno_id":"alu-test-1","cuota_id":"cuota-test-1","monto":5000,"fecha":"2025-03-10","medio":"efectivo","periodo":"Marzo 2025","idempotency_key":"t18-autor"}]'::JSONB);
+
+  -- Sesión B (uid=…0001 → tesorero global, mismo contenido, misma clave)
+  -- Este sería el caso de un tesorero diferente que reutiliza la clave.
+  -- uid=…0002 es el tesorero acotado a curso-test-1 — puede ver ese curso.
+  PERFORM set_config('app.test_es_dueno', 'false', true);
+  PERFORM set_config('app.test_user_id', '00000000-0000-0000-0000-000000000002', true);
+
+  BEGIN
+    PERFORM insertar_pagos_lote('aaaaaaaa-0000-0000-0000-000000000001'::UUID,
+      '[{"alumno_id":"alu-test-1","cuota_id":"cuota-test-1","monto":5000,"fecha":"2025-03-10","medio":"efectivo","periodo":"Marzo 2025","idempotency_key":"t18-autor"}]'::JSONB);
+  EXCEPTION WHEN OTHERS THEN
+    v_error_capturado := true;
+  END;
+
+  -- Restaurar a dueño
+  PERFORM set_config('app.test_es_dueno', 'true', true);
+  PERFORM set_config('app.test_user_id', '00000000-0000-0000-0000-000000000001', true);
+
+  IF NOT v_error_capturado THEN
+    RAISE EXCEPTION
+      'FAIL: Prueba 18 — sesión con distinto auth_id pudo reutilizar la clave de otra sesión '
+      '(la clave de idempotencia es personal; la identidad de autor debe verificarse)';
+  END IF;
+  RAISE NOTICE 'PASS: Prueba 18 — reintento de otra sesión/usuario rechazado (identidad de autor)';
+END;
+$$;
+
 \echo ''
-\echo '=== SUITE COMPLETADA: 15/15 PASS ==='
-\echo 'Las concurrencia real (Test 5) se verifica con run_tests.sh'
+\echo '=== SUITE COMPLETADA: 18/18 PASS ==='
+\echo 'Concurrencia real (Test 5) se verifica en run_tests.sh'
+\echo ''
+\echo 'EJECUTADO: T1–T18 en este archivo (esquema real, ON_ERROR_STOP=1)'
+\echo 'EJECUTADO (separado): run_tests.sh — T5 real con 2 conexiones psql paralelas'

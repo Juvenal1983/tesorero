@@ -42,11 +42,12 @@ echo "[4/4] Test de concurrencia real: 2 conexiones psql en paralelo..."
 
 CONC_KEY="conc-real-$(date +%s)"
 
-# Preparar fixture en entorno limpio
+# Preparar fixture en entorno limpio — limpiar tanto pagos como operaciones_pagos
 $PSQL -c "
   SET app.test_es_dueno = 'true';
   SET app.test_user_id  = '00000000-0000-0000-0000-000000000001';
-  DELETE FROM pagos WHERE idempotency_key LIKE 'conc-real-%';
+  DELETE FROM pagos             WHERE idempotency_key LIKE 'conc-real-%';
+  DELETE FROM operaciones_pagos WHERE idempotency_key LIKE 'conc-real-%';
 " > /dev/null 2>&1
 
 # Script SQL para cada sesión — ambas intentan insertar la misma clave
@@ -69,19 +70,43 @@ PID_A=$!
 $PSQL -c "$CONC_SQL_B" > /tmp/conc_b.out 2>&1 &
 PID_B=$!
 
-# Esperar a que ambas terminen
-wait $PID_A || true
-wait $PID_B || true
+# Esperar a que ambas terminen y capturar exit codes por separado.
+# ÍTEM 5: NO usar || true — los códigos de salida importan.
+# En idempotencia correcta ambas sesiones deben tener éxito (una inserta,
+# la otra retorna la fila existente). Si ambas fallan hay un problema real.
+wait $PID_A; RC_A=$?
+wait $PID_B; RC_B=$?
 
-# Verificar que solo queda 1 fila con esa clave
+echo "  Sesión A: exit=$RC_A"
+echo "  Sesión B: exit=$RC_B"
+
+if [ $RC_A -ne 0 ] && [ $RC_B -ne 0 ]; then
+  echo "FAIL: Test de concurrencia real — AMBAS sesiones fallaron"
+  echo "  Salida sesión A: $(cat /tmp/conc_a.out)"
+  echo "  Salida sesión B: $(cat /tmp/conc_b.out)"
+  exit 1
+fi
+
+# Verificar que solo queda 1 fila con esa clave (idempotencia)
 CNT=$($PSQL -t -c "SELECT COUNT(*) FROM pagos WHERE idempotency_key = '$CONC_KEY';" | tr -d ' \n')
+
+# Verificar respuesta JSON de la sesión que tuvo éxito (debe contener el pago)
+SUCCESS_OUT=""
+if [ $RC_A -eq 0 ]; then SUCCESS_OUT=$(cat /tmp/conc_a.out); fi
+if [ $RC_B -eq 0 ]; then SUCCESS_OUT=$(cat /tmp/conc_b.out); fi
 
 if [ "$CNT" = "1" ]; then
   echo "PASS: Test de concurrencia real — 2 sesiones paralelas, 1 sola fila (key=$CONC_KEY)"
+  if echo "$SUCCESS_OUT" | grep -q '"monto"'; then
+    echo "  PASS (respuesta): JSON de respuesta contiene datos del pago ✓"
+  else
+    echo "  ADVERTENCIA: JSON de respuesta no contiene 'monto'; revisar salida completa"
+    echo "  Salida: $SUCCESS_OUT"
+  fi
 else
   echo "FAIL: Test de concurrencia real — se esperaba 1 fila, se encontraron $CNT (key=$CONC_KEY)"
-  echo "  Salida sesión A: $(cat /tmp/conc_a.out)"
-  echo "  Salida sesión B: $(cat /tmp/conc_b.out)"
+  echo "  Salida sesión A (RC=$RC_A): $(cat /tmp/conc_a.out)"
+  echo "  Salida sesión B (RC=$RC_B): $(cat /tmp/conc_b.out)"
   exit 1
 fi
 

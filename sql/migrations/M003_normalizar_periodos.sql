@@ -31,7 +31,10 @@
 --      AND a.pago_id     = p.id
 --      AND a.cuenta_id   = p.cuenta_id   -- delimitar por cuenta (evita IDs repetidos legacy)
 --      AND a.estado      = 'actualizado'
---      AND a.migrado_en  >= '<timestamp_ejecucion>';  -- delimitar por ejecución si se ejecutó varias veces
+--      AND p.periodo     = a.periodo_nuevo   -- PROTECCIÓN HISTÓRICA: solo revertir si el
+--                                            --   período actual sigue siendo el valor migrado.
+--                                            --   Si fue modificado después de M003, NO revertir.
+--      AND a.migrado_en  >= '<timestamp_ejecucion>';  -- delimitar por ejecución específica
 --
 --   -- Revertir solo planes_pago:
 --   UPDATE planes_pago pp
@@ -41,12 +44,17 @@
 --      AND a.pago_id     = pp.id
 --      AND a.cuenta_id   = pp.cuenta_id
 --      AND a.estado      = 'actualizado'
+--      AND pp.periodo    = a.periodo_nuevo   -- PROTECCIÓN HISTÓRICA: ídem para planes_pago
 --      AND a.migrado_en  >= '<timestamp_ejecucion>';
 --
---   ADVERTENCIA: si después de M003 se agregaron registros con el formato nuevo
---   (Mes AAAA), la reversión crearía inconsistencia. Revisar antes de revertir.
+--   ADVERTENCIA: el filtro AND p.periodo = a.periodo_nuevo es OBLIGATORIO.
+--   Sin él, si un período fue modificado después de M003 (por corrección manual
+--   u otro proceso), la reversión lo sobrescribiría con el valor anterior a M003,
+--   ignorando los cambios posteriores y creando inconsistencia silenciosa.
 --   El filtro por cuenta_id es OBLIGATORIO para evitar afectar IDs de otra cuenta
 --   que coincidan por reutilización histórica de identificadores.
+--   El filtro por migrado_en delimita la ejecución: si M003 se ejecutó varias
+--   veces (p.ej. en staging de pruebas), cada ejecución queda aislada.
 --
 -- Pre-condición: ejecutar SOLO en staging (rucgmytyxpfowznowxwd).
 -- NUNCA ejecutar en producción (tmjqzaakzhecbldebyeg).
@@ -237,13 +245,15 @@ BEGIN
     RAISE WARNING '  → Consultar _auditoria_periodos_m003 WHERE estado=''ambiguo'' para lista completa.';
   END IF;
 
-  RAISE NOTICE '-- REVERSIÓN SEGURA (siempre delimitar por cuenta Y entity_type):';
+  RAISE NOTICE '-- REVERSIÓN SEGURA (siempre delimitar por cuenta, entity_type Y ejecución):';
   RAISE NOTICE '-- UPDATE pagos p SET periodo = a.periodo_original';
   RAISE NOTICE '--   FROM _auditoria_periodos_m003 a';
   RAISE NOTICE '--   WHERE a.entity_type = ''pago''';
-  RAISE NOTICE '--     AND a.pago_id = p.id';
-  RAISE NOTICE '--     AND a.cuenta_id = p.cuenta_id';
-  RAISE NOTICE '--     AND a.estado = ''actualizado'';';
+  RAISE NOTICE '--     AND a.pago_id     = p.id';
+  RAISE NOTICE '--     AND a.cuenta_id   = p.cuenta_id';
+  RAISE NOTICE '--     AND a.estado      = ''actualizado''';
+  RAISE NOTICE '--     AND p.periodo     = a.periodo_nuevo   -- CRÍTICO: protege cambios post-M003';
+  RAISE NOTICE '--     AND a.migrado_en >= ''<timestamp_ejecucion>'';  -- delimita ejecución';
 END;
 $$;
 
