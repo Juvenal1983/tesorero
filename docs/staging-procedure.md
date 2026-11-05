@@ -3,9 +3,12 @@
 **Staging Supabase:** `rucgmytyxpfowznowxwd.supabase.co`  
 **Producción:** `tmjqzaakzhecbldebyeg.supabase.co` — **NUNCA TOCAR**
 
+> **Regla permanente:** Ninguna migración sobre producción ni activación de la versión nueva
+> hasta revisión y aprobación explícita del operador.
+
 ---
 
-## Estado actual conocido de Staging (consulta de solo lectura)
+## Estado de referencia en Staging
 
 Según la consulta de auditoría previa, staging contiene:
 
@@ -16,45 +19,85 @@ Según la consulta de auditoría previa, staging contiene:
 | pagos | 3 |
 
 Estos datos **deben conservarse intactos** al final del procedimiento.
+El conteo previo es el punto de comparación "antes".
 
 ---
 
 ## Precondiciones obligatorias
 
-1. **Acceso a Supabase Studio** de staging con rol `service_role` o `postgres`.
-   - URL: `https://app.supabase.com/project/rucgmytyxpfowznowxwd`
-   - Acceso: SQL Editor → "SQL Editor" (esquina superior).
+### 1. Acceso a Supabase Studio de staging
 
-2. **Ninguna migración pendiente sobre producción.** Solo staging para este hito.
+- URL: `https://app.supabase.com/project/rucgmytyxpfowznowxwd`
+- Usar: **SQL Editor** (menú lateral izquierdo → "SQL Editor").
+- Rol requerido: `service_role` o `postgres` (disponible en SQL Editor de Supabase Studio).
 
-3. **Backup previo a staging** (Supabase Studio → Database → Backups → Download).
-   - Hacer un backup on-demand antes de cualquier cambio.
+### 2. Backup previo (plan gratuito de Supabase)
 
-4. **Variable de control:** antes de ejecutar cualquier archivo, correr el diagnóstico:
-   ```sql
-   SELECT 'cuentas' AS tabla, COUNT(*) FROM tesorero_cuentas
-   UNION ALL SELECT 'cursos', COUNT(*) FROM cursos
-   UNION ALL SELECT 'pagos',  COUNT(*) FROM pagos;
-   ```
-   Resultado esperado: 2 cuentas · 3 cursos · 3 pagos. Si no coincide, detener y verificar.
+El plan gratuito de Supabase **no ofrece backups on-demand desde la interfaz**.
+Las alternativas disponibles son:
 
-5. **Revisar que las migraciones previas NO están aplicadas** (para no re-ejecutar):
-   ```sql
-   -- M001: comprobar que el índice de idempotencia existe
-   SELECT indexname FROM pg_indexes
-    WHERE tablename='pagos' AND indexname='pagos_idempotency_key_unico';
-   -- M002: comprobar NOT NULL en eximido
-   SELECT is_nullable FROM information_schema.columns
-    WHERE table_name='alumnos' AND column_name='eximido';
-   -- M004: comprobar tabla operaciones_pagos
-   SELECT to_regclass('public.operaciones_pagos');
-   ```
+**Opción A — pg_dump por CLI** (requiere `psql` y `pg_dump` instalados localmente):
+```bash
+# Obtener la connection string en: Project Settings → Database → Connection string (URI)
+pg_dump "postgresql://postgres:<password>@db.rucgmytyxpfowznowxwd.supabase.co:5432/postgres" \
+  --no-password \
+  --clean \
+  --if-exists \
+  --format=plain \
+  --no-owner \
+  > staging_backup_$(date +%Y%m%d_%H%M%S).sql
+```
+
+**Opción B — Exportar tablas clave como CSV desde SQL Editor**
+(ejecutar en SQL Editor; copiar resultado y guardarlo localmente):
+```sql
+-- Exportar una tabla a la vez usando el botón "Export CSV" del SQL Editor
+SELECT * FROM pagos ORDER BY id;
+SELECT * FROM alumnos ORDER BY id;
+SELECT * FROM tesorero_cuentas ORDER BY id;
+SELECT * FROM cursos ORDER BY id;
+```
+En el SQL Editor de Supabase Studio hay un botón **"Export CSV"** sobre los resultados.
+Descargar y guardar cada tabla antes de continuar.
+
+### 3. Conteo de referencia "ANTES"
+
+Ejecutar en SQL Editor y registrar los resultados:
+```sql
+-- ═══ CONTEO ANTES — guardar este resultado ═══
+SELECT 'tesorero_cuentas' AS tabla, COUNT(*) AS n FROM tesorero_cuentas
+UNION ALL SELECT 'cursos',              COUNT(*) FROM cursos
+UNION ALL SELECT 'alumnos',             COUNT(*) FROM alumnos
+UNION ALL SELECT 'cuotas',              COUNT(*) FROM cuotas
+UNION ALL SELECT 'pagos',               COUNT(*) FROM pagos
+UNION ALL SELECT 'operaciones_pagos',   COUNT(*) FROM operaciones_pagos
+ORDER BY tabla;
+-- Si operaciones_pagos no existe aún, omitir esa línea o envolver en DO $$.
+```
+
+Resultado esperado base: cuentas=2 · cursos=3 · pagos=3.
+Si no coincide, detener y verificar antes de continuar.
+
+### 4. Revisar migraciones ya aplicadas
+
+```sql
+-- M001: comprobar índice de idempotencia
+SELECT indexname FROM pg_indexes
+ WHERE tablename='pagos' AND indexname='pagos_idempotency_key_unico';
+
+-- M002: comprobar NOT NULL en eximido
+SELECT is_nullable FROM information_schema.columns
+ WHERE table_name='alumnos' AND column_name='eximido';
+
+-- M004: comprobar tabla operaciones_pagos
+SELECT to_regclass('public.operaciones_pagos');
+```
 
 ---
 
 ## Orden de ejecución
 
-Ejecutar en este orden exacto, **uno a la vez**, verificando el resultado de cada paso antes de continuar.
+Ejecutar en este orden exacto, **uno a la vez**, verificando el resultado antes de continuar.
 
 ### Paso 1 — M001: Idempotency key en pagos
 
@@ -62,14 +105,14 @@ Ejecutar en este orden exacto, **uno a la vez**, verificando el resultado de cad
 
 **Qué hace:** Agrega la columna `pagos.idempotency_key TEXT` y un índice parcial UNIQUE donde no es NULL.
 
-**Precondición:** `pagos.idempotency_key` no existe todavía.
-
+**Verificar antes:**
 ```sql
--- Verificar antes:
 SELECT column_name FROM information_schema.columns
  WHERE table_name='pagos' AND column_name='idempotency_key';
--- Si ya existe → omitir paso 1 (M001 tiene IF NOT EXISTS; re-ejecutar es seguro pero innecesario)
+-- Vacío → no existe, procede. Una fila → ya aplicada, omitir.
 ```
+
+**Ejecutar:** copiar y pegar el contenido completo de `sql/migrations/M001_idempotency_key.sql` en SQL Editor.
 
 **Resultado esperado:**
 ```
@@ -80,7 +123,11 @@ NOTICE: M001 verificada: idempotency_key ✓, índice nuevo ✓, índice viejo e
 ```sql
 SELECT column_name, data_type FROM information_schema.columns
  WHERE table_name='pagos' AND column_name='idempotency_key';
--- Debe retornar: pagos | idempotency_key | text
+-- Debe retornar: idempotency_key | text
+
+SELECT indexname FROM pg_indexes
+ WHERE tablename='pagos' AND indexname='pagos_idempotency_key_unico';
+-- Debe retornar: pagos_idempotency_key_unico
 ```
 
 ---
@@ -91,14 +138,14 @@ SELECT column_name, data_type FROM information_schema.columns
 
 **Qué hace:** Convierte `alumnos.eximido` NULL→false, luego agrega NOT NULL con DEFAULT false.
 
-**Precondición:** Tabla `alumnos` debe existir.
-
+**Verificar antes:**
 ```sql
--- Verificar antes:
 SELECT is_nullable FROM information_schema.columns
  WHERE table_name='alumnos' AND column_name='eximido';
--- 'YES' → procede; 'NO' → ya aplicada, omitir
+-- 'YES' → procede; 'NO' → ya aplicada, omitir.
 ```
+
+**Ejecutar:** copiar y pegar el contenido completo de `sql/migrations/M002_eximido_normalize.sql`.
 
 **Resultado esperado:**
 ```
@@ -121,22 +168,25 @@ SELECT is_nullable, column_default FROM information_schema.columns
 
 **Qué hace:** Crea la tabla `operaciones_pagos(cuenta_id, idempotency_key)` con `auth_id` y los 7 campos de identidad de contenido. También crea `pago_id` como referencia débil (sin FK) para permitir que el pago se elimine sin perder el slot.
 
-**Precondición:** `tesorero_cuentas` debe existir. `auth.uid()` debe estar disponible (función de Supabase Auth).
-
+**Verificar antes:**
 ```sql
--- Verificar antes:
 SELECT to_regclass('public.operaciones_pagos');
--- NULL → no existe, procede; otro valor → ya aplicada, omitir
+-- NULL → no existe, procede; otro valor → ya aplicada, omitir.
 ```
+
+**Ejecutar:** copiar y pegar el contenido completo de `sql/migrations/M004_operaciones_idempotentes.sql`.
 
 **Resultado esperado:**
 ```
 NOTICE: M004 verificada: operaciones_pagos creada con identidad de autor ✓
 ```
 
-**Verificación post:**
+**Verificación post — estructura de la tabla (compatible SQL Editor):**
 ```sql
-\d operaciones_pagos
+SELECT column_name, data_type, is_nullable
+  FROM information_schema.columns
+ WHERE table_name = 'operaciones_pagos'
+ ORDER BY ordinal_position;
 -- Debe mostrar: cuenta_id, idempotency_key, auth_id, alumno_id, cuota_id,
 --              monto, periodo, fecha, medio, estado, pago_id, creado_en
 ```
@@ -151,7 +201,7 @@ NOTICE: M004 verificada: operaciones_pagos creada con identidad de autor ✓
 - Existen pagos con `periodo` en formato "Mes" (sin año).
 - El usuario aprueba expresamente.
 
-**Diagnóstico previo** (ejecutar antes, no hace cambios):
+**Diagnóstico previo** (solo lectura, no hace cambios):
 ```sql
 -- Contar pagos con período en formato antiguo (solo mes, sin año):
 SELECT periodo, COUNT(*) 
@@ -160,18 +210,19 @@ SELECT periodo, COUNT(*)
                    'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre')
  GROUP BY periodo
  ORDER BY periodo;
+-- Vacío → no hay nada que normalizar, omitir M003.
 ```
-- Si el resultado está vacío → **no hay nada que normalizar**, omitir M003.
-- Si hay filas → verificar que las cuotas asociadas tienen `anio` NOT NULL:
-  ```sql
-  SELECT p.alumno_id, p.cuota_id, p.periodo, cu.anio
-    FROM pagos p
-    LEFT JOIN cuotas cu ON cu.cuenta_id=p.cuenta_id AND cu.id=p.cuota_id
-   WHERE p.periodo IN ('Enero','Febrero','Marzo','Abril','Mayo','Junio',
-                       'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre')
-   ORDER BY cu.anio NULLS LAST;
-  ```
-  - Filas con `cu.anio IS NULL` → quedarán marcadas como 'ambiguo' en la auditoría, **no se tocarán**.
+
+Si hay filas, verificar que las cuotas asociadas tienen `anio` NOT NULL:
+```sql
+SELECT p.alumno_id, p.cuota_id, p.periodo, cu.anio
+  FROM pagos p
+  LEFT JOIN cuotas cu ON cu.cuenta_id=p.cuenta_id AND cu.id=p.cuota_id
+ WHERE p.periodo IN ('Enero','Febrero','Marzo','Abril','Mayo','Junio',
+                     'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre')
+ ORDER BY cu.anio NULLS LAST;
+-- Filas con cu.anio IS NULL → quedarán marcadas como 'ambiguo'; no se tocarán.
+```
 
 **Resultado esperado (si se ejecuta):**
 ```
@@ -188,11 +239,11 @@ SELECT estado, COUNT(*) FROM _auditoria_periodos_m003 GROUP BY estado;
 -- ambiguo:     N (mes sin año de cuota — no tocados)
 ```
 
-**Reversión de M003** (si se detecta problema después de ejecutar):
+**Reversión de M003:**
 ```sql
 -- Capturar el timestamp de esta ejecución primero:
 SELECT MIN(migrado_en) FROM _auditoria_periodos_m003;
--- Reemplazar <ts> con ese valor
+-- Reemplazar <ts> con ese valor en la query de reversión:
 
 UPDATE pagos p
    SET periodo = a.periodo_original
@@ -217,19 +268,13 @@ UPDATE pagos p
 - Verificación de identidad de autor y contenido
 - GRANT EXECUTE a `authenticated`
 
-**Precondición:** M001 y M004 ya aplicadas (la función las referencia).
-
+**Verificar que las dependencias existen:**
 ```sql
--- Verificar que las dependencias existen:
 SELECT to_regclass('public.operaciones_pagos');  -- no NULL
 SELECT indexname FROM pg_indexes WHERE indexname='pagos_idempotency_key_unico';
 ```
 
-**Ejecutar:**
-```sql
--- Copiar y pegar el contenido de sql/11_insertar_pagos_lote.sql completo
--- (incluye BEGIN...COMMIT)
-```
+**Ejecutar:** copiar y pegar el contenido completo de `sql/11_insertar_pagos_lote.sql`.
 
 **Verificación post:**
 ```sql
@@ -248,68 +293,221 @@ SELECT insertar_pagos_lote(
 
 ---
 
+## Pruebas con JWT real
+
+> **Por qué es necesario:** `insertar_pagos_lote` verifica `auth.uid()` contra `operaciones_pagos.auth_id`.
+> Sin un JWT real, la verificación de autor no se puede testear; cualquier llamada desde SQL Editor
+> con rol `service_role` omite RLS y el `auth.uid()` retorna NULL.
+
+### Obtener un JWT de usuario real desde el navegador
+
+1. Abrir la aplicación en staging: `https://[tu-staging-domain]`
+2. Iniciar sesión con una cuenta de prueba (no la de producción).
+3. Abrir DevTools → Application → Local Storage → buscar la clave `sb-rucgmytyxpfowznowxwd-auth-token`.
+4. Copiar el valor del campo `access_token` (empieza con `eyJ...`).
+
+Alternativamente desde la consola del navegador:
+```javascript
+const { data: { session } } = await window.supabase.auth.getSession();
+console.log(session.access_token);
+```
+
+### Llamar a la RPC con el JWT real (curl)
+
+```bash
+# Reemplazar <JWT> y <cuenta_id> con los valores reales:
+curl -sS "https://rucgmytyxpfowznowxwd.supabase.co/rest/v1/rpc/insertar_pagos_lote" \
+  -H "apikey: <anon-key>" \
+  -H "Authorization: Bearer <JWT>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "p_cuenta_id": "<cuenta_id>",
+    "p_pagos": [{
+      "alumno_id": "alu-stg-v9-test-01",
+      "cuota_id":  "<cuota_id_exclusiva_de_prueba>",
+      "monto":     1000,
+      "fecha":     "2026-11-05",
+      "medio":     "test",
+      "estado":    "pagado",
+      "periodo":   "Test V9 2026",
+      "idempotency_key": "stg-v9-test-<EXEC_ID>-01"
+    }]
+  }'
+# Reemplazar <EXEC_ID> con la fecha del día: ej. 20261105
+```
+
+**Qué verificar:**
+- Primera llamada → retorna array con el pago creado.
+- Segunda llamada con el mismo `idempotency_key` → retorna el mismo pago sin duplicar.
+- Verificar con:
+  ```sql
+  SELECT auth_id FROM operaciones_pagos
+   WHERE idempotency_key LIKE 'stg-v9-test-%';
+  -- auth_id debe coincidir con el UUID del usuario del JWT, no NULL.
+  ```
+
+---
+
 ## Fixtures aislados de prueba
 
-Usar **IDs en el rango `test-stg-*`** para evitar colisiones con los 2 cuentas, 3 cursos y 3 pagos existentes.
+### Identificadores exclusivos de prueba
+
+Usar estos identificadores, que **no colisionan** con los datos de staging existentes:
+
+| Campo | Valor |
+|-------|-------|
+| alumno_id | `alu-stg-v9-test-01` |
+| cuota_id | `cuo-stg-v9-test-01` (crear cuota exclusiva) |
+| idempotency_key prefix | `stg-v9-test-<EXEC_ID>-` donde `<EXEC_ID>` = fecha (`20261105`) |
+| período | `Test V9 2026` |
+
+El `<EXEC_ID>` delimita la limpieza: todo lo creado en esta ejecución lleva ese prefijo.
+
+### Crear fixtures
 
 ```sql
--- ── Cuenta de prueba para staging ────────────────────────────────────────────
--- NOTA: auth_id debe ser un UUID de un usuario real en staging, o bien
--- usar el auth_id de uno de los usuarios existentes para que es_dueno() pase.
--- Para el test de staging del flujo de pago, usar la cuenta existente del operador.
+-- ═══ CONTEO ANTES de insertar fixtures ═══
+SELECT 'alumnos' AS tabla, COUNT(*) FROM alumnos
+UNION ALL SELECT 'cuotas', COUNT(*) FROM cuotas
+UNION ALL SELECT 'pagos',  COUNT(*) FROM pagos
+UNION ALL SELECT 'operaciones_pagos', COUNT(*) FROM operaciones_pagos;
 
--- Verificar las cuentas existentes:
-SELECT id, nombre, auth_id FROM tesorero_cuentas;
--- Usar uno de esos IDs (ej: cuenta_id = <el id que muestra>) para los fixtures.
+-- ── Verificar cuenta_id disponible ────────────────────────────────────────────
+SELECT id, nombre FROM tesorero_cuentas;
+-- Elegir una cuenta existente; usar ese id en <CUENTA_ID> más abajo.
 
--- ── Alumno de prueba ─────────────────────────────────────────────────────────
+-- ── Alumno exclusivo de prueba ────────────────────────────────────────────────
 INSERT INTO alumnos (id, cuenta_id, curso_id, nombres, apellidos, eximido)
-SELECT 'alu-stg-test-001', id, 
-  (SELECT id FROM cursos WHERE cuenta_id=tc.id LIMIT 1),
-  'Test', 'Staging', false
-  FROM tesorero_cuentas tc
- WHERE tc.nombre = '<nombre de la cuenta que ya existe>';
+SELECT 'alu-stg-v9-test-01',
+       '<CUENTA_ID>',
+       (SELECT id FROM cursos WHERE cuenta_id='<CUENTA_ID>' LIMIT 1),
+       'Test', 'V9 Staging', false
+ WHERE NOT EXISTS (SELECT 1 FROM alumnos WHERE id='alu-stg-v9-test-01');
 
--- ── Pago de prueba vía RPC ───────────────────────────────────────────────────
--- (reemplazar <cuenta_id>, <cuota_id> con valores reales del staging)
+-- ── Cuota exclusiva de prueba ─────────────────────────────────────────────────
+INSERT INTO cuotas (id, cuenta_id, curso_id, nombre, tipo, monto, anio, activa)
+SELECT 'cuo-stg-v9-test-01',
+       '<CUENTA_ID>',
+       (SELECT id FROM cursos WHERE cuenta_id='<CUENTA_ID>' LIMIT 1),
+       'Cuota Test V9', 'extraordinaria', 1000, 2026, true
+ WHERE NOT EXISTS (SELECT 1 FROM cuotas WHERE id='cuo-stg-v9-test-01');
+```
+
+### Ejecutar prueba de idempotencia vía RPC
+
+```sql
+-- ── Primer intento (debe crear) ───────────────────────────────────────────────
+-- (Desde SQL Editor con service_role — sin validación auth_id)
+-- Para validación auth_id real, usar curl con JWT (ver sección anterior).
 SELECT insertar_pagos_lote(
-  '<cuenta_id>'::uuid,
+  '<CUENTA_ID>'::uuid,
   '[{
-    "alumno_id":"alu-stg-test-001",
-    "cuota_id":"<cuota_id_existente>",
-    "monto":100,
-    "fecha":"2026-11-04",
-    "medio":"test",
-    "estado":"pagado",
-    "periodo":"Test Staging",
-    "idempotency_key":"stg-test-001-unico"
+    "alumno_id":       "alu-stg-v9-test-01",
+    "cuota_id":        "cuo-stg-v9-test-01",
+    "monto":           1000,
+    "fecha":           "2026-11-05",
+    "medio":           "test",
+    "estado":          "pagado",
+    "periodo":         "Test V9 2026",
+    "idempotency_key": "stg-v9-test-20261105-01"
   }]'::jsonb
 );
 
--- ── Verificar idempotencia (reintento) ───────────────────────────────────────
--- Volver a ejecutar la misma llamada → debe retornar el mismo pago sin duplicar
--- Verificar:
-SELECT COUNT(*) FROM pagos WHERE idempotency_key='stg-test-001-unico';
--- Debe ser = 1
+-- ── Segundo intento con mismo idempotency_key (debe deduplicar) ───────────────
+SELECT insertar_pagos_lote(
+  '<CUENTA_ID>'::uuid,
+  '[{
+    "alumno_id":       "alu-stg-v9-test-01",
+    "cuota_id":        "cuo-stg-v9-test-01",
+    "monto":           1000,
+    "fecha":           "2026-11-05",
+    "medio":           "test",
+    "estado":          "pagado",
+    "periodo":         "Test V9 2026",
+    "idempotency_key": "stg-v9-test-20261105-01"
+  }]'::jsonb
+);
 
--- ── Limpiar fixtures de prueba ───────────────────────────────────────────────
-DELETE FROM operaciones_pagos WHERE idempotency_key='stg-test-001-unico';
-DELETE FROM pagos WHERE idempotency_key='stg-test-001-unico';
-DELETE FROM alumnos WHERE id='alu-stg-test-001';
+-- ── Verificar idempotencia ────────────────────────────────────────────────────
+SELECT COUNT(*) AS n_pagos FROM pagos
+ WHERE idempotency_key LIKE 'stg-v9-test-20261105-%';
+-- Debe ser = 1 (no duplicado)
+
+SELECT COUNT(*) AS n_ops FROM operaciones_pagos
+ WHERE idempotency_key LIKE 'stg-v9-test-20261105-%';
+-- Debe ser = 1 (el slot está ocupado — protección durable)
+```
+
+### Conteo DESPUÉS y comparación
+
+```sql
+-- ═══ CONTEO DESPUÉS de fixtures ═══
+SELECT 'alumnos' AS tabla, COUNT(*) FROM alumnos
+UNION ALL SELECT 'cuotas', COUNT(*) FROM cuotas
+UNION ALL SELECT 'pagos',  COUNT(*) FROM pagos
+UNION ALL SELECT 'operaciones_pagos', COUNT(*) FROM operaciones_pagos;
+
+-- Los deltas esperados vs el conteo ANTES:
+-- alumnos:            +1  (alu-stg-v9-test-01)
+-- cuotas:             +1  (cuo-stg-v9-test-01)
+-- pagos:              +1  (pago de prueba)
+-- operaciones_pagos:  +1  (slot de idempotencia)
+-- tesorero_cuentas:    0  (sin cambio)
+-- cursos:              0  (sin cambio)
+```
+
+### Limpiar fixtures de prueba
+
+> **IMPORTANTE:** La protección de idempotencia se basa en que el slot en `operaciones_pagos`
+> persiste aunque el pago sea eliminado. Limpiar `operaciones_pagos` **destruye esa protección**
+> y permitiría reinsertar el mismo `idempotency_key` en el futuro.
+>
+> En staging, limpiar el slot es aceptable porque los fixtures de prueba no deben persistir.
+> **En producción, nunca borrar filas de `operaciones_pagos`.**
+
+```sql
+-- ── Limpieza delimitada por cuenta_id + EXEC_ID ───────────────────────────────
+-- Reemplazar '<CUENTA_ID>' y el prefijo 'stg-v9-test-20261105' con los valores reales.
+
+-- 1. Eliminar pagos de prueba (referencia débil — no afecta a operaciones_pagos)
+DELETE FROM pagos
+ WHERE cuenta_id = '<CUENTA_ID>'
+   AND idempotency_key LIKE 'stg-v9-test-20261105-%';
+
+-- 2. Eliminar slot de idempotencia de prueba (staging únicamente)
+DELETE FROM operaciones_pagos
+ WHERE cuenta_id = '<CUENTA_ID>'
+   AND idempotency_key LIKE 'stg-v9-test-20261105-%';
+
+-- 3. Eliminar cuota exclusiva de prueba
+DELETE FROM cuotas
+ WHERE id = 'cuo-stg-v9-test-01'
+   AND cuenta_id = '<CUENTA_ID>';
+
+-- 4. Eliminar alumno exclusivo de prueba
+DELETE FROM alumnos
+ WHERE id = 'alu-stg-v9-test-01'
+   AND cuenta_id = '<CUENTA_ID>';
+
+-- ── Verificar que los datos originales se preservaron ─────────────────────────
+SELECT 'tesorero_cuentas' AS tabla, COUNT(*) FROM tesorero_cuentas
+UNION ALL SELECT 'cursos', COUNT(*) FROM cursos
+UNION ALL SELECT 'pagos',  COUNT(*) FROM pagos;
+-- Resultado esperado: cuentas=2 · cursos=3 · pagos=3  (igual que el conteo ANTES)
 ```
 
 ---
 
 ## Resultados esperados al finalizar
 
-Después de ejecutar M001 → M002 → M004 → RPC (y M003 si corresponde):
+Después de ejecutar M001 → M002 → M004 → RPC (y M003 si corresponde) y limpiar fixtures:
 
 ```sql
 -- Verificar que los datos originales se preservaron:
-SELECT 'cuentas' AS tabla, COUNT(*) FROM tesorero_cuentas
-UNION ALL SELECT 'cursos', COUNT(*) FROM cursos
-UNION ALL SELECT 'pagos',  COUNT(*) FROM pagos;
--- cuentas: 2, cursos: 3, pagos: 3  ← mismos que antes
+SELECT 'tesorero_cuentas' AS tabla, COUNT(*) FROM tesorero_cuentas
+UNION ALL SELECT 'cursos',              COUNT(*) FROM cursos
+UNION ALL SELECT 'pagos',               COUNT(*) FROM pagos;
+-- cuentas: 2  ·  cursos: 3  ·  pagos: 3  ← mismos que antes
 ```
 
 ```sql
@@ -333,15 +531,18 @@ SELECT to_regproc('public.insertar_pagos_lote(uuid, jsonb)');
 ## Recuperación si algo falla
 
 ### Si M001 falla (index creation error)
+
+Ver el mensaje de error en el panel inferior del SQL Editor y luego:
 ```sql
--- Ver qué índice existe actualmente:
+-- Ver qué índices existen en pagos:
 SELECT indexname, indexdef FROM pg_indexes WHERE tablename='pagos';
--- Si hay un índice duplicado o incorrecto, eliminarlo:
+-- Si hay un índice duplicado o incorrecto:
 DROP INDEX IF EXISTS idx_pagos_idempotency_key;
 -- Luego re-ejecutar M001.
 ```
 
 ### Si M002 falla (NOT NULL error)
+
 ```sql
 -- Ver si hay NULLs pendientes:
 SELECT COUNT(*) FROM alumnos WHERE eximido IS NULL;
@@ -351,6 +552,7 @@ UPDATE alumnos SET eximido = false WHERE eximido IS NULL;
 ```
 
 ### Si M004 falla (FK error o tabla ya existe)
+
 ```sql
 -- Si la tabla existe pero incompleta:
 DROP TABLE IF EXISTS operaciones_pagos;
@@ -360,17 +562,26 @@ DROP TABLE IF EXISTS operaciones_pagos;
 ```
 
 ### Si el RPC falla (function error)
+
+El SQL Editor muestra el detalle del error en el panel inferior. Leer el mensaje completo ahí.
+
+Los errores más comunes y su causa:
 ```sql
--- Ver el error exacto:
-\errverbose
--- Los errores más comunes:
---   "function es_dueno does not exist" → 01_schema.sql no fue cargado en staging
---   "function tiene_rol_en_curso does not exist" → mismo
---   "relation operaciones_pagos does not exist" → M004 no aplicado
--- Verificar las dependencias y re-ejecutar.
+-- Verificar dependencias:
+SELECT to_regclass('public.operaciones_pagos');
+-- NULL → M004 no fue aplicada → aplicar M004 primero.
+
+SELECT pg_get_function_identity_arguments(oid)
+  FROM pg_proc WHERE proname='es_dueno';
+-- Sin resultado → 01_schema.sql no fue cargado en staging → cargar el schema primero.
+
+SELECT pg_get_function_identity_arguments(oid)
+  FROM pg_proc WHERE proname='tiene_rol_en_curso';
+-- Sin resultado → mismo problema de schema.
 ```
 
 ### Si M003 produce resultados inesperados
+
 ```sql
 -- Ver auditoría:
 SELECT * FROM _auditoria_periodos_m003 ORDER BY migrado_en DESC LIMIT 20;
@@ -393,6 +604,7 @@ UPDATE pagos p
 ## Notas finales
 
 - **No ejecutar nada en producción** (`tmjqzaakzhecbldebyeg`) hasta revisión y aprobación explícita.
-- Cada paso debe ejecutarse individualmente, no en bloque, para poder identificar errores.
+- Cada paso debe ejecutarse individualmente en el SQL Editor, no en bloque, para poder identificar errores.
 - Los fixtures de prueba deben limpiarse antes de reportar resultados finales.
-- La RLS (Row Level Security) está activa en staging: los tests de fixtures deben usar el token del usuario real de staging, no el superusuario de Supabase.
+- La RLS (Row Level Security) está activa en staging: para testear la validación de `auth_id`, usar el JWT de un usuario real (ver sección "Pruebas con JWT real").
+- El SQL Editor de Supabase Studio ejecuta como `service_role` por defecto, lo que omite RLS y retorna `auth.uid() = NULL`. Esto es suficiente para verificar el esquema y la lógica transaccional, pero no reemplaza la prueba con JWT real para validar el aislamiento por usuario.
