@@ -487,18 +487,22 @@ async function screenshot(page, nombre) {
     // Hacer click en "Registrar y notificar →"
     await page.click('[onclick*="savePago"]');
 
-    // Esperar que el modal se cierre (input + overlay)
+    // Esperar que el formulario de pago se cierre (#p-monto desaparece)
+    // savePago puede abrir luego un modal de notificación → lo cerramos programáticamente
     try {
       await page.waitForFunction(
-        () => document.querySelector('#p-monto') === null &&
-              (!document.querySelector('#modal-ov') ||
-               getComputedStyle(document.querySelector('#modal-ov')).display === 'none'),
+        () => document.querySelector('#p-monto') === null,
         { timeout: TIMEOUT_LARGO }
       );
+      // Cerrar modal de notificación remanente (si existe)
+      await page.evaluate(() => { if (document.getElementById('modal-ov')) window.closeModal?.(); });
+      await page.waitForFunction(() => !document.getElementById('modal-ov'), { timeout: TIMEOUT_CORTO });
       ok('U07-b: modal cerrado tras guardar pago 1', true);
     } catch (_) {
       await screenshot(page, 'u07-modal-open');
       ok('U07-b: modal cerrado tras guardar pago 1', false);
+      // Intentar cerrar overlay para no bloquear pasos siguientes
+      await page.evaluate(() => { if (document.getElementById('modal-ov')) window.closeModal?.(); }).catch(() => {});
     }
 
     // Verificar en DB que el pago se guardó
@@ -522,15 +526,16 @@ async function screenshot(page, nombre) {
 
     try {
       await page.waitForFunction(
-        () => document.querySelector('#p-monto') === null &&
-              (!document.querySelector('#modal-ov') ||
-               getComputedStyle(document.querySelector('#modal-ov')).display === 'none'),
+        () => document.querySelector('#p-monto') === null,
         { timeout: TIMEOUT_LARGO }
       );
+      await page.evaluate(() => { if (document.getElementById('modal-ov')) window.closeModal?.(); });
+      await page.waitForFunction(() => !document.getElementById('modal-ov'), { timeout: TIMEOUT_CORTO });
       ok('U08-a: modal cerrado tras guardar pago 2', true);
     } catch (_) {
       await screenshot(page, 'u08-modal-open');
       ok('U08-a: modal cerrado tras guardar pago 2', false);
+      await page.evaluate(() => { if (document.getElementById('modal-ov')) window.closeModal?.(); }).catch(() => {});
     }
 
     const pagos8 = await _queryPagosTest(jwt);
@@ -592,15 +597,16 @@ async function screenshot(page, nombre) {
         await page.click('[onclick*="saveEditPago"]');
         try {
           await page.waitForFunction(
-            () => document.querySelector('#ep-medio') === null &&
-                  (!document.querySelector('#modal-ov') ||
-                   getComputedStyle(document.querySelector('#modal-ov')).display === 'none'),
+            () => document.querySelector('#ep-medio') === null,
             { timeout: TIMEOUT_LARGO }
           );
+          await page.evaluate(() => { if (document.getElementById('modal-ov')) window.closeModal?.(); });
+          await page.waitForFunction(() => !document.getElementById('modal-ov'), { timeout: TIMEOUT_CORTO });
           ok('U10-a: modal edición cerrado', true);
         } catch (_) {
           await screenshot(page, 'u10-modal-stuck');
           ok('U10-a: modal edición cerrado', false);
+          await page.evaluate(() => { if (document.getElementById('modal-ov')) window.closeModal?.(); }).catch(() => {});
         }
       } else {
         await screenshot(page, 'u10-noedit');
