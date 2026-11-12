@@ -352,8 +352,13 @@ async function screenshot(page, nombre) {
       window.STAGING_SUPA_KEY = key;
     }, { url: SUPA_URL, key: ANON_KEY });
 
-    await page.goto(`http://localhost:${APP_PORT}/`, { waitUntil: 'networkidle', timeout: TIMEOUT_LARGO });
-    await waitAppReady(page);
+    await page.goto(`http://localhost:${APP_PORT}/`, { waitUntil: 'load', timeout: TIMEOUT_LARGO });
+    try {
+      await waitAppReady(page);
+    } catch (_) {
+      await screenshot(page, 'u02-appready-fail');
+      throw new Error('window.S no definido tras cargar la app (ver screenshot u02-appready-fail)');
+    }
     const hasLoginForm = await page.locator('#l-email').count() > 0;
     ok('U02: formulario de login visible', hasLoginForm);
     if (!hasLoginForm) {
@@ -524,8 +529,13 @@ async function screenshot(page, nombre) {
 
     // ── U09: Recarga — verificar persistencia ─────────────────────────────────
     console.log('\n[U09] Recarga de página: verificar que los 2 pagos persisten');
-    await page.reload({ waitUntil: 'networkidle', timeout: TIMEOUT_LARGO });
-    await waitAppReady(page);
+    await page.reload({ waitUntil: 'load', timeout: TIMEOUT_LARGO });
+    try {
+      await waitAppReady(page);
+    } catch (_) {
+      await screenshot(page, 'u09-appready-fail');
+      throw new Error('window.S no definido tras recarga (ver screenshot u09-appready-fail)');
+    }
 
     // Tras recarga: sesión puede perderse si no había token cacheado.
     // Verificar en DB (REST) como fuente de verdad.
