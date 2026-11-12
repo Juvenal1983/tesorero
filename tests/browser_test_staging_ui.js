@@ -487,9 +487,14 @@ async function screenshot(page, nombre) {
     // Hacer click en "Registrar y notificar →"
     await page.click('[onclick*="savePago"]');
 
-    // Esperar que el modal se cierre
+    // Esperar que el modal se cierre (input + overlay)
     try {
-      await page.waitForFunction(() => document.querySelector('#p-monto') === null, { timeout: TIMEOUT_LARGO });
+      await page.waitForFunction(
+        () => document.querySelector('#p-monto') === null &&
+              (!document.querySelector('#modal-ov') ||
+               getComputedStyle(document.querySelector('#modal-ov')).display === 'none'),
+        { timeout: TIMEOUT_LARGO }
+      );
       ok('U07-b: modal cerrado tras guardar pago 1', true);
     } catch (_) {
       await screenshot(page, 'u07-modal-open');
@@ -516,7 +521,12 @@ async function screenshot(page, nombre) {
     await page.click('[onclick*="savePago"]');
 
     try {
-      await page.waitForFunction(() => document.querySelector('#p-monto') === null, { timeout: TIMEOUT_LARGO });
+      await page.waitForFunction(
+        () => document.querySelector('#p-monto') === null &&
+              (!document.querySelector('#modal-ov') ||
+               getComputedStyle(document.querySelector('#modal-ov')).display === 'none'),
+        { timeout: TIMEOUT_LARGO }
+      );
       ok('U08-a: modal cerrado tras guardar pago 2', true);
     } catch (_) {
       await screenshot(page, 'u08-modal-open');
@@ -581,7 +591,12 @@ async function screenshot(page, nombre) {
         await medioSel.selectOption('Cheque');
         await page.click('[onclick*="saveEditPago"]');
         try {
-          await page.waitForFunction(() => document.querySelector('#ep-medio') === null, { timeout: TIMEOUT_LARGO });
+          await page.waitForFunction(
+            () => document.querySelector('#ep-medio') === null &&
+                  (!document.querySelector('#modal-ov') ||
+                   getComputedStyle(document.querySelector('#modal-ov')).display === 'none'),
+            { timeout: TIMEOUT_LARGO }
+          );
           ok('U10-a: modal edición cerrado', true);
         } catch (_) {
           await screenshot(page, 'u10-modal-stuck');
