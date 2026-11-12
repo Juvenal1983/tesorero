@@ -9,10 +9,12 @@
     "test:ui":   "node tests/05_prueba_funcional_ui.js",
     "test:delegado": "node tests/06_acceso_delegado.js",
     "test:guard":    "node tests/07_guard_logout_db.js",
-    "test:all":  "node tests/07_guard_logout_db.js && node tests/03_rls_cliente.js && node tests/04_verifica_no_produccion.js && node tests/05_prueba_funcional_ui.js && node tests/06_acceso_delegado.js"
+    "test:all":  "node tests/07_guard_logout_db.js && node tests/03_rls_cliente.js && node tests/04_verifica_no_produccion.js && node tests/05_prueba_funcional_ui.js && node tests/06_acceso_delegado.js",
+    "test:v9":   "node tests/test_v9_staging.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^16.4.5",
     "playwright": "^1.48.0"
   },
   "engines": {
