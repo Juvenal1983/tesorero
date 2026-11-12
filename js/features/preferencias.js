@@ -273,7 +273,7 @@ function toggleMesesCuota(tipo){
   if(row) row.style.display = tipo==='mensual' ? '' : 'none';
 }
 
-function saveCuota(id){
+async function saveCuota(id){
   const nombre=document.getElementById('q-nombre').value.trim();
   const monto=parseInt(document.getElementById('q-monto').value);
   if(!nombre||!monto){alert('Completa nombre y monto.');return;}
@@ -281,6 +281,38 @@ function saveCuota(id){
   const mesInicio  = tipo==='mensual' ? parseInt(document.getElementById('q-mes-inicio')?.value||'2')  : undefined;
   const mesTermino = tipo==='mensual' ? parseInt(document.getElementById('q-mes-termino')?.value||'11') : undefined;
   const data={nombre,tipo,monto,anio:parseInt(document.getElementById('q-anio').value)||2026,obs:document.getElementById('q-obs').value,activa:true,cursoId:S.cursoId,mesInicio,mesTermino};
+
+  // ── V9_RELACIONAL: persistir en Supabase ──────────────────────────────────
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    if (!S._v9CuentaId) { alert('⚠️ Sesión relacional no inicializada (falta _v9CuentaId).'); return; }
+    const btn = document.querySelector('[onclick*="saveCuota"]');
+    if (btn) { btn.disabled = true; btn.textContent = 'Guardando…'; }
+    try {
+      let dbRow;
+      if (id) {
+        dbRow = await actualizarCuotaV9(S._v9CuentaId, id, data, _authToken);
+      } else {
+        dbRow = await crearCuotaV9(S._v9CuentaId, S.cursoId, data, _authToken);
+      }
+      // Actualizar caché local para render inmediato
+      const mapped = _mapCuota(dbRow);
+      if (id) {
+        const i = (DB.cuotas||[]).findIndex(q => q.id === id);
+        if (i >= 0) DB.cuotas[i] = { ...DB.cuotas[i], ...mapped };
+        else { if (!DB.cuotas) DB.cuotas = []; DB.cuotas.push(mapped); }
+      } else {
+        if (!DB.cuotas) DB.cuotas = [];
+        DB.cuotas.push({ ...mapped, cursoId: S.cursoId });
+      }
+      closeModal(); go('cuotas');
+    } catch (err) {
+      console.error('[saveCuota v9]', err);
+      showToast('❌ Error al guardar cuota: ' + (err.message || err), '#E24B4A');
+      if (btn) { btn.disabled = false; btn.textContent = id ? 'Guardar cambios' : 'Crear'; }
+    }
+    return;
+  }
+  // ── legado: blob local ────────────────────────────────────────────────────
   if(id){const i=(DB.cuotas||[]).findIndex(q=>q.id===id);if(i>=0) DB.cuotas[i]={...DB.cuotas[i],...data};}
   else{if(!DB.cuotas) DB.cuotas=[];DB.cuotas.push({id:uid(),...data});}
   saveDB(); closeModal(); go('cuotas');

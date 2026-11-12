@@ -274,14 +274,26 @@ function modalEnviarPin(aluId){
   </div>`;
 }
 
-function delAlumno(id){
-  // B4-fix: en modo relacional v9, la eliminación de alumnos debe ir a Supabase.
-  // Bloquear hasta implementar el CRUD relacional para alumnos.
-  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
-    alert('⚠️ La eliminación de alumnos no está disponible en el modo relacional v9 todavía.\n\nEsta función requiere integración con la tabla alumnos de Supabase (pendiente de implementar).');
+async function delAlumno(id){
+  if(!confirm('¿Eliminar este alumno? Se eliminarán también sus pagos asociados.')) return;
+
+  // ── V9_RELACIONAL: eliminar en Supabase ───────────────────────────────────
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    if (!S._v9CuentaId) { alert('⚠️ Sesión relacional no inicializada (falta _v9CuentaId).'); return; }
+    try {
+      await eliminarAlumnoV9(S._v9CuentaId, id, _authToken);
+      // Actualizar caché local
+      DB.alumnos    = (DB.alumnos   ||[]).filter(a => a.id !== id);
+      DB.pagos      = (DB.pagos     ||[]).filter(p => p.alumnoId !== id);
+      DB.apoderados = (DB.apoderados||[]).filter(a => a.alumnoId !== id);
+      go('alumnos');
+    } catch (err) {
+      console.error('[delAlumno v9]', err);
+      showToast('❌ Error al eliminar alumno: ' + (err.message || err), '#E24B4A');
+    }
     return;
   }
-  if(!confirm('¿Eliminar este alumno? Se eliminarán también sus pagos asociados.')) return;
+  // ── legado ────────────────────────────────────────────────────────────────
   DB.alumnos=(DB.alumnos||[]).filter(a=>a.id!==id);
   DB.pagos=(DB.pagos||[]).filter(p=>p.alumnoId!==id);
   saveDB(); go('alumnos');

@@ -26,15 +26,26 @@ function renderCuotas(){
     </table></div>`}
   </div>`;
 }
-function delCuota(id){
+async function delCuota(id){
   if(!puedeEscribir()){ showToast('⛔ Sin permisos para eliminar cuotas','#E24B4A'); return; }
-  // B4-fix: en modo relacional v9, la eliminación de cuotas debe ir a Supabase.
-  // Bloquear hasta implementar el CRUD relacional para cuotas.
-  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
-    alert('⚠️ La eliminación de cuotas no está disponible en el modo relacional v9 todavía.\n\nEsta función requiere integración con la tabla cuotas de Supabase (pendiente de implementar).');
+  if(!confirm('¿Eliminar esta cuota? Los pagos asociados también serán eliminados.')) return;
+
+  // ── V9_RELACIONAL: eliminar en Supabase ───────────────────────────────────
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    if (!S._v9CuentaId) { alert('⚠️ Sesión relacional no inicializada (falta _v9CuentaId).'); return; }
+    try {
+      await eliminarCuotaV9(S._v9CuentaId, id, _authToken);
+      // Actualizar caché local para render inmediato
+      DB.cuotas = (DB.cuotas||[]).filter(q => q.id !== id);
+      DB.pagos  = (DB.pagos ||[]).filter(p => p.cuotaId !== id);
+      go('cuotas');
+    } catch (err) {
+      console.error('[delCuota v9]', err);
+      showToast('❌ Error al eliminar cuota: ' + (err.message || err), '#E24B4A');
+    }
     return;
   }
-  if(!confirm('¿Eliminar esta cuota? Los pagos asociados también serán eliminados.')) return;
+  // ── legado ────────────────────────────────────────────────────────────────
   DB.cuotas=(DB.cuotas||[]).filter(q=>q.id!==id);
   DB.pagos=(DB.pagos||[]).filter(p=>p.cuotaId!==id);
   saveDB(); go('cuotas');

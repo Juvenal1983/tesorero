@@ -54,35 +54,59 @@ function generarPinAleatorio(){
   if(el) el.value=pin;
 }
 
-function saveAlumno(id){
-  // B4-fix: en modo V9_RELACIONAL el blob local NO es la fuente de verdad.
-  // Sin implementación CRUD relacional para alumnos, bloquear para evitar
-  // divergencia silenciosa entre el blob local y la DB.
-  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
-    alert('⚠️ Función no disponible en modo V9: la gestión de alumnos requiere implementación CRUD relacional. Por ahora, los cambios de alumnos deben hacerse directamente en Supabase.');
-    return;
-  }
+async function saveAlumno(id){
   const nombres=document.getElementById('m-nombres').value.trim();
   const apellidos=document.getElementById('m-apellidos').value.trim();
   const pin=document.getElementById('m-pin').value.trim();
   if(!nombres||!apellidos){alert('Ingresa nombre y apellidos.');return;}
   if(pin && pin.length < 4){alert('El PIN debe tener al menos 4 caracteres.');return;}
   const eximido = document.getElementById('m-eximido')?.checked || false;
+  const estado  = document.getElementById('m-estado').value;
+  const obs     = document.getElementById('m-obs').value;
+
+  // ── V9_RELACIONAL: persistir en Supabase ──────────────────────────────────
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    if (!S._v9CuentaId) { alert('⚠️ Sesión relacional no inicializada (falta _v9CuentaId).'); return; }
+    const btn = document.querySelector('[onclick*="saveAlumno"]');
+    if (btn) { btn.disabled = true; btn.textContent = 'Guardando…'; }
+    try {
+      let dbRow;
+      if (id) {
+        dbRow = await actualizarAlumnoV9(S._v9CuentaId, id, { nombres, apellidos, estado, obs, eximido }, _authToken);
+        // Actualizar caché local
+        const i = (DB.alumnos||[]).findIndex(a => a.id === id);
+        if (i >= 0) DB.alumnos[i] = { ...DB.alumnos[i], nombres, apellidos, estado, obs, eximido,
+          nombre: `${nombres} ${apellidos}`.trim(),
+          pin: pin || DB.alumnos[i].pin || '', _v9: true };
+      } else {
+        dbRow = await crearAlumnoV9(S._v9CuentaId, S.cursoId, { nombres, apellidos, estado, obs, eximido }, _authToken);
+        if (!DB.alumnos) DB.alumnos = [];
+        DB.alumnos.push({ id: dbRow.id, cursoId: S.cursoId, nombres, apellidos, estado, obs, eximido,
+          nombre: `${nombres} ${apellidos}`.trim(), pin: pin||'', _v9: true });
+      }
+      // PIN: se guarda solo en blob local (alumnos_credenciales requiere service_role)
+      if (pin) {
+        const aluId = id || dbRow.id;
+        const ix = (DB.alumnos||[]).findIndex(a => a.id === aluId);
+        if (ix >= 0) { DB.alumnos[ix].pin = pin; saveDB(); }
+        console.info('[saveAlumno v9] PIN guardado solo en blob local. Para hash seguro usar service_role en alumnos_credenciales.');
+      }
+      closeModal(); go('alumnos');
+    } catch (err) {
+      console.error('[saveAlumno v9]', err);
+      showToast('❌ Error al guardar alumno: ' + (err.message || err), '#E24B4A');
+      if (btn) { btn.disabled = false; btn.textContent = id ? 'Guardar cambios' : 'Agregar'; }
+    }
+    return;
+  }
+  // ── legado: blob local ────────────────────────────────────────────────────
   if(id){
     const i=(DB.alumnos||[]).findIndex(a=>a.id===id);
-    if(i>=0){DB.alumnos[i]={...DB.alumnos[i],nombres,apellidos,
-      estado:document.getElementById('m-estado').value,
-      obs:document.getElementById('m-obs').value,
-      pin:pin||DB.alumnos[i].pin||'',
-      eximido
-    };}
+    if(i>=0){DB.alumnos[i]={...DB.alumnos[i],nombres,apellidos,estado,obs,
+      pin:pin||DB.alumnos[i].pin||'',eximido};}
   } else {
     if(!DB.alumnos) DB.alumnos=[];
-    DB.alumnos.push({id:uid(),cursoId:S.cursoId,nombres,apellidos,
-      estado:document.getElementById('m-estado').value,
-      obs:document.getElementById('m-obs').value,
-      pin:pin||'', eximido
-    });
+    DB.alumnos.push({id:uid(),cursoId:S.cursoId,nombres,apellidos,estado,obs,pin:pin||'',eximido});
   }
   saveDB(); closeModal(); go('alumnos');
 }
@@ -125,16 +149,28 @@ function modalEditApoderadoTesorero({apId, alumnoId}){
   </div>`;
 }
 
-function saveEditApTesorero(apId, alumnoId){
-  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
-    alert('⚠️ Función no disponible en modo V9: la edición de apoderados requiere implementación CRUD relacional.');
-    return;
-  }
+async function saveEditApTesorero(apId, alumnoId){
   const nombre=document.getElementById('eapt-nombre')?.value.trim();
   if(!nombre){ alert('El nombre es obligatorio.'); return; }
   const relacion=document.getElementById('eapt-rel')?.value;
   const telefono=document.getElementById('eapt-tel')?.value.trim();
   const email=document.getElementById('eapt-email')?.value.trim();
+
+  // ── V9_RELACIONAL ─────────────────────────────────────────────────────────
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    if (!S._v9CuentaId) { alert('⚠️ Sesión relacional no inicializada.'); return; }
+    try {
+      await actualizarApoderadoV9(S._v9CuentaId, apId, { nombre, relacion, telefono, email }, _authToken);
+      const i=(DB.apoderados||[]).findIndex(a=>a.id===apId);
+      if(i>=0) DB.apoderados[i]={...DB.apoderados[i], nombre, relacion, telefono, email, _v9:true};
+      showModal('apoderadosAlumno',{id:alumnoId});
+    } catch (err) {
+      console.error('[saveEditApTesorero v9]', err);
+      showToast('❌ Error al guardar apoderado: ' + (err.message || err), '#E24B4A');
+    }
+    return;
+  }
+  // ── legado ────────────────────────────────────────────────────────────────
   const i=(DB.apoderados||[]).findIndex(a=>a.id===apId);
   if(i<0) return;
   DB.apoderados[i]={...DB.apoderados[i], nombre, relacion, telefono, email};
@@ -178,24 +214,54 @@ function modalApoderados(alumnoId){
     </div>
   </div>`;
 }
-function saveAp(alumnoId){
-  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
-    alert('⚠️ Función no disponible en modo V9: el alta de apoderados requiere implementación CRUD relacional.');
-    return;
-  }
+async function saveAp(alumnoId){
   const nombre=document.getElementById('ap-nombre').value.trim();
   if(!nombre){alert('Ingresa el nombre del apoderado.');return;}
-  if(!DB.apoderados) DB.apoderados=[];
-  DB.apoderados.push({id:uid(),alumnoId,nombre,relacion:document.getElementById('ap-rel').value,telefono:document.getElementById('ap-tel').value,email:document.getElementById('ap-email').value,estado:'activo'});
-  saveDB(); showModal('apoderadosAlumno',{id:alumnoId});
-}
-function delAp(id){
+  const relacion  = document.getElementById('ap-rel').value;
+  const telefono  = document.getElementById('ap-tel').value;
+  const email     = document.getElementById('ap-email').value;
+
+  // ── V9_RELACIONAL ─────────────────────────────────────────────────────────
   if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
-    alert('⚠️ Función no disponible en modo V9: la eliminación de apoderados requiere implementación CRUD relacional.');
+    if (!S._v9CuentaId) { alert('⚠️ Sesión relacional no inicializada.'); return; }
+    const btn = document.querySelector('[onclick*="saveAp"]');
+    if (btn) { btn.disabled = true; btn.textContent = 'Guardando…'; }
+    try {
+      const dbRow = await crearApoderadoV9(S._v9CuentaId, alumnoId, { nombre, relacion, telefono, email }, _authToken);
+      if (!DB.apoderados) DB.apoderados = [];
+      DB.apoderados.push({ id: dbRow.id, alumnoId, nombre, relacion, telefono, email, estado:'activo', _v9:true });
+      showModal('apoderadosAlumno',{id:alumnoId});
+    } catch (err) {
+      console.error('[saveAp v9]', err);
+      showToast('❌ Error al agregar apoderado: ' + (err.message || err), '#E24B4A');
+      if (btn) { btn.disabled = false; btn.textContent = `Agregar ${V('contacto')}`; }
+    }
     return;
   }
+  // ── legado ────────────────────────────────────────────────────────────────
+  if(!DB.apoderados) DB.apoderados=[];
+  DB.apoderados.push({id:uid(),alumnoId,nombre,relacion,telefono,email,estado:'activo'});
+  saveDB(); showModal('apoderadosAlumno',{id:alumnoId});
+}
+async function delAp(id){
   if(!confirm('¿Eliminar este apoderado?')) return;
   const ap=(DB.apoderados||[]).find(x=>x.id===id);
+
+  // ── V9_RELACIONAL ─────────────────────────────────────────────────────────
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    if (!S._v9CuentaId) { alert('⚠️ Sesión relacional no inicializada.'); return; }
+    try {
+      await eliminarApoderadoV9(S._v9CuentaId, id, _authToken);
+      DB.apoderados = (DB.apoderados||[]).filter(x => x.id !== id);
+      if (ap) showModal('apoderadosAlumno',{id:ap.alumnoId});
+      else closeModal();
+    } catch (err) {
+      console.error('[delAp v9]', err);
+      showToast('❌ Error al eliminar apoderado: ' + (err.message || err), '#E24B4A');
+    }
+    return;
+  }
+  // ── legado ────────────────────────────────────────────────────────────────
   DB.apoderados=(DB.apoderados||[]).filter(x=>x.id!==id);
   saveDB(); if(ap) showModal('apoderadosAlumno',{id:ap.alumnoId});
 }

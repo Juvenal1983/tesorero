@@ -309,6 +309,200 @@ async function buscarPagoV9(cuentaId, pagoId, accessToken) {
   return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
 }
 
+// ─── CRUD cuotas ─────────────────────────────────────────────────────────────
+
+/**
+ * Crea una cuota en Supabase y devuelve la fila insertada.
+ */
+async function crearCuotaV9(cuentaId, cursoId, data, accessToken) {
+  const id = data.id || uid();
+  const payload = {
+    cuenta_id:   cuentaId,
+    id,
+    curso_id:    cursoId,
+    nombre:      data.nombre,
+    monto:       Math.round(Number(data.monto)),
+    tipo:        data.tipo   || 'unica',
+    anio:        data.anio   || new Date().getFullYear(),
+    activa:      data.activa !== false,
+    mes_inicio:  data.mesInicio  != null ? data.mesInicio  : null,
+    mes_termino: data.mesTermino != null ? data.mesTermino : null,
+    obs:         data.obs || null,
+  };
+  const rows = await _v9Fetch(
+    '/cuotas?select=*',
+    { method: 'POST', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(payload) },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error('[datos_v9] crearCuotaV9: INSERT sin respuesta — verifica RLS y permisos.');
+  return rows[0];
+}
+
+/**
+ * Actualiza campos de una cuota existente. Devuelve la fila actualizada.
+ */
+async function actualizarCuotaV9(cuentaId, cuotaId, data, accessToken) {
+  const patch = {};
+  if (data.nombre     !== undefined) patch.nombre      = data.nombre;
+  if (data.monto      !== undefined) patch.monto       = Math.round(Number(data.monto));
+  if (data.tipo       !== undefined) patch.tipo        = data.tipo;
+  if (data.anio       !== undefined) patch.anio        = data.anio;
+  if (data.activa     !== undefined) patch.activa      = data.activa;
+  if (data.mesInicio  !== undefined) patch.mes_inicio  = data.mesInicio  != null ? data.mesInicio  : null;
+  if (data.mesTermino !== undefined) patch.mes_termino = data.mesTermino != null ? data.mesTermino : null;
+  if (data.obs        !== undefined) patch.obs         = data.obs || null;
+  const rows = await _v9Fetch(
+    `/cuotas?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(cuotaId)}&select=*`,
+    { method: 'PATCH', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(patch) },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error(`[datos_v9] actualizarCuotaV9: cuota ${cuotaId} no encontrada (ninguna fila modificada).`);
+  return rows[0];
+}
+
+/**
+ * Elimina una cuota. No lanza error si ya no existe.
+ */
+async function eliminarCuotaV9(cuentaId, cuotaId, accessToken) {
+  const rows = await _v9Fetch(
+    `/cuotas?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(cuotaId)}&select=*`,
+    { method: 'DELETE', headers: { 'Prefer': 'return=representation' } },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    console.warn(`[datos_v9] eliminarCuotaV9: DELETE de cuota ${cuotaId} no afectó ninguna fila.`);
+  return rows || [];
+}
+
+// ─── CRUD alumnos ─────────────────────────────────────────────────────────────
+
+/**
+ * Crea un alumno en Supabase y devuelve la fila insertada.
+ * Nota: el PIN se guarda solo en el blob local (alumnos_credenciales requiere service_role).
+ */
+async function crearAlumnoV9(cuentaId, cursoId, data, accessToken) {
+  const id = data.id || uid();
+  const nombre = `${data.nombres || ''} ${data.apellidos || ''}`.trim();
+  const payload = {
+    cuenta_id: cuentaId,
+    id,
+    curso_id:  cursoId,
+    nombre,
+    nombres:   data.nombres   || null,
+    apellidos: data.apellidos || null,
+    estado:    data.estado    || 'activo',
+    obs:       data.obs       || null,
+    eximido:   data.eximido   || false,
+  };
+  const rows = await _v9Fetch(
+    '/alumnos?select=*',
+    { method: 'POST', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(payload) },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error('[datos_v9] crearAlumnoV9: INSERT sin respuesta — verifica RLS y permisos.');
+  return { ...rows[0], id };
+}
+
+/**
+ * Actualiza campos de un alumno existente. Devuelve la fila actualizada.
+ */
+async function actualizarAlumnoV9(cuentaId, alumnoId, data, accessToken) {
+  const patch = {};
+  if (data.nombres   !== undefined || data.apellidos !== undefined) {
+    patch.nombres   = data.nombres   || null;
+    patch.apellidos = data.apellidos || null;
+    patch.nombre    = `${data.nombres || ''} ${data.apellidos || ''}`.trim();
+  }
+  if (data.estado  !== undefined) patch.estado  = data.estado;
+  if (data.obs     !== undefined) patch.obs     = data.obs || null;
+  if (data.eximido !== undefined) patch.eximido = data.eximido;
+  const rows = await _v9Fetch(
+    `/alumnos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(alumnoId)}&select=*`,
+    { method: 'PATCH', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(patch) },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error(`[datos_v9] actualizarAlumnoV9: alumno ${alumnoId} no encontrado.`);
+  return rows[0];
+}
+
+/**
+ * Elimina un alumno. No lanza error si ya no existe.
+ */
+async function eliminarAlumnoV9(cuentaId, alumnoId, accessToken) {
+  const rows = await _v9Fetch(
+    `/alumnos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(alumnoId)}&select=*`,
+    { method: 'DELETE', headers: { 'Prefer': 'return=representation' } },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    console.warn(`[datos_v9] eliminarAlumnoV9: DELETE de alumno ${alumnoId} no afectó ninguna fila.`);
+  return rows || [];
+}
+
+// ─── CRUD apoderados ──────────────────────────────────────────────────────────
+
+/**
+ * Crea un apoderado vinculado a un alumno. Devuelve la fila insertada.
+ */
+async function crearApoderadoV9(cuentaId, alumnoId, data, accessToken) {
+  const id = data.id || uid();
+  const payload = {
+    cuenta_id: cuentaId,
+    id,
+    alumno_id: alumnoId,
+    nombre:    data.nombre,
+    relacion:  data.relacion || null,
+    telefono:  data.telefono || null,
+    email:     data.email    || null,
+    estado:    'activo',
+  };
+  const rows = await _v9Fetch(
+    '/apoderados?select=*',
+    { method: 'POST', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(payload) },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error('[datos_v9] crearApoderadoV9: INSERT sin respuesta — verifica RLS y permisos.');
+  return { ...rows[0], id };
+}
+
+/**
+ * Actualiza campos de un apoderado existente.
+ */
+async function actualizarApoderadoV9(cuentaId, apId, data, accessToken) {
+  const patch = {};
+  if (data.nombre   !== undefined) patch.nombre   = data.nombre;
+  if (data.relacion !== undefined) patch.relacion = data.relacion || null;
+  if (data.telefono !== undefined) patch.telefono = data.telefono || null;
+  if (data.email    !== undefined) patch.email    = data.email    || null;
+  const rows = await _v9Fetch(
+    `/apoderados?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(apId)}&select=*`,
+    { method: 'PATCH', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(patch) },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error(`[datos_v9] actualizarApoderadoV9: apoderado ${apId} no encontrado.`);
+  return rows[0];
+}
+
+/**
+ * Elimina un apoderado. No lanza error si ya no existe.
+ */
+async function eliminarApoderadoV9(cuentaId, apId, accessToken) {
+  const rows = await _v9Fetch(
+    `/apoderados?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(apId)}&select=*`,
+    { method: 'DELETE', headers: { 'Prefer': 'return=representation' } },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    console.warn(`[datos_v9] eliminarApoderadoV9: DELETE de apoderado ${apId} no afectó ninguna fila.`);
+  return rows || [];
+}
+
 // ─── Adaptadores: mapear filas relacionales al formato esperado por DB ────────
 // El estado en memoria (DB) sigue siendo el mismo objeto legado para que el
 // resto de la UI (render, navegación, reportes) no necesite cambios todavía.
