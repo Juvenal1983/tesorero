@@ -249,8 +249,9 @@ async function limpiarFixtures(jwt) {
       console.log(`  ✅ ${paso.nombre} eliminado`);
     }
   }
-  console.log('\n  📋 SQL admin para limpiar operaciones_pagos:');
-  console.log(`  DELETE FROM operaciones_pagos WHERE cuenta_id = '${CUENTA_ID}' AND idempotency_key LIKE 'stg-ui-%';`);
+  console.log('\n  📋 SQL admin para limpiar operaciones_pagos de este run:');
+  console.log(`  DELETE FROM operaciones_pagos WHERE cuenta_id = '${CUENTA_ID}' AND idempotency_key LIKE 'stg-ui-${EXEC_ID}%';`);
+  console.log('  -- (para limpiar todos los runs UI de esta cuenta: LIKE \'stg-ui-%\')');
 }
 
 // ── Helpers Playwright ────────────────────────────────────────────────────────
@@ -456,22 +457,28 @@ async function screenshot(page, nombre) {
 
     // ── U06: Seleccionar alumno de test ───────────────────────────────────────
     console.log('\n[U06] Seleccionar alumno de test');
-    // Chip: `${apellidos.split(' ')[0]}, ${nombres.split(' ')[0]}` → "UI, Test"
-    // Click en el chip del alumno (apellidos = "UI EXEC_ID" → chip empieza con "UI,")
-    const chipAlumno = page.locator('.chip', { hasText: /^UI,/ }).first();
+    // El chip muestra "apellidos[0], nombres[0]" → apellidos="UI EXEC_ID" → "UI,"
+    // Buscar chip cuyo texto comienza con "UI," (único en este curso de test)
+    const chipAlumno = page.locator(`.chip:text-matches("^UI,")`).first();
+    let u06Ok = false;
     if (await chipAlumno.count() > 0) {
       await chipAlumno.click();
-      ok('U06: alumno de test seleccionado', true);
+      u06Ok = true;
     } else {
-      // Seleccionar programáticamente por ID si el chip no matchea
+      // Fallback programático: navegar directamente al alumno por ID
       await page.evaluate((id) => window.go('pagos', { aluId: id }), ALU_ID);
-      ok('U06: alumno de test seleccionado (programático)', true);
     }
-    await page.waitForFunction(
-      (id) => window.S?.params?.aluId === id,
-      ALU_ID,
-      { timeout: TIMEOUT_CORTO }
-    );
+    try {
+      await page.waitForFunction(
+        (id) => window.S?.params?.aluId === id,
+        ALU_ID,
+        { timeout: TIMEOUT_CORTO }
+      );
+      u06Ok = true;
+    } catch (_) {
+      await screenshot(page, 'u06-alunosel-fail');
+    }
+    ok('U06: alumno de test seleccionado', u06Ok);
 
     // ── U07: Registrar primer pago parcial ($8.000) ───────────────────────────
     console.log('\n[U07] Registrar pago parcial 1 — $8.000');
@@ -608,22 +615,36 @@ async function screenshot(page, nombre) {
       const btnEditar = page.locator(`[onclick*="editPago"][onclick*="${p1db.id}"]`).first();
       if (await btnEditar.count() > 0) {
         await btnEditar.click();
-        await page.waitForSelector('#ep-medio,#p-medio,select.fs', { timeout: TIMEOUT_CORTO });
-        const medioSel = page.locator('#ep-medio,select.fs').first();
-        await medioSel.selectOption('Cheque');
-        await page.click('[onclick*="saveEditPago"]');
+        // Esperar el campo del modal de edición — solo #ep-medio, sin selector genérico
+        const modal   = page.locator('#modal-ov');
+        const epMedio = modal.locator('#ep-medio');
         try {
-          await page.waitForFunction(
-            () => document.querySelector('#ep-medio') === null,
-            { timeout: TIMEOUT_LARGO }
-          );
-          await page.evaluate(() => { if (document.getElementById('modal-ov')) window.closeModal?.(); });
-          await page.waitForFunction(() => !document.getElementById('modal-ov'), { timeout: TIMEOUT_CORTO });
-          ok('U10-a: modal edición cerrado', true);
+          await epMedio.waitFor({ state: 'visible', timeout: TIMEOUT_CORTO });
         } catch (_) {
-          await screenshot(page, 'u10-modal-stuck');
-          ok('U10-a: modal edición cerrado', false);
+          await screenshot(page, 'u10-no-epmedio');
+          ok('U10-a: #ep-medio visible en modal de edición', false);
+          // No hay modal de edición; saltar verificación DB
+          ok('U10-b: medio actualizado a "cheque" o "Cheque"', false);
+          // Intentar cerrar cualquier overlay remanente
           await page.evaluate(() => { if (document.getElementById('modal-ov')) window.closeModal?.(); }).catch(() => {});
+          // saltar al resto del flujo
+        }
+        if (await epMedio.isVisible().catch(() => false)) {
+          await epMedio.selectOption({ label: 'Cheque' });
+          await modal.locator('[onclick*="saveEditPago"]').click();
+          try {
+            await page.waitForFunction(
+              () => document.querySelector('#ep-medio') === null,
+              { timeout: TIMEOUT_LARGO }
+            );
+            await page.evaluate(() => { if (document.getElementById('modal-ov')) window.closeModal?.(); });
+            await page.waitForFunction(() => !document.getElementById('modal-ov'), { timeout: TIMEOUT_CORTO });
+            ok('U10-a: modal edición cerrado', true);
+          } catch (_) {
+            await screenshot(page, 'u10-modal-stuck');
+            ok('U10-a: modal edición cerrado', false);
+            await page.evaluate(() => { if (document.getElementById('modal-ov')) window.closeModal?.(); }).catch(() => {});
+          }
         }
       } else {
         await screenshot(page, 'u10-noedit');
