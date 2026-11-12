@@ -290,10 +290,10 @@ async function navegarPagosAlumno(page) {
   await page.waitForFunction(() => window.S?.route === 'pagos', { timeout: TIMEOUT_CORTO });
 }
 
-/** Capturar screenshot en fallo */
+/** Capturar screenshot en fallo — guardado junto al script del test */
 async function screenshot(page, nombre) {
   try {
-    const p = `/tmp/claude-0/-home-claude/baceb390-7fe6-5be0-bc70-3bf96e00da99/scratchpad/ui-${nombre}-${EXEC_ID}.png`;
+    const p = path.join(__dirname, `ui-${nombre}-${EXEC_ID}.png`);
     await page.screenshot({ path: p, fullPage: true });
     console.log(`    📸 ${p}`);
   } catch (_) {}

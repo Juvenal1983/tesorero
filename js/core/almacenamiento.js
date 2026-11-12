@@ -430,6 +430,10 @@ function initDB(){
   if(guardado) saveDB();
 }
 
+// Exponer S en window para Playwright y para funciones de otros scripts
+// que accedan a través de window.S (tests UI, depuración).
+window.S = S;
+
 // ─────────────────────────────────────────────
 // UTILIDADES
 // ─────────────────────────────────────────────
