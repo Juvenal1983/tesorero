@@ -269,22 +269,39 @@ async function reloginViaUI(page) {
   await page.fill('#l-email', USER_EMAIL);
   await page.fill('#l-pass', USER_PASS);
   await page.click('[onclick="doLogin()"]');
+  // Esperar sesión Y _v9CuentaId — hay rutas de login que setean session sin _v9CuentaId
   await page.waitForFunction(
-    () => window.S?.session !== null && window.S?.session !== undefined,
+    () => window.S?.session !== null &&
+          window.S?.session !== undefined &&
+          !!window.S?._v9CuentaId,
     { timeout: TIMEOUT_LARGO }
   );
 }
 
-/** Navegar a la vista de pagos del alumno de test (asume sesión activa) */
+/** Navegar a la vista de pagos del alumno de test (asume sesión activa con _v9CuentaId) */
 async function navegarPagosAlumno(page) {
   const cursoActual = await page.evaluate(() => window.S?.cursoId ?? null);
   if (cursoActual !== CURSO_ID) {
-    await page.evaluate((id) => window.selectCurso && window.selectCurso(id), CURSO_ID);
-    await page.waitForFunction(
-      (id) => window.S?.cursoId === id,
-      CURSO_ID,
-      { timeout: TIMEOUT_LARGO }
-    );
+    // selectCurso necesita S._v9CuentaId; solo llamarlo si está disponible
+    const v9Listo = await page.evaluate(() => !!window.S?._v9CuentaId);
+    if (v9Listo) {
+      await page.evaluate((id) => window.selectCurso && window.selectCurso(id), CURSO_ID);
+      await page.waitForFunction(
+        (id) => window.S?.cursoId === id,
+        CURSO_ID,
+        { timeout: TIMEOUT_LARGO }
+      );
+    } else {
+      // _v9CuentaId no disponible: navegar al selector y hacer clic en el curso vía UI
+      await page.evaluate(() => window.go('selector'));
+      await page.waitForSelector(`text=${CURSO_NOMBRE}`, { timeout: TIMEOUT_CORTO });
+      await page.click(`text=${CURSO_NOMBRE}`);
+      await page.waitForFunction(
+        (id) => window.S?.cursoId === id,
+        CURSO_ID,
+        { timeout: TIMEOUT_LARGO }
+      );
+    }
   }
   await page.evaluate((id) => window.go('pagos', { aluId: id }), ALU_ID);
   await page.waitForFunction(() => window.S?.route === 'pagos', { timeout: TIMEOUT_CORTO });
