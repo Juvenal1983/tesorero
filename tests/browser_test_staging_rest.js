@@ -7,14 +7,17 @@
  * idempotencia → edición → eliminación → rechazo de reintento post-eliminar.
  *
  * Requisitos de entorno (NUNCA pegar en el chat ni el repositorio):
- *   STAGING_SUPA_URL       — https://rucgmytyxpfowznowxwd.supabase.co
- *   STAGING_SUPA_KEY       — anon key del proyecto de staging
- *   STAGING_USER_A_EMAIL   — email del tesorero A
- *   STAGING_USER_A_PASS    — contraseña del tesorero A
- *   STAGING_CUENTA_A_ID    — UUID de tesorero_cuentas para la cuenta A
+ *   STAGING_SUPABASE_URL        — https://rucgmytyxpfowznowxwd.supabase.co
+ *   STAGING_SUPABASE_ANON_KEY   — anon key del proyecto de staging
+ *   STAGING_USER_A_EMAIL        — email del tesorero A
+ *   STAGING_USER_A_PASSWORD     — contraseña del tesorero A
  *
- * Ejecución con .env local (adaptado a nombres existentes):
- *   export $(grep -v '^#' .env | xargs) && node tests/browser_test_staging_rest.js
+ * El cuenta_id se descubre automáticamente tras el login (no hace falta en el .env).
+ *
+ * Ejecución con .env local:
+ *   Windows CMD : for /f "usebackq tokens=1,* delims==" %A in (`type .env ^| findstr /v "^#"`) do set %A=%B
+ *                 node tests/browser_test_staging_rest.js
+ *   bash/zsh    : export $(grep -v '^#' .env | xargs) && node tests/browser_test_staging_rest.js
  *
  * NUNCA apuntar al proyecto de producción (tmjqzaakzhecbldebyeg).
  */
@@ -23,8 +26,8 @@
 
 // ── Validar variables de entorno ──────────────────────────────────────────────
 const REQUIRED_ENV = [
-  'STAGING_SUPA_URL', 'STAGING_SUPA_KEY',
-  'STAGING_USER_A_EMAIL', 'STAGING_USER_A_PASS', 'STAGING_CUENTA_A_ID',
+  'STAGING_SUPABASE_URL', 'STAGING_SUPABASE_ANON_KEY',
+  'STAGING_USER_A_EMAIL', 'STAGING_USER_A_PASSWORD',
 ];
 const missing = REQUIRED_ENV.filter(k => !process.env[k]);
 if (missing.length) {
@@ -32,11 +35,12 @@ if (missing.length) {
   process.exit(1);
 }
 
-const SUPA_URL   = process.env.STAGING_SUPA_URL;
-const ANON_KEY   = process.env.STAGING_SUPA_KEY;
+const SUPA_URL   = process.env.STAGING_SUPABASE_URL;
+const ANON_KEY   = process.env.STAGING_SUPABASE_ANON_KEY;
 const USER_EMAIL = process.env.STAGING_USER_A_EMAIL;
-const USER_PASS  = process.env.STAGING_USER_A_PASS;
-const CUENTA_ID  = process.env.STAGING_CUENTA_A_ID;
+const USER_PASS  = process.env.STAGING_USER_A_PASSWORD;
+// CUENTA_ID se descubre automáticamente en S01 consultando tesorero_cuentas
+let   CUENTA_ID  = null;
 
 // ── Guard: hostname exacto de staging ────────────────────────────────────────
 const STAGING_HOSTNAME = 'rucgmytyxpfowznowxwd.supabase.co';
@@ -44,7 +48,7 @@ const PROD_HOSTNAME    = 'tmjqzaakzhecbldebyeg.supabase.co';
 
 let parsedHost;
 try { parsedHost = new URL(SUPA_URL).hostname; }
-catch (_) { console.error('❌ STAGING_SUPA_URL no es una URL válida.'); process.exit(2); }
+catch (_) { console.error('❌ STAGING_SUPABASE_URL no es una URL válida.'); process.exit(2); }
 
 if (parsedHost === PROD_HOSTNAME) {
   console.error('❌ CRÍTICO: STAGING_SUPA_URL apunta a producción. Abortando.');
@@ -146,6 +150,17 @@ async function loginTesorero() {
     throw new Error(`Login falló (HTTP ${res.status}): ${JSON.stringify(res.body)}`);
   }
   return res.body.access_token;
+}
+
+async function descubrirCuentaId(jwt) {
+  // Consulta tesorero_cuentas para obtener el cuenta_id del usuario autenticado.
+  // La columna auth_id vincula la cuenta con el usuario de Supabase Auth.
+  const res = await supaFetchAuth('/rest/v1/tesorero_cuentas?select=id,auth_id&limit=5', jwt);
+  if (res.status !== 200 || !Array.isArray(res.body) || res.body.length === 0) {
+    throw new Error(`No se encontró cuenta en tesorero_cuentas (HTTP ${res.status}): ${JSON.stringify(res.body)}`);
+  }
+  // Si hay más de una cuenta, usar la primera (tesorero A es propietario de una sola)
+  return res.body[0].id;
 }
 
 async function rpcInsertarLote(jwt, pagos) {
@@ -317,8 +332,10 @@ async function limpiarFixtures(jwt) {
   try {
     jwt = await loginTesorero();
     ok('S01-a: login exitoso — JWT obtenido', typeof jwt === 'string' && jwt.length > 20);
+    CUENTA_ID = await descubrirCuentaId(jwt);
+    ok(`S01-b: cuenta_id descubierto (${CUENTA_ID})`, typeof CUENTA_ID === 'string' && CUENTA_ID.length > 10);
   } catch (e) {
-    console.error('❌ Login falló:', e.message);
+    console.error('❌ Login o descubrimiento de cuenta falló:', e.message);
     process.exit(3);
   }
 
