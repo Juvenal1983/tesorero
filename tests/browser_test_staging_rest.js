@@ -69,8 +69,11 @@ const ALU_ID   = `alu-stg-${EXEC_ID}`;
 const CUOTA_ID = `cuo-stg-${EXEC_ID}`;
 const IK_PRE   = `stg-${EXEC_ID}`;
 
-// IDs de los 3 pagos originales que deben preservarse intactos
-const PAGOS_ORIGINALES = ['p-1793328640658-66rix', 'pago-a-01', 'pago-b-01'];
+// IDs de pagos originales por cuenta (para S12)
+// cuenta A: p-1793328640658-66rix, pago-a-01   → verificar con JWT-A
+// cuenta B: pago-b-01                           → verificar con JWT-B (STAGING_USER_B_EMAIL/PASSWORD)
+const PAGOS_CUENTA_A = ['p-1793328640658-66rix', 'pago-a-01'];
+const PAGO_CUENTA_B  = 'pago-b-01';
 
 let pass = 0, fail = 0;
 const failures = [];
@@ -181,23 +184,16 @@ async function queryPagosTest(jwt) {
   return Array.isArray(res.body) ? res.body : [];
 }
 
-async function queryPagosOriginales(jwt) {
-  // Cada pago original puede pertenecer a cuentas distintas (A o B).
-  // Se consulta por ID sin filtrar por cuenta_id; RLS permite verlos
-  // si el JWT tiene acceso (es_dueno de alguna cuenta o rol en el curso).
-  // Se hace una consulta por pago para no depender de que todos sean
-  // de la misma cuenta.
-  const encontrados = [];
-  for (const id of PAGOS_ORIGINALES) {
-    const res = await supaFetchAuth(
-      `/rest/v1/pagos?id=eq.${encodeURIComponent(id)}&select=id`,
-      jwt
-    );
-    if (res.status === 200 && Array.isArray(res.body) && res.body.length > 0) {
-      encontrados.push(id);
-    }
+async function loginConCredenciales(email, password) {
+  const res = await supaFetchAnon('/auth/v1/token?grant_type=password', {
+    method: 'POST',
+    body:   { email, password },
+    prefer: '',
+  });
+  if (res.status !== 200 || !res.body?.access_token) {
+    throw new Error(`Login falló (HTTP ${res.status}): ${JSON.stringify(res.body)}`);
   }
-  return encontrados;
+  return res.body.access_token;
 }
 
 // ── Crear fixtures con JWT del tesorero ───────────────────────────────────────
@@ -416,11 +412,15 @@ async function limpiarFixtures(jwt) {
     ok('S06-a: 2 pagos en DB',          pagos6.length === 2);
     ok('S06-b: suma = 20000',           sumado6 === 20000);
 
-    // ── S07: Slots de idempotencia — no consultable vía REST (RLS protege) ────
-    console.log('\n[S07] operaciones_pagos protegida por RLS — verificación por comportamiento RPC');
-    // La protección se demuestra indirectamente: el RPC respeta idempotencia (S04)
-    // y rechaza reintentos post-eliminar (S11). Consulta directa requiere SQL admin.
-    ok('S07: idempotencia demostrada por S04 (RPC no duplicó)', pagos4.length === 1);
+    // ── S07: Comportamiento idempotente — reintento explícito con IK ya registrada ─
+    // Reenvía pago1 (IK1 ya existe en operaciones_pagos tras S03/S04) ahora que
+    // también existe pago2. Debe devolver el mismo id sin crear fila nueva.
+    console.log('\n[S07] Comportamiento idempotente: reintento de pago1 tras añadir pago2');
+    const r7     = await rpcInsertarLote(jwt, [pago1]);
+    const pagos7 = await queryPagosTest(jwt);
+    ok('S07-a: RPC retorna HTTP 200',                 r7.status === 200);
+    ok('S07-b: mismo id que pago1 (slot reconocido)', Array.isArray(r7.body) && r7.body[0]?.id === p1Id);
+    ok('S07-c: DB conserva 2 pagos, sin duplicado',   pagos7.length === 2);
 
     // ── S08: Recarga — reintento del lote completo ────────────────────────────
     console.log('\n[S08] Simular recarga: reintento de [pago1, pago2] completo');
@@ -471,11 +471,45 @@ async function limpiarFixtures(jwt) {
       console.error(`    Respuesta inesperada (${r11.status}): ${JSON.stringify(r11.body).slice(0, 200)}`);
     }
 
-    // ── S12: Pagos originales intactos ────────────────────────────────────────
-    console.log('\n[S12] Verificar pagos originales preservados');
-    const originalesEncontrados = await queryPagosOriginales(jwt);
-    for (const id of PAGOS_ORIGINALES) {
-      ok(`S12: pago original ${id} intacto`, originalesEncontrados.includes(id));
+    // ── S12: Pagos originales intactos — registros completos por cuenta ──────────
+    // Usar las credenciales autorizadas de cada cuenta para leer el registro
+    // completo. No se amplía RLS; se opera con el JWT del propietario de cada pago.
+    console.log('\n[S12] Pagos originales: registros completos con credenciales autorizadas');
+
+    // Cuenta A (jwt ya disponible)
+    for (const id of PAGOS_CUENTA_A) {
+      const r12a = await supaFetchAuth(
+        `/rest/v1/pagos?id=eq.${encodeURIComponent(id)}&select=id,monto,medio,estado`,
+        jwt
+      );
+      const pago = r12a.status === 200 && Array.isArray(r12a.body) ? r12a.body[0] : null;
+      ok(`S12 ${id} — encontrado (JWT-A)`,  !!pago?.id);
+      ok(`S12 ${id} — monto registrado`,    typeof pago?.monto === 'number' && pago.monto > 0);
+      ok(`S12 ${id} — medio registrado`,    typeof pago?.medio === 'string'  && pago.medio.length > 0);
+    }
+
+    // Cuenta B — requiere STAGING_USER_B_EMAIL / STAGING_USER_B_PASSWORD (opcionales)
+    const USER_B_EMAIL = process.env.STAGING_USER_B_EMAIL;
+    const USER_B_PASS  = process.env.STAGING_USER_B_PASSWORD;
+    if (USER_B_EMAIL && USER_B_PASS) {
+      let jwtB = null;
+      try {
+        jwtB = await loginConCredenciales(USER_B_EMAIL, USER_B_PASS);
+      } catch (e) { console.error(`  ⚠️  Login cuenta B falló: ${e.message}`); }
+
+      if (jwtB) {
+        const r12b = await supaFetchAuth(
+          `/rest/v1/pagos?id=eq.${encodeURIComponent(PAGO_CUENTA_B)}&select=id,monto,medio,estado`,
+          jwtB
+        );
+        const pago = r12b.status === 200 && Array.isArray(r12b.body) ? r12b.body[0] : null;
+        ok(`S12 ${PAGO_CUENTA_B} — encontrado (JWT-B)`,  !!pago?.id);
+        ok(`S12 ${PAGO_CUENTA_B} — monto registrado`,    typeof pago?.monto === 'number' && pago.monto > 0);
+        ok(`S12 ${PAGO_CUENTA_B} — medio registrado`,    typeof pago?.medio === 'string'  && pago.medio.length > 0);
+      }
+    } else {
+      console.log(`  ℹ️  STAGING_USER_B_EMAIL/PASSWORD no definidos — ${PAGO_CUENTA_B} omitido.`);
+      console.log('     Agregar al .env para comparar registro completo de cuenta B con JWT-B.');
     }
 
   } finally {

@@ -262,6 +262,34 @@ async function waitAppReady(page) {
   await page.waitForFunction(() => typeof window.S !== 'undefined', { timeout: TIMEOUT_LARGO });
 }
 
+/** Re-login vía UI si el formulario de login está visible (sesión no restaurada) */
+async function reloginViaUI(page) {
+  const tieneForm = await page.locator('#l-email').count() > 0;
+  if (!tieneForm) return; // ya autenticado u otra vista
+  await page.fill('#l-email', USER_EMAIL);
+  await page.fill('#l-pass', USER_PASS);
+  await page.click('[onclick="doLogin()"]');
+  await page.waitForFunction(
+    () => window.S?.session !== null && window.S?.session !== undefined,
+    { timeout: TIMEOUT_LARGO }
+  );
+}
+
+/** Navegar a la vista de pagos del alumno de test (asume sesión activa) */
+async function navegarPagosAlumno(page) {
+  const cursoActual = await page.evaluate(() => window.S?.cursoId ?? null);
+  if (cursoActual !== CURSO_ID) {
+    await page.evaluate((id) => window.selectCurso && window.selectCurso(id), CURSO_ID);
+    await page.waitForFunction(
+      (id) => window.S?.cursoId === id,
+      CURSO_ID,
+      { timeout: TIMEOUT_LARGO }
+    );
+  }
+  await page.evaluate((id) => window.go('pagos', { aluId: id }), ALU_ID);
+  await page.waitForFunction(() => window.S?.route === 'pagos', { timeout: TIMEOUT_CORTO });
+}
+
 /** Capturar screenshot en fallo */
 async function screenshot(page, nombre) {
   try {
@@ -504,48 +532,54 @@ async function screenshot(page, nombre) {
     const pagos9 = await _queryPagosTest(jwt);
     ok('U09-a: 2 pagos en DB después de recarga', pagos9.length === 2);
 
-    // Si la sesión se restauró, navegar a pagos y verificar UI también
-    const sesionRestaurada = await page.evaluate(() =>
-      window.S?.session !== null && window.S?.cursoId !== null
+    // Restaurar sesión vía UI si no estaba activa (no REST fallback)
+    const sesionActiva = await page.evaluate(() =>
+      window.S?.session !== null && window.S?.session !== undefined
     );
-    if (sesionRestaurada) {
-      await page.evaluate((id) => window.go('pagos', { aluId: id }), ALU_ID);
-      await page.waitForFunction(() => window.S?.route === 'pagos', { timeout: TIMEOUT_CORTO });
-      // Buscar badge "⚠ Parcial" en la vista (si ambos pagos son < monto obligado individualmente
-      // pero se sumarán ≥ monto, aparece "✓ Pagado")
-      const badgePagado = await page.locator('text=✓ Pagado').count();
-      ok('U09-b: estado "Pagado" visible en tabla de cuotas', badgePagado > 0);
+    if (!sesionActiva) {
+      console.log('  → Sesión no restaurada automáticamente; re-login vía UI');
+      try {
+        await reloginViaUI(page);
+        ok('U09-b: re-login vía UI tras recarga', true);
+      } catch (_) {
+        await screenshot(page, 'u09-relogin-fail');
+        ok('U09-b: re-login vía UI tras recarga', false);
+      }
     } else {
-      ok('U09-b: sesión no restaurada (verificar localStorage del navegador)', false);
+      ok('U09-b: sesión restaurada automáticamente', true);
     }
 
-    // ── U10: Editar pago 1 ────────────────────────────────────────────────────
-    console.log('\n[U10] Editar pago 1 — cambiar medio a "Cheque"');
+    // Navegar a pagos del alumno (siempre)
+    try {
+      await navegarPagosAlumno(page);
+      const badgePagado = await page.locator('text=✓ Pagado').count();
+      ok('U09-c: estado "Pagado" visible en tabla de cuotas', badgePagado > 0);
+    } catch (_) {
+      await screenshot(page, 'u09-nav-fail');
+      ok('U09-c: estado "Pagado" visible en tabla de cuotas', false);
+    }
+
+    // ── U10: Editar pago 1 vía UI ─────────────────────────────────────────────
+    console.log('\n[U10] Editar pago 1 — cambiar medio a "Cheque" via UI');
     const p1db = pagos9.find(p => p.monto === 8000) ?? pagos8.find(p => p.monto === 8000);
     if (p1db?.id) {
-      if (sesionRestaurada) {
-        const btnEditar = page.locator(`[onclick*="editPago"][onclick*="${p1db.id}"]`).first();
-        if (await btnEditar.count() > 0) {
-          await btnEditar.click();
-          await page.waitForSelector('#ep-medio,#p-medio,select.fs', { timeout: TIMEOUT_CORTO });
-          // El modal de edición puede usar #ep-medio o similar
-          const medioSel = page.locator('#ep-medio,select.fs').first();
-          await medioSel.selectOption('Cheque');
-          await page.click('[onclick*="saveEditPago"]');
-          try {
-            await page.waitForFunction(() => document.querySelector('#ep-medio') === null, { timeout: TIMEOUT_LARGO });
-            ok('U10-a: modal edición cerrado', true);
-          } catch (_) {
-            ok('U10-a: modal edición cerrado', false);
-          }
-        } else {
-          // Editar via REST como fallback
-          await _editarPago(p1db.id, jwt);
-          ok('U10-a: pago editado vía REST (botón no encontrado en UI)', true);
+      const btnEditar = page.locator(`[onclick*="editPago"][onclick*="${p1db.id}"]`).first();
+      if (await btnEditar.count() > 0) {
+        await btnEditar.click();
+        await page.waitForSelector('#ep-medio,#p-medio,select.fs', { timeout: TIMEOUT_CORTO });
+        const medioSel = page.locator('#ep-medio,select.fs').first();
+        await medioSel.selectOption('Cheque');
+        await page.click('[onclick*="saveEditPago"]');
+        try {
+          await page.waitForFunction(() => document.querySelector('#ep-medio') === null, { timeout: TIMEOUT_LARGO });
+          ok('U10-a: modal edición cerrado', true);
+        } catch (_) {
+          await screenshot(page, 'u10-modal-stuck');
+          ok('U10-a: modal edición cerrado', false);
         }
       } else {
-        await _editarPago(p1db.id, jwt);
-        ok('U10-a: pago editado vía REST (sesión no restaurada)', true);
+        await screenshot(page, 'u10-noedit');
+        ok('U10-a: botón editar visible en UI (pago 1)', false);
       }
       // Verificar en DB
       const pagos10 = await _queryPagosTest(jwt);
@@ -556,28 +590,21 @@ async function screenshot(page, nombre) {
       ok('U10: skip (no se encontró pago de $8.000)', false);
     }
 
-    // ── U11: Eliminar pago 2 ──────────────────────────────────────────────────
-    console.log('\n[U11] Eliminar pago 2');
+    // ── U11: Eliminar pago 2 vía UI ───────────────────────────────────────────
+    console.log('\n[U11] Eliminar pago 2 via UI');
     const pagos10b = await _queryPagosTest(jwt);
     const p2db = pagos10b.find(p => p.monto === 12000);
     if (p2db?.id) {
-      if (sesionRestaurada) {
-        const btnEliminar = page.locator(`[onclick*="delPago('${p2db.id}')"]`).first();
-        if (await btnEliminar.count() > 0) {
-          // Interceptar confirm() para aceptar automáticamente si lo hay
-          page.on('dialog', async dialog => { await dialog.accept(); });
-          await btnEliminar.click();
-          await page.waitForTimeout(2000); // esperar procesamiento asíncrono
-          ok('U11-a: botón eliminar clickeado', true);
-        } else {
-          await _eliminarPago(p2db.id, jwt);
-          ok('U11-a: pago 2 eliminado vía REST (botón no visible)', true);
-        }
+      const btnEliminar = page.locator(`[onclick*="delPago('${p2db.id}')"]`).first();
+      if (await btnEliminar.count() > 0) {
+        page.on('dialog', async dialog => { await dialog.accept(); });
+        await btnEliminar.click();
+        await page.waitForTimeout(2000);
+        ok('U11-a: botón eliminar clickeado', true);
       } else {
-        await _eliminarPago(p2db.id, jwt);
-        ok('U11-a: pago 2 eliminado vía REST (sesión no restaurada)', true);
+        await screenshot(page, 'u11-nodel');
+        ok('U11-a: botón eliminar visible en UI (pago 2)', false);
       }
-      // Verificar en DB
       const pagos11 = await _queryPagosTest(jwt);
       ok('U11-b: 1 pago en DB (pago 2 eliminado)', pagos11.length === 1);
     } else {
@@ -615,18 +642,5 @@ async function _queryPagosTest(jwt) {
   return Array.isArray(res.body) ? res.body : [];
 }
 
-async function _editarPago(pagoId, jwt) {
-  await supaFetchAuth(
-    `/rest/v1/pagos?id=eq.${encodeURIComponent(pagoId)}&cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}`,
-    jwt,
-    { method: 'PATCH', body: { medio: 'cheque' } }
-  );
-}
-
-async function _eliminarPago(pagoId, jwt) {
-  await supaFetchAuth(
-    `/rest/v1/pagos?id=eq.${encodeURIComponent(pagoId)}&cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}`,
-    jwt,
-    { method: 'DELETE', prefer: 'return=minimal' }
-  );
-}
+// _editarPago y _eliminarPago eliminados: U10/U11 usan exclusivamente la UI.
+// Si necesitas editar/eliminar en cleanup, usa limpiarFixtures() que ya lo hace.
