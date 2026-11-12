@@ -275,17 +275,30 @@ function modalEnviarPin(aluId){
 }
 
 async function delAlumno(id){
-  if(!confirm('¿Eliminar este alumno? Se eliminarán también sus pagos asociados.')) return;
-
   // ── V9_RELACIONAL: eliminar en Supabase ───────────────────────────────────
   if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
     if (!S._v9CuentaId) { alert('⚠️ Sesión relacional no inicializada (falta _v9CuentaId).'); return; }
+
+    // Bloquear si el alumno tiene pagos registrados (historial financiero protegido)
+    const pagosAlumno = (DB.pagos||[]).filter(p => p.alumnoId === id || p.aluId === id);
+    if (pagosAlumno.length > 0) {
+      alert(
+        `⛔ No se puede eliminar: este alumno tiene ${pagosAlumno.length} pago${pagosAlumno.length !== 1 ? 's' : ''} registrado${pagosAlumno.length !== 1 ? 's' : ''}.\n\n` +
+        'Para mantener la integridad del historial financiero, primero cambia el estado del alumno a "Retirado" en lugar de eliminarlo.'
+      );
+      return;
+    }
+
+    const alu = (DB.alumnos||[]).find(a => a.id === id);
+    const nombre = alu ? `${alu.nombres || ''} ${alu.apellidos || ''}`.trim() : id;
+    if (!confirm(`¿Eliminar a ${nombre}? También se eliminarán sus apoderados. Esta acción no se puede deshacer.`)) return;
+
     try {
       await eliminarAlumnoV9(S._v9CuentaId, id, _authToken);
-      // Actualizar caché local
+      // Actualizar caché local solo tras confirmación del servidor
       DB.alumnos    = (DB.alumnos   ||[]).filter(a => a.id !== id);
-      DB.pagos      = (DB.pagos     ||[]).filter(p => p.alumnoId !== id);
       DB.apoderados = (DB.apoderados||[]).filter(a => a.alumnoId !== id);
+      // DB.pagos no se toca — no había pagos (verificado arriba)
       go('alumnos');
     } catch (err) {
       console.error('[delAlumno v9]', err);
@@ -294,6 +307,7 @@ async function delAlumno(id){
     return;
   }
   // ── legado ────────────────────────────────────────────────────────────────
+  if(!confirm('¿Eliminar este alumno? Se eliminarán también sus pagos asociados.')) return;
   DB.alumnos=(DB.alumnos||[]).filter(a=>a.id!==id);
   DB.pagos=(DB.pagos||[]).filter(p=>p.alumnoId!==id);
   saveDB(); go('alumnos');

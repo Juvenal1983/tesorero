@@ -73,23 +73,41 @@ async function saveAlumno(id){
       let dbRow;
       if (id) {
         dbRow = await actualizarAlumnoV9(S._v9CuentaId, id, { nombres, apellidos, estado, obs, eximido }, _authToken);
-        // Actualizar caché local
-        const i = (DB.alumnos||[]).findIndex(a => a.id === id);
-        if (i >= 0) DB.alumnos[i] = { ...DB.alumnos[i], nombres, apellidos, estado, obs, eximido,
-          nombre: `${nombres} ${apellidos}`.trim(),
-          pin: pin || DB.alumnos[i].pin || '', _v9: true };
       } else {
         dbRow = await crearAlumnoV9(S._v9CuentaId, S.cursoId, { nombres, apellidos, estado, obs, eximido }, _authToken);
-        if (!DB.alumnos) DB.alumnos = [];
-        DB.alumnos.push({ id: dbRow.id, cursoId: S.cursoId, nombres, apellidos, estado, obs, eximido,
-          nombre: `${nombres} ${apellidos}`.trim(), pin: pin||'', _v9: true });
       }
-      // PIN: se guarda solo en blob local (alumnos_credenciales requiere service_role)
+      const aluId = id || dbRow.id;
+
+      // ── Recarga relacional de alumnos (garantiza consistencia al volver) ──
+      try {
+        const alumnosRaw = await cargarAlumnos(S._v9CuentaId, S.cursoId, _authToken);
+        DB.alumnos = alumnosRaw.map(_mapAlumno);
+      } catch (reloadErr) {
+        // Fallback: actualizar caché local si la recarga falla
+        console.warn('[saveAlumno v9] recarga falló, usando caché local:', reloadErr.message);
+        if (id) {
+          const i = (DB.alumnos||[]).findIndex(a => a.id === id);
+          if (i >= 0) DB.alumnos[i] = { ...DB.alumnos[i], nombres, apellidos, estado, obs, eximido,
+            nombre: `${nombres} ${apellidos}`.trim(), _v9: true };
+        } else {
+          if (!DB.alumnos) DB.alumnos = [];
+          DB.alumnos.push({ id: aluId, cursoId: S.cursoId, nombres, apellidos, estado, obs, eximido,
+            nombre: `${nombres} ${apellidos}`.trim(), _v9: true });
+        }
+      }
+
+      // ── PIN: guardar en servidor via RPC (hash bcrypt) ────────────────────
       if (pin) {
-        const aluId = id || dbRow.id;
-        const ix = (DB.alumnos||[]).findIndex(a => a.id === aluId);
-        if (ix >= 0) { DB.alumnos[ix].pin = pin; saveDB(); }
-        console.info('[saveAlumno v9] PIN guardado solo en blob local. Para hash seguro usar service_role en alumnos_credenciales.');
+        try {
+          await guardarPinV9(S._v9CuentaId, aluId, pin, _authToken);
+          // Actualizar caché local solo para mostrar "PIN configurado" en el modal
+          const ix = (DB.alumnos||[]).findIndex(a => a.id === aluId);
+          if (ix >= 0) DB.alumnos[ix].pin = '****'; // nunca guardar el PIN real en memoria
+        } catch (pinErr) {
+          // PIN fallido no bloquea el guardado del alumno
+          showToast('⚠️ Alumno guardado, pero PIN no pudo guardarse: ' + (pinErr.message || pinErr), '#E8A000');
+          console.warn('[saveAlumno v9] PIN error:', pinErr);
+        }
       }
       closeModal(); go('alumnos');
     } catch (err) {
@@ -161,8 +179,18 @@ async function saveEditApTesorero(apId, alumnoId){
     if (!S._v9CuentaId) { alert('⚠️ Sesión relacional no inicializada.'); return; }
     try {
       await actualizarApoderadoV9(S._v9CuentaId, apId, { nombre, relacion, telefono, email }, _authToken);
-      const i=(DB.apoderados||[]).findIndex(a=>a.id===apId);
-      if(i>=0) DB.apoderados[i]={...DB.apoderados[i], nombre, relacion, telefono, email, _v9:true};
+      // Recarga relacional de apoderados del alumno
+      try {
+        const ap = (DB.apoderados||[]).find(a => a.id === apId);
+        const aluId = ap?.alumnoId || alumnoId;
+        const rows = await cargarApoderadosV9(S._v9CuentaId, aluId, _authToken);
+        DB.apoderados = (DB.apoderados||[]).filter(a => a.alumnoId !== aluId)
+          .concat(rows.map(_mapApoderado));
+      } catch (reloadErr) {
+        // Fallback caché local
+        const i=(DB.apoderados||[]).findIndex(a=>a.id===apId);
+        if(i>=0) DB.apoderados[i]={...DB.apoderados[i], nombre, relacion, telefono, email, _v9:true};
+      }
       showModal('apoderadosAlumno',{id:alumnoId});
     } catch (err) {
       console.error('[saveEditApTesorero v9]', err);
@@ -227,9 +255,17 @@ async function saveAp(alumnoId){
     const btn = document.querySelector('[onclick*="saveAp"]');
     if (btn) { btn.disabled = true; btn.textContent = 'Guardando…'; }
     try {
-      const dbRow = await crearApoderadoV9(S._v9CuentaId, alumnoId, { nombre, relacion, telefono, email }, _authToken);
-      if (!DB.apoderados) DB.apoderados = [];
-      DB.apoderados.push({ id: dbRow.id, alumnoId, nombre, relacion, telefono, email, estado:'activo', _v9:true });
+      await crearApoderadoV9(S._v9CuentaId, alumnoId, { nombre, relacion, telefono, email }, _authToken);
+      // Recarga relacional de apoderados del alumno
+      try {
+        const rows = await cargarApoderadosV9(S._v9CuentaId, alumnoId, _authToken);
+        DB.apoderados = (DB.apoderados||[]).filter(a => a.alumnoId !== alumnoId)
+          .concat(rows.map(_mapApoderado));
+      } catch (reloadErr) {
+        // Fallback caché local si la recarga falla
+        if (!DB.apoderados) DB.apoderados = [];
+        DB.apoderados.push({ id: uid(), alumnoId, nombre, relacion, telefono, email, estado:'activo', _v9:true });
+      }
       showModal('apoderadosAlumno',{id:alumnoId});
     } catch (err) {
       console.error('[saveAp v9]', err);
@@ -252,9 +288,20 @@ async function delAp(id){
     if (!S._v9CuentaId) { alert('⚠️ Sesión relacional no inicializada.'); return; }
     try {
       await eliminarApoderadoV9(S._v9CuentaId, id, _authToken);
-      DB.apoderados = (DB.apoderados||[]).filter(x => x.id !== id);
-      if (ap) showModal('apoderadosAlumno',{id:ap.alumnoId});
-      else closeModal();
+      // Recarga relacional de apoderados del alumno
+      if (ap?.alumnoId) {
+        try {
+          const rows = await cargarApoderadosV9(S._v9CuentaId, ap.alumnoId, _authToken);
+          DB.apoderados = (DB.apoderados||[]).filter(a => a.alumnoId !== ap.alumnoId)
+            .concat(rows.map(_mapApoderado));
+        } catch (reloadErr) {
+          DB.apoderados = (DB.apoderados||[]).filter(x => x.id !== id);
+        }
+        showModal('apoderadosAlumno',{id:ap.alumnoId});
+      } else {
+        DB.apoderados = (DB.apoderados||[]).filter(x => x.id !== id);
+        closeModal();
+      }
     } catch (err) {
       console.error('[delAp v9]', err);
       showToast('❌ Error al eliminar apoderado: ' + (err.message || err), '#E24B4A');

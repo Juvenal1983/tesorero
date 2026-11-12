@@ -363,7 +363,8 @@ async function actualizarCuotaV9(cuentaId, cuotaId, data, accessToken) {
 }
 
 /**
- * Elimina una cuota. No lanza error si ya no existe.
+ * Elimina una cuota. Lanza error si no se encontró (0 filas afectadas).
+ * El caller debe haber verificado que no hay pagos asociados antes de llamar.
  */
 async function eliminarCuotaV9(cuentaId, cuotaId, accessToken) {
   const rows = await _v9Fetch(
@@ -372,8 +373,8 @@ async function eliminarCuotaV9(cuentaId, cuotaId, accessToken) {
     accessToken
   );
   if (!Array.isArray(rows) || rows.length === 0)
-    console.warn(`[datos_v9] eliminarCuotaV9: DELETE de cuota ${cuotaId} no afectó ninguna fila.`);
-  return rows || [];
+    throw new Error(`[datos_v9] eliminarCuotaV9: cuota ${cuotaId} no encontrada o sin permiso.`);
+  return rows;
 }
 
 // ─── CRUD alumnos ─────────────────────────────────────────────────────────────
@@ -430,7 +431,8 @@ async function actualizarAlumnoV9(cuentaId, alumnoId, data, accessToken) {
 }
 
 /**
- * Elimina un alumno. No lanza error si ya no existe.
+ * Elimina un alumno. Lanza error si no se encontró (0 filas afectadas).
+ * El caller debe haber verificado que no hay pagos asociados antes de llamar.
  */
 async function eliminarAlumnoV9(cuentaId, alumnoId, accessToken) {
   const rows = await _v9Fetch(
@@ -439,8 +441,8 @@ async function eliminarAlumnoV9(cuentaId, alumnoId, accessToken) {
     accessToken
   );
   if (!Array.isArray(rows) || rows.length === 0)
-    console.warn(`[datos_v9] eliminarAlumnoV9: DELETE de alumno ${alumnoId} no afectó ninguna fila.`);
-  return rows || [];
+    throw new Error(`[datos_v9] eliminarAlumnoV9: alumno ${alumnoId} no encontrado o sin permiso.`);
+  return rows;
 }
 
 // ─── CRUD apoderados ──────────────────────────────────────────────────────────
@@ -490,7 +492,7 @@ async function actualizarApoderadoV9(cuentaId, apId, data, accessToken) {
 }
 
 /**
- * Elimina un apoderado. No lanza error si ya no existe.
+ * Elimina un apoderado. Lanza error si no se encontró (0 filas afectadas).
  */
 async function eliminarApoderadoV9(cuentaId, apId, accessToken) {
   const rows = await _v9Fetch(
@@ -499,8 +501,160 @@ async function eliminarApoderadoV9(cuentaId, apId, accessToken) {
     accessToken
   );
   if (!Array.isArray(rows) || rows.length === 0)
-    console.warn(`[datos_v9] eliminarApoderadoV9: DELETE de apoderado ${apId} no afectó ninguna fila.`);
-  return rows || [];
+    throw new Error(`[datos_v9] eliminarApoderadoV9: apoderado ${apId} no encontrado o sin permiso.`);
+  return rows;
+}
+
+// ─── Recarga selectiva de alumnos/apoderados ─────────────────────────────────
+
+/**
+ * Carga todos los apoderados de un alumno específico.
+ * Usar tras crear/editar/eliminar un apoderado para mantener DB.apoderados
+ * sincronizado con Supabase.
+ */
+async function cargarApoderadosV9(cuentaId, alumnoId, accessToken) {
+  const rows = await _v9Fetch(
+    `/apoderados?cuenta_id=eq.${encodeURIComponent(cuentaId)}&alumno_id=eq.${encodeURIComponent(alumnoId)}&select=*&order=nombre.asc`,
+    { method: 'GET' },
+    accessToken
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+/**
+ * Llama al RPC tesorero_set_pin para guardar el PIN hasheado en el servidor.
+ * Requiere que el RPC sql/E5_pin_rpc.sql esté desplegado en staging/producción.
+ *
+ * @param {string} cuentaId   — UUID de la cuenta
+ * @param {string} alumnoId   — ID del alumno
+ * @param {string} pin        — PIN en texto plano (mínimo 4 caracteres)
+ * @param {string} accessToken — JWT del tesorero autenticado
+ * @returns {Promise<{ok: boolean, error?: string}>}
+ */
+async function guardarPinV9(cuentaId, alumnoId, pin, accessToken) {
+  const base = _v9BaseUrl();
+  const url  = base + '/rpc/tesorero_set_pin';
+  const res  = await fetch(url, {
+    method:  'POST',
+    headers: {
+      'apikey':        SUPA_KEY,
+      'Authorization': `Bearer ${accessToken}`,
+      'Content-Type':  'application/json',
+      'Accept':        'application/json',
+    },
+    body: JSON.stringify({
+      p_cuenta_id:  cuentaId,
+      p_alumno_id:  alumnoId,
+      p_pin:        pin,
+    }),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => res.status);
+    throw new Error(`[datos_v9] guardarPinV9: HTTP ${res.status} — ${txt}`);
+  }
+  const result = await res.json();
+  if (!result || result.ok === false) {
+    throw new Error(`[datos_v9] guardarPinV9: ${result?.error || 'error desconocido'}`);
+  }
+  return result;
+}
+
+// ─── CRUD movimientos (E6) ────────────────────────────────────────────────────
+
+/**
+ * Crea un movimiento (ingreso o gasto) en Supabase.
+ * @param {string} cuentaId
+ * @param {string} cursoId
+ * @param {Object} data — { tipo, desc, monto, categoria, fecha, responsable, visible, obs }
+ * @param {string} accessToken
+ */
+async function crearMovimientoV9(cuentaId, cursoId, data, accessToken) {
+  const id = data.id || uid();
+  const payload = {
+    cuenta_id:   cuentaId,
+    id,
+    curso_id:    cursoId,
+    tipo:        data.tipo        || 'gasto',
+    desc:        data.desc        || data.descripcion || null,
+    monto:       Math.round(Number(data.monto)) || 0,
+    categoria:   data.categoria   || null,
+    fecha:       data.fecha       || new Date().toISOString().slice(0, 10),
+    responsable: data.responsable || null,
+    visible:     data.visible     !== false,
+    obs:         data.obs         || null,
+    creado_por:  data.creadoPor   || null,
+    archivos:    data.archivos    || null,
+    comprobante: data.comprobante || null,
+  };
+  const rows = await _v9Fetch(
+    '/movimientos?select=*',
+    { method: 'POST', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(payload) },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error('[datos_v9] crearMovimientoV9: INSERT sin respuesta — verifica RLS y permisos.');
+  return { ...rows[0], id };
+}
+
+/**
+ * Actualiza campos de un movimiento existente.
+ */
+async function actualizarMovimientoV9(cuentaId, movId, data, accessToken) {
+  const patch = {};
+  if (data.tipo        !== undefined) patch.tipo        = data.tipo;
+  if (data.desc        !== undefined) patch.desc        = data.desc        || null;
+  if (data.descripcion !== undefined) patch.desc        = data.descripcion || null;
+  if (data.monto       !== undefined) patch.monto       = Math.round(Number(data.monto));
+  if (data.categoria   !== undefined) patch.categoria   = data.categoria   || null;
+  if (data.fecha       !== undefined) patch.fecha       = data.fecha;
+  if (data.responsable !== undefined) patch.responsable = data.responsable || null;
+  if (data.visible     !== undefined) patch.visible     = data.visible;
+  if (data.obs         !== undefined) patch.obs         = data.obs         || null;
+  const rows = await _v9Fetch(
+    `/movimientos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(movId)}&select=*`,
+    { method: 'PATCH', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(patch) },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error(`[datos_v9] actualizarMovimientoV9: movimiento ${movId} no encontrado.`);
+  return rows[0];
+}
+
+/**
+ * Elimina un movimiento. Lanza error si no se encontró (0 filas afectadas).
+ */
+async function eliminarMovimientoV9(cuentaId, movId, accessToken) {
+  const rows = await _v9Fetch(
+    `/movimientos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(movId)}&select=*`,
+    { method: 'DELETE', headers: { 'Prefer': 'return=representation' } },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error(`[datos_v9] eliminarMovimientoV9: movimiento ${movId} no encontrado o sin permiso.`);
+  return rows;
+}
+
+/**
+ * Convierte una fila de `movimientos` al shape esperado por DB.movimientos.
+ */
+function _mapMovimiento(row) {
+  return {
+    id:          row.id,
+    cursoId:     row.curso_id,
+    tipo:        row.tipo,
+    desc:        row.desc,
+    descripcion: row.desc,
+    monto:       row.monto,
+    categoria:   row.categoria,
+    fecha:       row.fecha,
+    responsable: row.responsable,
+    visible:     row.visible,
+    obs:         row.obs,
+    creadoPor:   row.creado_por,
+    archivos:    row.archivos    || [],
+    comprobante: row.comprobante || null,
+    _v9: true,
+  };
 }
 
 // ─── Adaptadores: mapear filas relacionales al formato esperado por DB ────────
@@ -539,6 +693,23 @@ function _mapAlumno(row) {
     apellidos:  row.apellidos,
     estado:     row.estado,
     eximido:    row.eximido,
+    _v9: true,
+  };
+}
+
+/**
+ * Convierte una fila de `apoderados` al shape que espera DB.apoderados.
+ */
+function _mapApoderado(row) {
+  return {
+    id:       row.id,
+    alumnoId: row.alumno_id,
+    aluId:    row.alumno_id,
+    nombre:   row.nombre,
+    relacion: row.relacion,
+    telefono: row.telefono,
+    email:    row.email,
+    estado:   row.estado,
     _v9: true,
   };
 }

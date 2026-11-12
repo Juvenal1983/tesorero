@@ -28,16 +28,30 @@ function renderCuotas(){
 }
 async function delCuota(id){
   if(!puedeEscribir()){ showToast('⛔ Sin permisos para eliminar cuotas','#E24B4A'); return; }
-  if(!confirm('¿Eliminar esta cuota? Los pagos asociados también serán eliminados.')) return;
 
   // ── V9_RELACIONAL: eliminar en Supabase ───────────────────────────────────
   if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
     if (!S._v9CuentaId) { alert('⚠️ Sesión relacional no inicializada (falta _v9CuentaId).'); return; }
+
+    // Bloquear si la cuota tiene pagos registrados (historial financiero protegido)
+    const pagosCuota = (DB.pagos||[]).filter(p => p.cuotaId === id);
+    if (pagosCuota.length > 0) {
+      const cuota = (DB.cuotas||[]).find(q => q.id === id);
+      alert(
+        `⛔ No se puede eliminar: la cuota "${cuota?.nombre || id}" tiene ${pagosCuota.length} pago${pagosCuota.length !== 1 ? 's' : ''} registrado${pagosCuota.length !== 1 ? 's' : ''}.\n\n` +
+        'El historial financiero no puede borrarse. Puedes desactivar la cuota cambiando su estado a "Inactiva" en lugar de eliminarla.'
+      );
+      return;
+    }
+
+    const cuota = (DB.cuotas||[]).find(q => q.id === id);
+    if (!confirm(`¿Eliminar la cuota "${cuota?.nombre || id}"? Esta acción no se puede deshacer.`)) return;
+
     try {
       await eliminarCuotaV9(S._v9CuentaId, id, _authToken);
-      // Actualizar caché local para render inmediato
+      // Actualizar caché local solo tras confirmación del servidor
       DB.cuotas = (DB.cuotas||[]).filter(q => q.id !== id);
-      DB.pagos  = (DB.pagos ||[]).filter(p => p.cuotaId !== id);
+      // DB.pagos no se toca — no había pagos (verificado arriba)
       go('cuotas');
     } catch (err) {
       console.error('[delCuota v9]', err);
@@ -46,6 +60,7 @@ async function delCuota(id){
     return;
   }
   // ── legado ────────────────────────────────────────────────────────────────
+  if(!confirm('¿Eliminar esta cuota? Los pagos asociados también serán eliminados.')) return;
   DB.cuotas=(DB.cuotas||[]).filter(q=>q.id!==id);
   DB.pagos=(DB.pagos||[]).filter(p=>p.cuotaId!==id);
   saveDB(); go('cuotas');

@@ -97,14 +97,25 @@ function renderMovimientos(){
     </table></div>`}
   </div>`;
 }
-function delMov(id){
+async function delMov(id){
   if(!puedeGestionarMovimientos()){ showToast('⛔ Sin permisos para eliminar movimientos','#E24B4A'); return; }
-  // B4-fix: en modo relacional v9, la eliminación de movimientos debe ir a Supabase.
+  if(!confirm('¿Eliminar este movimiento? Esta acción no se puede deshacer.')) return;
+
+  // ── V9_RELACIONAL: eliminar en Supabase ───────────────────────────────────
   if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
-    alert('⚠️ La eliminación de movimientos no está disponible en el modo relacional v9 todavía.\n\nEsta función requiere integración con la tabla movimientos de Supabase (pendiente de implementar).');
+    if(!S._v9CuentaId){ alert('⚠️ Sesión relacional no inicializada (falta _v9CuentaId).'); return; }
+    try {
+      await eliminarMovimientoV9(S._v9CuentaId, id, _authToken);
+      // Actualizar caché local solo tras confirmación del servidor
+      DB.movimientos = (DB.movimientos||[]).filter(m => m.id !== id);
+      go('movimientos');
+    } catch(err) {
+      console.error('[delMov v9]', err);
+      showToast('❌ Error al eliminar movimiento: ' + (err.message || err), '#E24B4A');
+    }
     return;
   }
-  if(!confirm('¿Eliminar este movimiento?')) return;
+  // ── legado ────────────────────────────────────────────────────────────────
   DB.movimientos=(DB.movimientos||[]).filter(m=>m.id!==id);
   saveDB(); go('movimientos');
 }
@@ -189,27 +200,45 @@ function modalEditMov(data){
   </div>`;
 }
 
-function saveEditMov(id){
+async function saveEditMov(id){
   if(!puedeGestionarMovimientos()){ showToast('⛔ Sin permisos para editar movimientos','#E24B4A'); return; }
-  // B4-fix: en modo relacional v9, la edición de movimientos debe ir a Supabase.
-  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
-    alert('⚠️ La edición de movimientos no está disponible en el modo relacional v9 todavía.\n\nEsta función requiere integración con la tabla movimientos de Supabase (pendiente de implementar).');
-    return;
-  }
   const m=(DB.movimientos||[]).find(x=>x.id===id);
   if(!m) return;
   const desc=document.getElementById('em-desc').value.trim();
   const monto=parseInt(document.getElementById('em-monto').value)||0;
   if(!desc||!monto){ alert('Completa descripción y monto.'); return; }
-  m.tipo        = document.getElementById('em-tipo').value;
-  m.desc        = desc;
-  m.descripcion = desc;
-  m.monto       = monto;
-  m.categoria   = document.getElementById('em-cat').value;
-  m.fecha       = document.getElementById('em-fecha').value;
-  m.responsable = document.getElementById('em-resp').value;
-  m.visible     = document.getElementById('em-visible').value==='true';
-  m.obs         = document.getElementById('em-obs').value;
+
+  const patch = {
+    tipo:        document.getElementById('em-tipo').value,
+    desc,
+    monto,
+    categoria:   document.getElementById('em-cat').value,
+    fecha:       document.getElementById('em-fecha').value,
+    responsable: document.getElementById('em-resp').value,
+    visible:     document.getElementById('em-visible').value==='true',
+    obs:         document.getElementById('em-obs').value,
+  };
+
+  // ── V9_RELACIONAL: actualizar en Supabase ─────────────────────────────────
+  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
+    if(!S._v9CuentaId){ alert('⚠️ Sesión relacional no inicializada (falta _v9CuentaId).'); return; }
+    const btn = document.querySelector('[onclick*="saveEditMov"]');
+    if(btn){ btn.disabled = true; btn.textContent = 'Guardando…'; }
+    try {
+      const dbRow = await actualizarMovimientoV9(S._v9CuentaId, id, patch, _authToken);
+      // Actualizar caché local solo tras confirmación del servidor
+      const idx = (DB.movimientos||[]).findIndex(x => x.id === id);
+      if(idx >= 0) DB.movimientos[idx] = { ...DB.movimientos[idx], ..._mapMovimiento(dbRow) };
+      closeModal(); showToast('✓ Movimiento actualizado'); go('movimientos');
+    } catch(err) {
+      console.error('[saveEditMov v9]', err);
+      showToast('❌ Error al actualizar movimiento: ' + (err.message || err), '#E24B4A');
+      if(btn){ btn.disabled = false; btn.textContent = '💾 Guardar cambios'; }
+    }
+    return;
+  }
+  // ── legado ────────────────────────────────────────────────────────────────
+  Object.assign(m, patch, { descripcion: patch.desc });
   saveDB(); closeModal(); showToast('✓ Movimiento actualizado'); go('movimientos');
 }
 
