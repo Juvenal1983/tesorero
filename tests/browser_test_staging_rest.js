@@ -182,15 +182,22 @@ async function queryPagosTest(jwt) {
 }
 
 async function queryPagosOriginales(jwt) {
-  const ids = PAGOS_ORIGINALES.map(id => `"${id}"`).join(',');
-  const res = await supaFetchAuth(
-    `/rest/v1/pagos?id=in.(${ids})&cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&select=id`,
-    jwt
-  );
-  if (res.status !== 200) {
-    throw new Error(`queryPagosOriginales: HTTP ${res.status} — ${JSON.stringify(res.body)}`);
+  // Cada pago original puede pertenecer a cuentas distintas (A o B).
+  // Se consulta por ID sin filtrar por cuenta_id; RLS permite verlos
+  // si el JWT tiene acceso (es_dueno de alguna cuenta o rol en el curso).
+  // Se hace una consulta por pago para no depender de que todos sean
+  // de la misma cuenta.
+  const encontrados = [];
+  for (const id of PAGOS_ORIGINALES) {
+    const res = await supaFetchAuth(
+      `/rest/v1/pagos?id=eq.${encodeURIComponent(id)}&select=id`,
+      jwt
+    );
+    if (res.status === 200 && Array.isArray(res.body) && res.body.length > 0) {
+      encontrados.push(id);
+    }
   }
-  return Array.isArray(res.body) ? res.body.map(p => p.id) : [];
+  return encontrados;
 }
 
 // ── Crear fixtures con JWT del tesorero ───────────────────────────────────────
