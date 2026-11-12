@@ -23,13 +23,14 @@ function modalAlumno(id){
       <div style="font-size:12px;color:var(--t3);margin-bottom:10px">
         El apoderado necesitará este PIN para ver el estado de pagos de su hijo/a. Entrégaselo personalmente.
       </div>
+      ${a?._pinConfigurado ? `<div style="font-size:12px;font-weight:700;color:var(--gm);margin-bottom:8px;padding:6px 10px;background:#EAF7EE;border-radius:7px">✅ PIN ya configurado — deja el campo vacío para no cambiarlo</div>` : ''}
       <div class="fg-row">
         <div class="fg">
-          <label class="fl">PIN (mínimo 4 caracteres)</label>
-          <input class="fi" id="m-pin" type="text" value="${escHtml(a?.pin||'')}"
-            placeholder="Ej: 1234 o marte25"
+          <label class="fl">${a?._pinConfigurado ? 'Nuevo PIN (vacío = sin cambio)' : 'PIN (mínimo 4 caracteres)'}</label>
+          <input class="fi" id="m-pin" type="text" value=""
+            placeholder="${a?._pinConfigurado ? 'Dejar vacío para mantener el PIN actual' : 'Ej: 1234 o marte25'}"
             style="font-size:16px;letter-spacing:2px"
-            autocomplete="off">
+            autocomplete="new-password">
         </div>
         <div class="fg" style="display:flex;align-items:flex-end">
           <button type="button" class="btn bs" onclick="generarPinAleatorio()" style="width:100%;justify-content:center">
@@ -37,7 +38,7 @@ function modalAlumno(id){
           </button>
         </div>
       </div>
-      ${a?.pin ? `<div style="font-size:12px;color:var(--gm);font-weight:600;margin-top:4px">✓ PIN configurado</div>` : `<div style="font-size:12px;color:var(--a);margin-top:4px">⚠ Sin PIN — el/la ${V('contacto')} no podrá acceder</div>`}
+      ${!a?._pinConfigurado ? `<div style="font-size:12px;color:var(--a);margin-top:4px">⚠ Sin PIN — el/la ${V('contacto')} no podrá acceder</div>` : ''}
     </div>
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px">
       <button class="btn" onclick="closeModal()">Cancelar</button>
@@ -97,15 +98,21 @@ async function saveAlumno(id){
       }
 
       // ── PIN: guardar en servidor via RPC (hash bcrypt) ────────────────────
+      // pin está vacío cuando el usuario no quiso cambiarlo (edición sin nuevo PIN)
       if (pin) {
         try {
           await guardarPinV9(S._v9CuentaId, aluId, pin, _authToken);
-          // Actualizar caché local solo para mostrar "PIN configurado" en el modal
+          // Marcar _pinConfigurado=true; NUNCA guardar el PIN ni un placeholder en memoria
           const ix = (DB.alumnos||[]).findIndex(a => a.id === aluId);
-          if (ix >= 0) DB.alumnos[ix].pin = '****'; // nunca guardar el PIN real en memoria
+          if (ix >= 0) {
+            DB.alumnos[ix]._pinConfigurado = true;
+            delete DB.alumnos[ix].pin; // limpiar cualquier valor residual
+          }
+          showToast('🔐 PIN guardado correctamente');
         } catch (pinErr) {
           // PIN fallido no bloquea el guardado del alumno
-          showToast('⚠️ Alumno guardado, pero PIN no pudo guardarse: ' + (pinErr.message || pinErr), '#E8A000');
+          // El alumno existe: se puede reintentar con retryPin(aluId)
+          showToast(`⚠️ Alumno guardado, pero el PIN no pudo configurarse: ${pinErr.message || pinErr}\n\nUsa "🔑 Configurar PIN" para reintentarlo sin crear otro alumno.`, '#E8A000');
           console.warn('[saveAlumno v9] PIN error:', pinErr);
         }
       }
@@ -313,3 +320,73 @@ async function delAp(id){
   saveDB(); if(ap) showModal('apoderadosAlumno',{id:ap.alumnoId});
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// retryPin(alumnoId)
+// Permite configurar/cambiar el PIN de un alumno ya creado sin recrearlo.
+// Se llama desde la lista de alumnos cuando el PIN falló al crear, o desde el
+// menú de acciones del alumno. Muestra un modal mínimo solo con el campo PIN.
+// ─────────────────────────────────────────────────────────────────────────────
+function modalRetryPin(alumnoId) {
+  const a = (DB.alumnos||[]).find(x => x.id === alumnoId);
+  if (!a) return '';
+  const nombre = `${a.nombres || ''} ${a.apellidos || ''}`.trim() || alumnoId;
+  return `<div class="modal">
+    <div class="modal-hdr">
+      <div class="modal-title">🔑 Configurar PIN — ${escHtml(nombre)}</div>
+      <button class="close-btn" onclick="closeModal()">×</button>
+    </div>
+    <div style="font-size:13px;color:var(--t3);margin-bottom:12px">
+      El alumno ya está registrado. Ingresa el PIN que el/la ${V('contacto')} usará para acceder.
+    </div>
+    ${a._pinConfigurado ? `<div style="font-size:12px;font-weight:700;color:var(--gm);margin-bottom:10px;padding:6px 10px;background:#EAF7EE;border-radius:7px">✅ Ya tiene PIN — lo reemplazarás si guardas uno nuevo</div>` : ''}
+    <div class="fg-row">
+      <div class="fg">
+        <label class="fl">PIN (mínimo 4 caracteres)</label>
+        <input class="fi" id="rp-pin" type="text" value=""
+          placeholder="Ej: 1234 o marte25"
+          style="font-size:16px;letter-spacing:2px"
+          autocomplete="new-password">
+      </div>
+      <div class="fg" style="display:flex;align-items:flex-end">
+        <button type="button" class="btn bs" onclick="document.getElementById('rp-pin').value=(()=>{const c='23456789ABCDEFGHJKLMNPQRSTUVWXYZ';let p='';for(let i=0;i<5;i++)p+=c[Math.floor(Math.random()*c.length)];return p;})()" style="width:100%;justify-content:center">
+          🎲 Generar PIN
+        </button>
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px">
+      <button class="btn" onclick="closeModal()">Cancelar</button>
+      <button class="btn bp" onclick="saveRetryPin('${alumnoId}')">🔐 Guardar PIN</button>
+    </div>
+  </div>`;
+}
+
+async function saveRetryPin(alumnoId) {
+  const pinEl = document.getElementById('rp-pin');
+  const pin   = pinEl ? pinEl.value.trim() : '';
+  if (!pin) { alert('Ingresa un PIN antes de guardar.'); return; }
+  if (pin.length < 4) { alert('El PIN debe tener al menos 4 caracteres.'); return; }
+
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    if (!S._v9CuentaId) { alert('⚠️ Sesión relacional no inicializada.'); return; }
+    const btn = document.querySelector('[onclick*="saveRetryPin"]');
+    if (btn) { btn.disabled = true; btn.textContent = 'Guardando…'; }
+    try {
+      await guardarPinV9(S._v9CuentaId, alumnoId, pin, _authToken);
+      const ix = (DB.alumnos||[]).findIndex(a => a.id === alumnoId);
+      if (ix >= 0) {
+        DB.alumnos[ix]._pinConfigurado = true;
+        delete DB.alumnos[ix].pin; // limpiar cualquier valor residual
+      }
+      closeModal();
+      showToast('🔐 PIN configurado correctamente');
+      go('alumnos');
+    } catch (err) {
+      console.error('[saveRetryPin v9]', err);
+      showToast('❌ Error al guardar PIN: ' + (err.message || err), '#E24B4A');
+      if (btn) { btn.disabled = false; btn.textContent = '🔐 Guardar PIN'; }
+    }
+    return;
+  }
+  // legado: no hay concepto de "PIN seguro" sin V9
+  alert('El modo relacional no está activo; el PIN seguro requiere V9_RELACIONAL.');
+}

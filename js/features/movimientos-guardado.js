@@ -32,26 +32,37 @@ async function saveMov(){
       window._archivos = [];
       closeModal();
       go('movimientos');
-      // Subir comprobantes en segundo plano si los hay
+      // Subir comprobantes y persistir URLs en PostgreSQL
       if (archivosLocales.length) {
         showToast('⏳ Subiendo comprobante...');
         setTimeout(async () => {
           try {
             const urls = await subirArchivosStorage(archivosLocales, dbRow.id);
-            const idx = (DB.movimientos||[]).findIndex(m => m.id === dbRow.id);
-            if (idx >= 0 && urls?.length) {
-              DB.movimientos[idx].archivos = urls;
-              if (urls.every(u => u.url)) {
-                delete DB.movimientos[idx]._pendienteStorage;
-                showToast('✅ Comprobante subido correctamente');
-              } else {
-                showToast('⚠️ Comprobante guardado parcialmente — pendiente de subir');
-              }
-              go('movimientos');
+            if (!urls?.length) {
+              showToast('⚠️ No se pudo subir el comprobante — queda pendiente. Usa "↑ Subir pendientes" para reintentar.');
+              return;
             }
+            const todosConUrl = urls.every(u => u.url);
+            const primerUrl   = (urls.find(u => u.url) || {}).url || null;
+
+            // Persistir URLs en PostgreSQL ANTES de anunciar éxito
+            // Nunca guardar base64 como solución permanente
+            const patchData = { archivos: urls };
+            if (primerUrl) patchData.comprobante = primerUrl;
+            await actualizarMovimientoV9(S._v9CuentaId, dbRow.id, patchData, _authToken);
+
+            // Actualizar caché local solo tras confirmación del servidor
+            const idx = (DB.movimientos||[]).findIndex(m => m.id === dbRow.id);
+            if (idx >= 0) {
+              DB.movimientos[idx].archivos   = urls;
+              if (primerUrl) DB.movimientos[idx].comprobante = primerUrl;
+              if (todosConUrl) delete DB.movimientos[idx]._pendienteStorage;
+            }
+            showToast(todosConUrl ? '✅ Comprobante guardado correctamente' : '⚠️ Comprobante guardado parcialmente');
+            go('movimientos');
           } catch(e) {
-            console.warn('[saveMov v9] Error subiendo comprobante:', e);
-            showToast('⚠️ Error al subir comprobante — queda pendiente');
+            console.warn('[saveMov v9] Error subiendo/persistiendo comprobante:', e);
+            showToast('⚠️ Error al guardar comprobante: ' + (e.message || e));
           }
         }, 500);
       }

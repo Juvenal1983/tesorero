@@ -522,16 +522,50 @@ async function cargarApoderadosV9(cuentaId, alumnoId, accessToken) {
 }
 
 /**
+ * Carga TODOS los apoderados de una cuenta (todos los alumnos).
+ * Usar en cargarSesionV9 y recargarCursoV9 para poblar DB.apoderados en un
+ * solo request. Los apoderados son de cuenta, no de curso.
+ */
+async function cargarTodosApoderadosV9(cuentaId, accessToken) {
+  const rows = await _v9Fetch(
+    `/apoderados?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*&order=nombre.asc`,
+    { method: 'GET' },
+    accessToken
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+/**
+ * Carga los movimientos de un curso.
+ * Usar en cargarSesionV9 y recargarCursoV9 para poblar DB.movimientos.
+ */
+async function cargarMovimientosV9(cuentaId, cursoId, accessToken) {
+  const rows = await _v9Fetch(
+    `/movimientos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&curso_id=eq.${encodeURIComponent(cursoId)}&select=*&order=fecha.desc`,
+    { method: 'GET' },
+    accessToken
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+/**
  * Llama al RPC tesorero_set_pin para guardar el PIN hasheado en el servidor.
- * Requiere que el RPC sql/E5_pin_rpc.sql esté desplegado en staging/producción.
+ * Valida en cliente antes de enviar; el servidor revalida de forma independiente.
  *
- * @param {string} cuentaId   — UUID de la cuenta
- * @param {string} alumnoId   — ID del alumno
- * @param {string} pin        — PIN en texto plano (mínimo 4 caracteres)
+ * @param {string} cuentaId    — UUID de la cuenta
+ * @param {string} alumnoId    — ID del alumno
+ * @param {string} pin         — PIN en texto plano (mínimo 4 caracteres, no vacío)
  * @param {string} accessToken — JWT del tesorero autenticado
- * @returns {Promise<{ok: boolean, error?: string}>}
+ * @returns {Promise<{ok: boolean}>}
+ * @throws {Error} si el PIN es inválido o el servidor rechaza
  */
 async function guardarPinV9(cuentaId, alumnoId, pin, accessToken) {
+  // Validación cliente (el servidor revalida independientemente)
+  if (pin == null || typeof pin !== 'string') throw new Error('PIN inválido: debe ser texto.');
+  const pinTrimmed = pin.trim();
+  if (pinTrimmed.length === 0) throw new Error('PIN vacío: ingresa un PIN antes de guardar.');
+  if (pinTrimmed.length < 4)   throw new Error(`PIN demasiado corto: mínimo 4 caracteres (recibido: ${pinTrimmed.length}).`);
+
   const base = _v9BaseUrl();
   const url  = base + '/rpc/tesorero_set_pin';
   const res  = await fetch(url, {
@@ -543,18 +577,19 @@ async function guardarPinV9(cuentaId, alumnoId, pin, accessToken) {
       'Accept':        'application/json',
     },
     body: JSON.stringify({
-      p_cuenta_id:  cuentaId,
-      p_alumno_id:  alumnoId,
-      p_pin:        pin,
+      p_cuenta_id: cuentaId,
+      p_alumno_id: alumnoId,
+      p_pin:       pinTrimmed,
     }),
   });
   if (!res.ok) {
-    const txt = await res.text().catch(() => res.status);
+    const txt = await res.text().catch(() => String(res.status));
     throw new Error(`[datos_v9] guardarPinV9: HTTP ${res.status} — ${txt}`);
   }
   const result = await res.json();
   if (!result || result.ok === false) {
-    throw new Error(`[datos_v9] guardarPinV9: ${result?.error || 'error desconocido'}`);
+    const msg = result?.detalle || result?.error || 'error desconocido';
+    throw new Error(`[datos_v9] guardarPinV9: ${msg}`);
   }
   return result;
 }
@@ -610,6 +645,9 @@ async function actualizarMovimientoV9(cuentaId, movId, data, accessToken) {
   if (data.responsable !== undefined) patch.responsable = data.responsable || null;
   if (data.visible     !== undefined) patch.visible     = data.visible;
   if (data.obs         !== undefined) patch.obs         = data.obs         || null;
+  // Campos de comprobante — aceptados explícitamente; nunca guardar base64 como valor permanente
+  if (data.archivos    !== undefined) patch.archivos    = data.archivos    || null;
+  if (data.comprobante !== undefined) patch.comprobante = data.comprobante || null;
   const rows = await _v9Fetch(
     `/movimientos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(movId)}&select=*`,
     { method: 'PATCH', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(patch) },
@@ -863,14 +901,21 @@ async function cargarSesionV9(authId, accessToken, cursoId) {
 
   // 3. Alumnos del primer curso (se recargan al cambiar de curso en selectCurso)
   if (primerCursoId) {
-    const alumnosRaw = await cargarAlumnos(cuentaId, primerCursoId, accessToken);
-    DB.alumnos = alumnosRaw.map(_mapAlumno);
-
-    const cuotasRaw = await cargarCuotas(cuentaId, primerCursoId, accessToken);
-    DB.cuotas = cuotasRaw.map(_mapCuota);
+    const [alumnosRaw, cuotasRaw, apoderadosRaw, movimientosRaw] = await Promise.all([
+      cargarAlumnos(cuentaId, primerCursoId, accessToken),
+      cargarCuotas(cuentaId, primerCursoId, accessToken),
+      cargarTodosApoderadosV9(cuentaId, accessToken),
+      cargarMovimientosV9(cuentaId, primerCursoId, accessToken),
+    ]);
+    DB.alumnos      = alumnosRaw.map(_mapAlumno);
+    DB.cuotas       = cuotasRaw.map(_mapCuota);
+    DB.apoderados   = apoderadosRaw.map(_mapApoderado);
+    DB.movimientos  = movimientosRaw.map(_mapMovimiento);
   } else {
-    DB.alumnos = [];
-    DB.cuotas  = [];
+    DB.alumnos      = [];
+    DB.cuotas       = [];
+    DB.apoderados   = [];
+    DB.movimientos  = [];
   }
 
   // 4. Pagos de la cuenta (todos los cursos)
@@ -878,10 +923,8 @@ async function cargarSesionV9(authId, accessToken, cursoId) {
   DB.pagos = pagosRaw.map(_mapPago);
 
   // 5. C16: limpiar colecciones no relacionales (nunca preservar de sesión anterior).
-  // Usar || [] podría dejar datos de un usuario previo si el logout fue parcial.
-  DB.movimientos = [];
-  DB.notas       = [];
-  DB.colegios    = [];
+  DB.notas    = [];
+  DB.colegios = [];
 
   // Guardar cuentaId en S para que lo usen las funciones de guardado
   if (typeof S !== 'undefined') {
@@ -905,24 +948,28 @@ async function cargarSesionV9(authId, accessToken, cursoId) {
  *
  * @param {string} cursoId
  * @param {string} accessToken
- * @returns {Promise<{ alumnos: object[], cuotas: object[], pagos: object[] }>}
+ * @returns {Promise<{ alumnos: object[], cuotas: object[], pagos: object[], apoderados: object[], movimientos: object[] }>}
  */
 async function recargarCursoV9(cursoId, accessToken) {
   const cuentaId = (typeof S !== 'undefined' && S._v9CuentaId);
   if (!cuentaId) throw new Error('[v9] recargarCursoV9: S._v9CuentaId no disponible');
 
-  const [alumnosRaw, cuotasRaw, pagosRaw] = await Promise.all([
+  const [alumnosRaw, cuotasRaw, pagosRaw, apoderadosRaw, movimientosRaw] = await Promise.all([
     cargarAlumnos(cuentaId, cursoId, accessToken),
     cargarCuotas(cuentaId, cursoId, accessToken),
     cargarPagos(cuentaId, accessToken),
+    cargarTodosApoderadosV9(cuentaId, accessToken),
+    cargarMovimientosV9(cuentaId, cursoId, accessToken),
   ]);
 
   // Devolver los datos mapeados sin escribir en DB.
   // El llamador es responsable de verificar el epoch y aplicar los datos.
   return {
-    alumnos: alumnosRaw.map(_mapAlumno),
-    cuotas:  cuotasRaw.map(_mapCuota),
-    pagos:   pagosRaw.map(_mapPago),
+    alumnos:     alumnosRaw.map(_mapAlumno),
+    cuotas:      cuotasRaw.map(_mapCuota),
+    pagos:       pagosRaw.map(_mapPago),
+    apoderados:  apoderadosRaw.map(_mapApoderado),
+    movimientos: movimientosRaw.map(_mapMovimiento),
   };
 }
 

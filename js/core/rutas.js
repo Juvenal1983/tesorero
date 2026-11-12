@@ -47,9 +47,11 @@ function selectCurso(id){
           return;
         }
         // Aplicar datos y cursoId atómicamente: nunca DB sin cursoId ni cursoId sin datos
-        DB.alumnos = datos.alumnos;
-        DB.cuotas  = datos.cuotas;
-        DB.pagos   = datos.pagos;
+        DB.alumnos      = datos.alumnos;
+        DB.cuotas       = datos.cuotas;
+        DB.pagos        = datos.pagos;
+        DB.apoderados   = datos.apoderados  || [];
+        DB.movimientos  = datos.movimientos || [];
         S.cursoId  = id;
         go('dashboard');
       })

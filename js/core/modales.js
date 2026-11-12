@@ -34,6 +34,7 @@ function buildModal(){
     case 'editApoderado': return modalEditApoderadoLector(data);
     case 'editApoderadoTesorero': return modalEditApoderadoTesorero(data);
     case 'addApoderadoLector': return modalAddApoderadoLector(data);
+    case 'retryPin': return modalRetryPin(data.id);
     default: return '';
   }
 }

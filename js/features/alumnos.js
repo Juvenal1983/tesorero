@@ -49,17 +49,14 @@ function renderAlumnos(){
             </td>
             <td><span class="badge ${a.estado==='activo'?'bgg':'bgt'}">${a.estado==='activo'?'Activo':'Retirado'}</span></td>
             <td>
-              ${a.pin
+              ${a._pinConfigurado
                 ? `<div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap">
-                    <code style="font-size:14px;font-weight:700;letter-spacing:2px;color:var(--g);background:var(--gl);padding:3px 8px;border-radius:5px">${escHtml(a.pin)}</code>
-                    <button class="btn bs" title="Copiar PIN" onclick="copiarPin('${escHtml(a.pin)}',this)" style="padding:3px 7px;font-size:11px">📋</button>
-                    <button class="btn bs" title="${apConTel?'Enviar por WhatsApp a '+escHtml(apConTel.nombre):'Sin teléfono registrado'}"
-                      onclick="enviarPinWsp('${a.id}')"
-                      style="padding:3px 7px;font-size:11px;background:${apConTel?'#25D366':'var(--bg)'};color:${apConTel?'#fff':'var(--t3)'};border-color:${apConTel?'#25D366':'var(--brd)'}">
-                      💬${apConTel?'':' —'}
-                    </button>
+                    <span style="font-size:12px;font-weight:700;color:var(--gm);background:#EAF7EE;padding:3px 8px;border-radius:5px">✅ Configurado</span>
+                    ${puedeEscribir() ? `<button class="btn bs" title="Cambiar PIN" onclick="showModal('retryPin',{id:'${a.id}'})" style="padding:3px 7px;font-size:11px">🔑</button>` : ''}
                   </div>`
-                : `<span class="badge bga" style="cursor:pointer" onclick="showModal('editAlumno',{id:'${a.id}'})">⚠ Sin PIN</span>`
+                : (puedeEscribir()
+                    ? `<button class="btn bs bga" onclick="showModal('retryPin',{id:'${a.id}'})" style="font-size:12px">⚠ Configurar PIN</button>`
+                    : `<span class="badge bga">⚠ Sin PIN</span>`)
               }
             </td>
             <td><span style="color:var(--t3);font-size:13px">${aps.length} apoderado${aps.length!==1?'s':''}</span></td>
