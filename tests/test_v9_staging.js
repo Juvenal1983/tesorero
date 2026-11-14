@@ -109,14 +109,15 @@ async function req(urlPath, opts = {}, token = null) {
 }
 
 async function rpc(name, params, token) {
+  const headers = {
+    'apikey':       STAGING_KEY,
+    'Content-Type': 'application/json',
+    'Accept':       'application/json',
+  };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
   const res = await fetch(`${BASE}/rpc/${name}`, {
     method: 'POST',
-    headers: {
-      'apikey':        STAGING_KEY,
-      'Authorization': `Bearer ${token}`,
-      'Content-Type':  'application/json',
-      'Accept':        'application/json',
-    },
+    headers,
     body: JSON.stringify(params),
   });
   const body = await res.json().catch(() => null);
