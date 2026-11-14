@@ -344,6 +344,17 @@ async function testMovimientos(page) {
       ? ok('E6.M3a: comprobante URL persistida en PostgreSQL (Storage → PG, no base64)')
       : ko('E6.M3a: comprobante no persistido o no disponible', String(comprobanteUrl));
 
+    // Si no se persistió, mostrar errores de Storage capturados para diagnóstico
+    if (!urlValida && storageErrors.length > 0) {
+      console.warn('  📋 Errores de Storage interceptados durante el test:');
+      storageErrors.forEach(e =>
+        console.warn(`     ${e.status} ${e.url.replace(/.*\/storage\//, '/storage/')}\n     ${e.body.slice(0, 400)}`)
+      );
+    } else if (!urlValida) {
+      console.warn('  ℹ️  Sin errores de Storage interceptados — puede que Storage no esté configurado en staging');
+      console.warn('     Verificar: Supabase Dashboard → Storage → Buckets → "comprobantes" debe existir');
+    }
+
     const archivos = rows?.[0]?.archivos;
     Array.isArray(archivos) && archivos.length > 0
       ? ok('E6.M3b: campo archivos (JSONB) persistido')
@@ -390,9 +401,15 @@ async function testMovimientos(page) {
   // ── E6.M6: Eliminar movimiento ────────────────────────────────────────────
   console.log('  → E6.M6: Eliminar movimiento');
   try {
-    // Registrar el handler de confirm ANTES de llamar delMov (evita race condition)
+    // ⚠️  NO hacer `await` en el evaluate que llama delMov:
+    //   window.confirm() es SÍNCRONO en la página y pausa la ejecución JS
+    //   hasta que Playwright resuelva el diálogo. Si await-amos evaluate aquí,
+    //   nunca llegaríamos a `await dialogPromise` → deadlock permanente.
+    //   La solución: lanzar evaluate sin await, dejar que confirm dispare el
+    //   evento 'dialog', atraparlo, aceptarlo; evaluate completa solo.
     const dialogPromise = page.waitForEvent('dialog', { timeout: TIMEOUT_CORTO });
-    await page.evaluate(id => window.delMov && window.delMov(id), movIdCreado);
+    page.evaluate(id => window.delMov && window.delMov(id), movIdCreado)
+      .catch(e => console.warn('  [delMov evaluate]', e.message));
     const dialog = await dialogPromise;
     await dialog.accept();
     ok('E6.M6a: confirm de eliminar aceptado');
@@ -526,6 +543,8 @@ async function testPin(page) {
   console.log(`  Staging: ${SUPA_URL}\n`);
 
   let server, browser, page;
+  // Interceptar errores de Storage para diagnóstico de HTTP 400
+  const storageErrors = [];
 
   try {
     // Setup REST
@@ -541,6 +560,19 @@ async function testPin(page) {
     const ctx = await browser.newContext();
     page = await ctx.newPage();
     page.on('console', m => { if (m.type() === 'error') console.error('  🖥 ' + m.text()); });
+
+    // Capturar respuestas 4xx/5xx de Storage para diagnóstico
+    page.on('response', async resp => {
+      if (resp.url().includes('/storage/') && resp.status() >= 400) {
+        try {
+          const body = await resp.text().catch(() => '(sin cuerpo)');
+          const entry = { status: resp.status(), url: resp.url(), body };
+          storageErrors.push(entry);
+          console.warn(`  🔴 Storage ${resp.status()} POST ${resp.url().replace(/.*\/storage\//, '/storage/')}`);
+          console.warn(`     Body: ${body.slice(0, 300)}`);
+        } catch (_) {}
+      }
+    });
 
     console.log('\n🔑 Login UI...');
     await loginUI(page);
