@@ -10,7 +10,8 @@
     "test:delegado": "node tests/06_acceso_delegado.js",
     "test:guard":    "node tests/07_guard_logout_db.js",
     "test:all":  "node tests/07_guard_logout_db.js && node tests/03_rls_cliente.js && node tests/04_verifica_no_produccion.js && node tests/05_prueba_funcional_ui.js && node tests/06_acceso_delegado.js",
-    "test:v9":   "node tests/test_v9_staging.js"
+    "test:v9":   "node tests/test_v9_staging.js",
+    "test:e6":   "node tests/e6_movimientos_pin.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
