@@ -256,27 +256,24 @@ async function testMovimientos(page) {
   );
   ok('E6.M1a: modal cerrado tras crear movimiento');
 
-  // Verificar en caché local
-  const movIdCreado = await page.evaluate(desc =>
-    (window.DB?.movimientos || []).find(m => m.desc === desc || m.descripcion === desc)?.id,
-    descCrear
-  );
-  ok('E6.M1b: movimiento aparece en caché local', movIdCreado);
+  // DB es let de módulo — no accesible como window.DB.
+  // Obtener el ID directamente desde PostgreSQL, buscando por desc+curso+monto.
+  let movIdCreado = null;
+  try {
+    const rows = await req(
+      `/movimientos?cuenta_id=eq.${cuentaId}&curso_id=eq.${encodeURIComponent(CURSO_ID)}&desc=eq.${encodeURIComponent(descCrear)}&select=id,monto,tipo&order=id.desc&limit=1`
+    );
+    movIdCreado = rows?.[0]?.id || null;
+    rows?.[0]?.monto === 5000 && rows?.[0]?.tipo === 'gasto'
+      ? ok('E6.M1b: movimiento persistido en PostgreSQL (monto y tipo correctos)')
+      : ko('E6.M1b: movimiento no encontrado o campos incorrectos', JSON.stringify(rows?.[0]));
+  } catch (e) { ko('E6.M1b: error al verificar PostgreSQL', e.message); }
 
   if (!movIdCreado) {
     ko('E6.M1c: sin ID no se puede continuar el flujo de movimientos');
     return null;
   }
-
-  // Verificar en PostgreSQL
-  try {
-    const rows = await req(
-      `/movimientos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(movIdCreado)}&select=desc,monto,tipo`
-    );
-    rows?.[0]?.monto === 5000 && rows?.[0]?.tipo === 'gasto'
-      ? ok('E6.M1c: movimiento persistido en PostgreSQL')
-      : ko('E6.M1c: movimiento no encontrado en PostgreSQL', JSON.stringify(rows?.[0]));
-  } catch (e) { ko('E6.M1c: error al verificar PostgreSQL', e.message); }
+  ok('E6.M1c: ID de movimiento obtenido (' + movIdCreado.slice(0, 8) + '…)');
 
   // ── E6.M2: Editar movimiento ──────────────────────────────────────────────
   console.log('  → E6.M2: Editar movimiento');
@@ -424,11 +421,18 @@ async function testPin(page) {
   await page.evaluate(() => window.go('alumnos'));
   await page.waitForFunction(() => window.S?.route === 'alumnos', { timeout: TIMEOUT_CORTO });
 
+  // Esperar a que el alumno fixture aparezca renderizado en la lista de alumnos
+  // (el caso 'editAlumno' lo gestiona el dispatcher de modales)
+  await page.waitForFunction(
+    id => !!document.querySelector(`[onclick*="${id}"]`),
+    ALU_ID, { timeout: TIMEOUT_LARGO }
+  );
+
   // ── E6.PIN1: Configurar PIN en alumno fixture (ya existe en DB) ───────────
   console.log('  → E6.PIN1: Abrir alumno fixture y configurar PIN');
   const pinInicial = 'UIPIN9';
   try {
-    await page.evaluate(id => window.showModal('alumno', { id }), ALU_ID);
+    await page.evaluate(id => window.showModal('editAlumno', { id }), ALU_ID);
     await page.waitForSelector('#m-pin', { timeout: TIMEOUT_CORTO });
 
     // El campo PIN debe estar vacío (nunca precargado con texto real ni '****')
@@ -482,7 +486,7 @@ async function testPin(page) {
   const pinNuevo = 'RETRY77';
   try {
     // El botón 🔑 llama a retryPin(alumnoId); abrirlo vía evaluate
-    await page.evaluate(id => window.modalRetryPin && window.modalRetryPin(id), ALU_ID);
+    await page.evaluate(id => window.showModal('retryPin', { id }), ALU_ID);
     await page.waitForSelector('#rp-pin', { timeout: TIMEOUT_CORTO });
 
     await page.fill('#rp-pin', pinNuevo);
