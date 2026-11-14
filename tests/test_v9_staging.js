@@ -347,7 +347,7 @@ async function runTests(token, cuentaId, cursoId) {
   try {
     const rCorr = await rpc('apoderado_acceso',
       { p_cuenta_id: cuentaId, p_alumno_id: alumnoId, p_pin: pinValido },
-      token   // apoderado_acceso acepta authenticated
+      null   // anon — igual que el acceso real del apoderado; sin JWT del tesorero
     );
     !rCorr?.error
       ? ok('PIN correcto aceptado por apoderado_acceso (bcrypt verificado en servidor)')
@@ -357,7 +357,7 @@ async function runTests(token, cuentaId, cursoId) {
   try {
     const rWrong = await rpc('apoderado_acceso',
       { p_cuenta_id: cuentaId, p_alumno_id: alumnoId, p_pin: 'INCORRECTO99' },
-      token
+      null   // anon
     );
     rWrong?.error
       ? ok('PIN incorrecto rechazado (error: ' + rWrong.error + ')')
@@ -460,7 +460,7 @@ async function runTests(token, cuentaId, cursoId) {
   // Verificar que el PIN anterior (pinValido = 'PRUEBA9') aún funciona ANTES del cambio
   try {
     const rAntes = await rpc('apoderado_acceso',
-      { p_cuenta_id: cuentaId, p_alumno_id: alumnoId, p_pin: pinValido }, token);
+      { p_cuenta_id: cuentaId, p_alumno_id: alumnoId, p_pin: pinValido }, null); // anon
     !rAntes?.error
       ? ok('retryPin: PIN original sigue válido antes del cambio')
       : ko('retryPin: PIN original inválido antes del cambio', JSON.stringify(rAntes));
@@ -479,7 +479,7 @@ async function runTests(token, cuentaId, cursoId) {
   // PIN viejo debe ser rechazado
   try {
     const rViejo = await rpc('apoderado_acceso',
-      { p_cuenta_id: cuentaId, p_alumno_id: alumnoId, p_pin: pinValido }, token);
+      { p_cuenta_id: cuentaId, p_alumno_id: alumnoId, p_pin: pinValido }, null); // anon
     rViejo?.error
       ? ok('retryPin: PIN anterior rechazado tras el cambio (ON CONFLICT DO UPDATE efectivo)')
       : ko('retryPin: PIN anterior aún aceptado — upsert no funcionó', JSON.stringify(rViejo));
@@ -488,7 +488,7 @@ async function runTests(token, cuentaId, cursoId) {
   // PIN nuevo debe ser aceptado
   try {
     const rNuevo = await rpc('apoderado_acceso',
-      { p_cuenta_id: cuentaId, p_alumno_id: alumnoId, p_pin: pinNuevo }, token);
+      { p_cuenta_id: cuentaId, p_alumno_id: alumnoId, p_pin: pinNuevo }, null); // anon
     !rNuevo?.error
       ? ok('retryPin: PIN nuevo aceptado (bcrypt verificado en servidor)')
       : ko('retryPin: PIN nuevo rechazado', JSON.stringify(rNuevo));
