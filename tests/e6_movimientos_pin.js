@@ -80,6 +80,9 @@ const ALU_ID       = `alu-e6-${EXEC_ID}`;
 let pass = 0, fail = 0;
 const failures = [];
 let token = null, cuentaId = null;
+// Errores de Storage interceptados por page.on('response') — scope de módulo
+// para que testMovimientos() pueda leer lo que el IIFE registró.
+const storageErrors = [];
 
 // ── Contadores ────────────────────────────────────────────────────────────────
 function ok(label) { pass++; console.log(`  ✅ ${label}`); }
@@ -543,8 +546,6 @@ async function testPin(page) {
   console.log(`  Staging: ${SUPA_URL}\n`);
 
   let server, browser, page;
-  // Interceptar errores de Storage para diagnóstico de HTTP 400
-  const storageErrors = [];
 
   try {
     // Setup REST
