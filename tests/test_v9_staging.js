@@ -26,10 +26,12 @@
  *       https://tmjqzaakzhecbldebyeg.supabase.co
  *
  * Flujos probados:
- *   T1  Alumno + PIN: hash bcrypt, rechazo de PIN null/vacío/corto, _pinConfigurado
+ *   T1  Alumno + PIN: validaciones rechazo (null/vacío/corto), PIN válido aceptado,
+ *       verificación bcrypt vía apoderado_acceso (correcto ✓ / incorrecto ✗)
+ *       — alumnos_credenciales nunca se lee directamente (acceso intencionalmente bloqueado).
  *   T2  Apoderado creado → reaparece en carga completa de cuenta (simula recarga de sesión)
  *   T3  Movimiento → PATCH archivos+comprobante → reaparece al recargar
- *   T4  retryPin → cambia PIN en alumno existente sin recrearlo
+ *   T4  retryPin → cambia PIN en alumno existente: PIN viejo rechazado, nuevo aceptado
  */
 
 'use strict';
@@ -231,7 +233,7 @@ async function main() {
         id:        cursoId,
         nombre:    `[test-v9] Fixture ${new Date().toISOString()} (auto-eliminar)`,
         anio:      new Date().getFullYear(),
-        activo:    false,   // inactivo para no aparecer en vistas normales
+        activo:    true,    // activo para que apoderado_acceso pueda verificar PIN
       }),
     }, token);
     // Registrar PRIMERO para que cleanup lo borre AL FINAL (hijos primero)
@@ -255,10 +257,9 @@ async function main() {
   console.log('═════════════════════════════════════════════════════════');
 
   if (fail === 0) {
-    console.log('\n  Todo OK.');
-    console.log('  Paso siguiente: ejecutar sql/E5_pin_rpc.sql en staging (no tocar producción).');
+    console.log('\n  Todo OK. El RPC tesorero_set_pin y el flujo V9 funcionan correctamente en staging.');
   } else {
-    console.log('\n  Corrige los errores ❌ antes de ejecutar el RPC en staging.');
+    console.log('\n  Corrige los errores ❌ antes de continuar.');
   }
   process.exit(fail > 0 ? 1 : 0);
 }
@@ -285,7 +286,7 @@ async function runTests(token, cuentaId, cursoId) {
         estado:    'activo',
       }),
     }, token);
-    _cleanup.push({ table: 'alumnos_credenciales', field: 'alumno_id', id: alumnoId, cuentaId });
+    // alumnos_credenciales se borra por CASCADE al eliminar el alumno — no requiere entrada explícita
     _cleanup.push({ table: 'alumnos', id: alumnoId, cuentaId });
     ok(`Alumno creado (${alumnoId})`);
   } catch (e) {
@@ -339,20 +340,29 @@ async function runTests(token, cuentaId, cursoId) {
       : ko('PIN válido falló', JSON.stringify(r));
   } catch (e) { ko('PIN válido — error inesperado', e.message); }
 
-  // 1f. hash en BD es bcrypt, nunca texto plano
+  // 1f. Verificar PIN vía apoderado_acceso (bcrypt en servidor):
+  //     · PIN correcto  → respuesta sin campo "error" (devuelve datos del alumno)
+  //     · PIN incorrecto → respuesta con campo "error"
+  //     alumnos_credenciales NO se lee directamente (bloqueado intencionalmente por RLS).
   try {
-    const rows = await req(
-      `/alumnos_credenciales?cuenta_id=eq.${encodeURIComponent(cuentaId)}&alumno_id=eq.${encodeURIComponent(alumnoId)}&select=pin_hash`,
-      {}, token
+    const rCorr = await rpc('apoderado_acceso',
+      { p_cuenta_id: cuentaId, p_alumno_id: alumnoId, p_pin: pinValido },
+      token   // apoderado_acceso acepta authenticated
     );
-    const hash = rows?.[0]?.pin_hash;
-    hash?.startsWith('$2')
-      ? ok('pin_hash comienza con $2 (bcrypt confirmado)')
-      : ko('pin_hash no tiene formato bcrypt', String(hash));
-    hash && hash !== pinValido
-      ? ok('pin_hash ≠ texto plano (nunca credencial visible)')
-      : ko('pin_hash igual al texto plano — no se hasheó');
-  } catch (e) { ko('Leer alumnos_credenciales', e.message); }
+    !rCorr?.error
+      ? ok('PIN correcto aceptado por apoderado_acceso (bcrypt verificado en servidor)')
+      : ko('PIN correcto fue rechazado', JSON.stringify(rCorr));
+  } catch (e) { ko('apoderado_acceso con PIN correcto', e.message); }
+
+  try {
+    const rWrong = await rpc('apoderado_acceso',
+      { p_cuenta_id: cuentaId, p_alumno_id: alumnoId, p_pin: 'INCORRECTO99' },
+      token
+    );
+    rWrong?.error
+      ? ok('PIN incorrecto rechazado (error: ' + rWrong.error + ')')
+      : ko('PIN incorrecto fue aceptado — no debería', JSON.stringify(rWrong));
+  } catch (e) { ko('apoderado_acceso con PIN incorrecto', e.message); }
 
   // ── T2: Apoderado → simula recarga de sesión ────────────────────────
   console.log('\n── T2: Apoderado → reaparece en carga completa de cuenta ──');
@@ -447,16 +457,16 @@ async function runTests(token, cuentaId, cursoId) {
   // ── T4: retryPin sin recrear el alumno ──────────────────────────────
   console.log('\n── T4: retryPin — cambiar PIN en alumno existente ──');
 
-  // Leer hash actual para verificar que cambia
-  let hashAnterior = null;
+  // Verificar que el PIN anterior (pinValido = 'PRUEBA9') aún funciona ANTES del cambio
   try {
-    const rows = await req(
-      `/alumnos_credenciales?cuenta_id=eq.${encodeURIComponent(cuentaId)}&alumno_id=eq.${encodeURIComponent(alumnoId)}&select=pin_hash`,
-      {}, token
-    );
-    hashAnterior = rows?.[0]?.pin_hash || null;
-  } catch (_) {}
+    const rAntes = await rpc('apoderado_acceso',
+      { p_cuenta_id: cuentaId, p_alumno_id: alumnoId, p_pin: pinValido }, token);
+    !rAntes?.error
+      ? ok('retryPin: PIN original sigue válido antes del cambio')
+      : ko('retryPin: PIN original inválido antes del cambio', JSON.stringify(rAntes));
+  } catch (e) { ko('retryPin — verificar PIN antes del cambio', e.message); }
 
+  // Cambiar PIN vía RPC
   const pinNuevo = 'RETRY42';
   try {
     const r = await rpc('tesorero_set_pin',
@@ -466,20 +476,23 @@ async function runTests(token, cuentaId, cursoId) {
       : ko('retryPin: RPC falló', JSON.stringify(r));
   } catch (e) { ko('retryPin — error inesperado', e.message); }
 
+  // PIN viejo debe ser rechazado
   try {
-    const rows = await req(
-      `/alumnos_credenciales?cuenta_id=eq.${encodeURIComponent(cuentaId)}&alumno_id=eq.${encodeURIComponent(alumnoId)}&select=pin_hash`,
-      {}, token
-    );
-    const hashNuevo = rows?.[0]?.pin_hash;
-    hashNuevo?.startsWith('$2')
-      ? ok('Hash nuevo tiene formato bcrypt')
-      : ko('Hash nuevo no tiene formato bcrypt', String(hashNuevo));
-    hashNuevo && hashAnterior && hashNuevo !== hashAnterior
-      ? ok('Hash cambió tras retryPin (ON CONFLICT DO UPDATE efectivo)')
-      : ko('Hash no cambió — upsert no funcionó',
-          `anterior=${hashAnterior?.slice(0, 10)}…  nuevo=${hashNuevo?.slice(0, 10)}…`);
-  } catch (e) { ko('Verificar hash tras retryPin', e.message); }
+    const rViejo = await rpc('apoderado_acceso',
+      { p_cuenta_id: cuentaId, p_alumno_id: alumnoId, p_pin: pinValido }, token);
+    rViejo?.error
+      ? ok('retryPin: PIN anterior rechazado tras el cambio (ON CONFLICT DO UPDATE efectivo)')
+      : ko('retryPin: PIN anterior aún aceptado — upsert no funcionó', JSON.stringify(rViejo));
+  } catch (e) { ko('retryPin — verificar PIN anterior rechazado', e.message); }
+
+  // PIN nuevo debe ser aceptado
+  try {
+    const rNuevo = await rpc('apoderado_acceso',
+      { p_cuenta_id: cuentaId, p_alumno_id: alumnoId, p_pin: pinNuevo }, token);
+    !rNuevo?.error
+      ? ok('retryPin: PIN nuevo aceptado (bcrypt verificado en servidor)')
+      : ko('retryPin: PIN nuevo rechazado', JSON.stringify(rNuevo));
+  } catch (e) { ko('retryPin — verificar PIN nuevo aceptado', e.message); }
 }
 
 main().catch(e => { console.error('\nError fatal:', e.message || e); process.exit(1); });
