@@ -147,7 +147,48 @@ async function setup() {
 
 async function teardown() {
   console.log('\n🧹 Limpiando fixtures de prueba…');
-  // orden: movimientos, alumnos_credenciales (cascade), alumnos, cursos
+
+  // ── Limpiar archivos de Storage del curso fixture ─────────────────────────
+  // El path es {cursoId}/{movId}/{archivo}. Listamos el prefijo del curso y
+  // eliminamos cada archivo antes de borrar las filas de PostgreSQL.
+  try {
+    const listUrl = `${SUPA_URL}/storage/v1/object/list/comprobantes`;
+    const listRes = await fetch(listUrl, {
+      method: 'POST',
+      headers: {
+        'apikey': ANON_KEY,
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ prefix: CURSO_ID + '/', limit: 100 }),
+    });
+    if (listRes.ok) {
+      const items = await listRes.json();
+      const nombres = (items || []).map(i => `${CURSO_ID}/${i.name}`).filter(Boolean);
+      if (nombres.length > 0) {
+        const delRes = await fetch(`${SUPA_URL}/storage/v1/object/comprobantes`, {
+          method: 'DELETE',
+          headers: {
+            'apikey': ANON_KEY,
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ prefixes: nombres }),
+        });
+        delRes.ok
+          ? console.log(`  🗑  storage/comprobantes (${nombres.length} archivos)`)
+          : console.warn(`  ⚠  storage DELETE ${delRes.status}: ${await delRes.text().catch(() => '')}`);
+      } else {
+        console.log('  🗑  storage/comprobantes (sin archivos del fixture)');
+      }
+    } else {
+      console.warn(`  ⚠  storage LIST ${listRes.status} — puede no existir el bucket aún`);
+    }
+  } catch (e) {
+    console.warn(`  ⚠  no pudo limpiar storage: ${e.message}`);
+  }
+
+  // ── Limpiar filas PostgreSQL: movimientos → alumnos → cursos ─────────────
   for (const [table, field, id] of [
     ['movimientos', 'curso_id', CURSO_ID],
     ['alumnos',     'id',       ALU_ID],
