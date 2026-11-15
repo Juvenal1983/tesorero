@@ -226,53 +226,102 @@ function verificarSumaAsignaciones(movimientos, alumnos, cursoId, montoEsperado)
   return saldos;
 }
 
-// ── Setup: crear fixtures independientes ──────────────────────────────────────
-async function setup(jwt, cuentaId) {
+// ── Setup: crear fixtures independientes ─────────────────────────────────────
+// Campos validados contra el esquema real (igual que setup() de e7_fondos_actividades.js
+// que pasó 29/0/0):
+//   cursos:          cuenta_id, id, nombre, anio, activo, fondo_especial
+//   alumnos:         cuenta_id, curso_id, id, nombres, apellidos, estado
+//   usuarios_cuenta: cuenta_id, id, auth_id, email, nombre, rol, curso_id, desactivado
+// Campos NO en el esquema: colegio, tipo_org  → se omiten.
+async function setup(jwt, cuentaId, userCAuthId) {
   console.log('\n[Setup] Creando fixtures UI...');
+  const anio = new Date().getFullYear();
+
+  // IDs deterministas con EXEC_ID para facilitar limpieza
+  const cursoId  = `crs-e7ui-${EXEC_ID}`;
+  const curso2Id = `crs-e7ui2-${EXEC_ID}`;
 
   // Curso fixture principal
   const rC = await rest('/cursos', {
-    method: 'POST', _token: jwt,
+    method: 'POST',
+    headers: { 'Prefer': 'return=minimal' },
     body: JSON.stringify({
       cuenta_id: cuentaId,
-      nombre:    `Curso-E7UI-${EXEC_ID}`,
-      colegio:   'Test-E7UI',
-      tipo_org:  'curso',
-      fondo_especial: { activo: false, nombre: 'Fondo Especial' },
+      id:        cursoId,
+      nombre:    `[e7ui] ${EXEC_ID}`,
+      anio,
+      activo:    true,
+      fondo_especial: null,
     }),
   }, jwt);
-  if (!rC.ok) throw new Error(`Crear curso: ${JSON.stringify(rC.body)}`);
-  const cursoId = (Array.isArray(rC.body) ? rC.body[0] : rC.body).id;
+  // return=minimal devuelve 204 (sin body) si OK
+  if (rC.status !== 201 && rC.status !== 204)
+    throw new Error(`Crear curso: HTTP ${rC.status} ${JSON.stringify(rC.body)}`);
   console.log(`  [setup] Curso fixture: ${cursoId}`);
 
-  // 3 alumnos
+  // 3 alumnos — campos: nombres, apellidos, estado (no "nombre")
+  const aluDefs = [
+    [`alu-e7ui-1-${EXEC_ID}`, 'E7UIAlu1', `Uno${EXEC_ID}`],
+    [`alu-e7ui-2-${EXEC_ID}`, 'E7UIAlu2', `Dos${EXEC_ID}`],
+    [`alu-e7ui-3-${EXEC_ID}`, 'E7UIAlu3', `Tres${EXEC_ID}`],
+  ];
   const alumnos = [];
-  for (let i = 1; i <= 3; i++) {
+  for (const [id, nombres, apellidos] of aluDefs) {
     const rA = await rest('/alumnos', {
-      method: 'POST', _token: jwt,
-      body: JSON.stringify({ cuenta_id: cuentaId, curso_id: cursoId, nombre: `Alu-E7UI-${EXEC_ID}-${i}` }),
+      method: 'POST',
+      headers: { 'Prefer': 'return=minimal' },
+      body: JSON.stringify({ cuenta_id: cuentaId, curso_id: cursoId, id, nombres, apellidos, estado: 'activo' }),
     }, jwt);
-    if (!rA.ok) throw new Error(`Crear alumno ${i}: ${JSON.stringify(rA.body)}`);
-    alumnos.push(Array.isArray(rA.body) ? rA.body[0] : rA.body);
+    if (rA.status !== 201 && rA.status !== 204)
+      throw new Error(`Crear alumno ${id}: HTTP ${rA.status} ${JSON.stringify(rA.body)}`);
+    alumnos.push({ id, nombres, apellidos, cursoId });
   }
   console.log(`  [setup] 3 alumnos creados`);
 
   // Curso 2 para prueba de aislamiento
   const rC2 = await rest('/cursos', {
-    method: 'POST', _token: jwt,
+    method: 'POST',
+    headers: { 'Prefer': 'return=minimal' },
     body: JSON.stringify({
       cuenta_id: cuentaId,
-      nombre:    `Curso-E7UI2-${EXEC_ID}`,
-      colegio:   'Test-E7UI2',
-      tipo_org:  'curso',
-      fondo_especial: { activo: false, nombre: 'Fondo Especial' },
+      id:        curso2Id,
+      nombre:    `[e7ui-B] ${EXEC_ID}`,
+      anio,
+      activo:    true,
+      fondo_especial: null,
     }),
   }, jwt);
-  if (!rC2.ok) throw new Error(`Crear curso2: ${JSON.stringify(rC2.body)}`);
-  const curso2Id = (Array.isArray(rC2.body) ? rC2.body[0] : rC2.body).id;
+  if (rC2.status !== 201 && rC2.status !== 204)
+    throw new Error(`Crear curso2: HTTP ${rC2.status} ${JSON.stringify(rC2.body)}`);
   console.log(`  [setup] Curso2 fixture: ${curso2Id}`);
 
-  return { cursoId, curso2Id, alumnos };
+  // Membresía visor C en curso fixture (si auth_id disponible)
+  let membershipCId = null;
+  if (userCAuthId) {
+    const ucId = `uc-e7ui-c-${EXEC_ID}`;
+    const rMem = await rest('/usuarios_cuenta', {
+      method: 'POST',
+      headers: { 'Prefer': 'return=minimal' },
+      body: JSON.stringify({
+        cuenta_id:  cuentaId,
+        id:         ucId,
+        auth_id:    userCAuthId,
+        email:      USER_C_EMAIL,
+        nombre:     'VisorTest E7UI',
+        rol:        'visor',
+        curso_id:   cursoId,
+        desactivado: false,
+      }),
+    }, jwt);
+    if (rMem.status === 201 || rMem.status === 204) {
+      membershipCId = ucId;
+      console.log(`  [setup] membresía visor C: ${membershipCId}`);
+    } else {
+      console.warn(`  [setup] membresía C no creada: HTTP ${rMem.status} ${JSON.stringify(rMem.body)}`);
+    }
+  }
+
+  return { cursoId, curso2Id, alumnos, membershipCId };
 }
 
 // ── Teardown ──────────────────────────────────────────────────────────────────
@@ -280,24 +329,30 @@ async function teardown(jwt, cuentaId, state) {
   console.log('\n[Teardown] Limpiando fixtures de esta ejecución...');
   const { cursoId, curso2Id, membershipCId } = state;
 
+  // Membresía visor C — eliminada por ID exacto (no afecta otras membresías)
   if (membershipCId) {
-    await rest(`/usuarios_cuenta?id=eq.${membershipCId}`,
-      { method: 'DELETE', prefer: '' }, jwt).catch(e => console.warn(`  membresía C: ${e.message}`));
-    console.log('  [teardown] membresía visor C eliminada');
+    await rest(`/usuarios_cuenta?id=eq.${encodeURIComponent(membershipCId)}&cuenta_id=eq.${encodeURIComponent(cuentaId)}`,
+      { method: 'DELETE', headers: { 'Prefer': '' } }, jwt)
+      .catch(e => console.warn(`  membresía C: ${e.message}`));
+    console.log(`  [teardown] membresía visor C eliminada (${membershipCId})`);
   }
+
   if (cursoId) {
-    await rest(`/fondo_movimientos?cuenta_id=eq.${cuentaId}&curso_id=eq.${cursoId}`,
-      { method: 'DELETE', prefer: '' }, jwt).catch(() => {});
-    await rest(`/actividades?cuenta_id=eq.${cuentaId}&curso_id=eq.${cursoId}`,
-      { method: 'DELETE', prefer: '' }, jwt).catch(() => {});
-    await rest(`/alumnos?cuenta_id=eq.${cuentaId}&curso_id=eq.${cursoId}`,
-      { method: 'DELETE', prefer: '' }, jwt).catch(() => {});
-    await rest(`/cursos?id=eq.${cursoId}&cuenta_id=eq.${cuentaId}`,
-      { method: 'DELETE', prefer: '' }, jwt).catch(() => {});
+    // fondo_movimientos, actividades y alumnos — filtrados por cuenta_id + curso_id
+    for (const tabla of ['fondo_movimientos', 'actividades']) {
+      await rest(`/${tabla}?cuenta_id=eq.${encodeURIComponent(cuentaId)}&curso_id=eq.${encodeURIComponent(cursoId)}`,
+        { method: 'DELETE', headers: { 'Prefer': '' } }, jwt).catch(() => {});
+    }
+    // alumnos filtrado por cuenta_id + curso_id
+    await rest(`/alumnos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&curso_id=eq.${encodeURIComponent(cursoId)}`,
+      { method: 'DELETE', headers: { 'Prefer': '' } }, jwt).catch(() => {});
+    // curso principal
+    await rest(`/cursos?id=eq.${encodeURIComponent(cursoId)}&cuenta_id=eq.${encodeURIComponent(cuentaId)}`,
+      { method: 'DELETE', headers: { 'Prefer': '' } }, jwt).catch(() => {});
   }
   if (curso2Id) {
-    await rest(`/cursos?id=eq.${curso2Id}&cuenta_id=eq.${cuentaId}`,
-      { method: 'DELETE', prefer: '' }, jwt).catch(() => {});
+    await rest(`/cursos?id=eq.${encodeURIComponent(curso2Id)}&cuenta_id=eq.${encodeURIComponent(cuentaId)}`,
+      { method: 'DELETE', headers: { 'Prefer': '' } }, jwt).catch(() => {});
   }
   console.log('  [teardown] completado');
 }
@@ -363,8 +418,24 @@ async function navegar(page, ruta, waitSelector) {
     cuentaId = rCta.body[0].id;
     console.log(`  [ok] cuenta: ${cuentaId}`);
 
-    fixtures = await setup(jwt, cuentaId);
-    state = { cursoId: fixtures.cursoId, curso2Id: fixtures.curso2Id };
+    // Obtener auth_id de usuario C (si está configurado) para crear membresía en setup
+    let userCAuthId = null;
+    if (USER_C_EMAIL && USER_C_PASS) {
+      try {
+        const authC = await autenticar(USER_C_EMAIL, USER_C_PASS);
+        userCAuthId = authC.userId;
+        console.log(`  [ok] Usuario C auth_id: ${userCAuthId}`);
+      } catch (e) {
+        console.warn(`  [warn] No se pudo autenticar usuario C: ${e.message}`);
+      }
+    }
+
+    fixtures = await setup(jwt, cuentaId, userCAuthId);
+    state = {
+      cursoId:       fixtures.cursoId,
+      curso2Id:      fixtures.curso2Id,
+      membershipCId: fixtures.membershipCId,
+    };
     const { cursoId, curso2Id, alumnos } = fixtures;
     const aluIds = alumnos.map(a => a.id);
 
@@ -683,6 +754,7 @@ async function navegar(page, ruta, waitSelector) {
       // Crear movimiento tipo 'actividad' con monto conocido en agosto
       const rMovRpt = await rest('/fondo_movimientos', {
         method: 'POST',
+        headers: { 'Prefer': 'return=minimal' },
         body: JSON.stringify({
           cuenta_id:    cuentaId,
           curso_id:     cursoId,
@@ -692,9 +764,9 @@ async function navegar(page, ruta, waitSelector) {
           monto_total:  MONTO_RPT,
           participantes: aluIds.slice(0, 2),
         }),
-        prefer: 'return=representation',
       }, jwt);
-      if (!rMovRpt.ok) throw new Error(`Crear movimiento RPT: ${JSON.stringify(rMovRpt.body)}`);
+      if (rMovRpt.status !== 201 && rMovRpt.status !== 204)
+        throw new Error(`Crear movimiento RPT: HTTP ${rMovRpt.status} ${JSON.stringify(rMovRpt.body)}`);
       const movRptId = (Array.isArray(rMovRpt.body) ? rMovRpt.body[0] : rMovRpt.body)?.id;
       console.log(`  [rpt] movimiento actividad creado: ${movRptId}, monto=${MONTO_RPT}, mes=${MES_RPT}`);
 
@@ -751,53 +823,33 @@ async function navegar(page, ruta, waitSelector) {
 
     // ══════════════════════════════════════════════════════════════════════════
     // UI-VIS — Usuario C puede SELECT del curso fixture (REST) antes del rechazo
+    // La membresía visor ya fue creada en setup() si userCAuthId estaba disponible.
     // ══════════════════════════════════════════════════════════════════════════
     console.log('\n[UI-VIS]');
 
-    if (!USER_C_EMAIL || !USER_C_PASS) {
-      pend('UI-VIS.1', 'SELECT usuario C', 'STAGING_USER_C_EMAIL / _PASSWORD no configurados');
+    if (!USER_C_EMAIL || !USER_C_PASS || !userCAuthId) {
+      pend('UI-VIS.1', 'SELECT usuario C',
+        !USER_C_EMAIL ? 'STAGING_USER_C_EMAIL no configurado'
+          : !userCAuthId ? 'autenticación usuario C fallida en pre-vuelo'
+          : 'STAGING_USER_C_PASSWORD no configurado');
     } else {
       try {
         const authC = await autenticar(USER_C_EMAIL, USER_C_PASS);
         const jwtC  = authC.token;
 
-        // Insertar membresía visor para C en el curso fixture (usuario A la crea)
-        const rMem = await rest('/usuarios_cuenta', {
-          method: 'POST',
-          body: JSON.stringify({
-            user_id:   authC.userId,
-            cuenta_id: cuentaId,
-            curso_id:  cursoId,
-            rol:       'visor',
-          }),
-          prefer: 'return=representation',
-        }, jwt);
+        // Membresía ya creada en setup(); sólo verificamos que C puede leer
+        const memInfo = fixtures.membershipCId
+          ? `membresía ${fixtures.membershipCId}`
+          : 'membresía no creada en setup (ver advertencia)';
+        console.log(`  [vis] ${memInfo}`);
 
-        let membershipId = null;
-        if (rMem.ok) {
-          membershipId = (Array.isArray(rMem.body) ? rMem.body[0] : rMem.body)?.id;
-          state.membershipCId = membershipId;
-          console.log(`  [vis] membresía visor C: ${membershipId}`);
-        } else {
-          // Puede que ya exista; buscar
-          const rEx = await rest(
-            `/usuarios_cuenta?user_id=eq.${authC.userId}&curso_id=eq.${cursoId}&select=id`,
-            {}, jwt
-          );
-          if (rEx.body?.length) {
-            membershipId = rEx.body[0].id;
-            console.log(`  [vis] membresía existente: ${membershipId}`);
-          }
-        }
-
-        // Usuario C lee fondo_movimientos del curso fixture (debe funcionar como visor)
         const rSelect = await rest(
-          `/fondo_movimientos?cuenta_id=eq.${cuentaId}&curso_id=eq.${cursoId}&select=id`,
+          `/fondo_movimientos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&curso_id=eq.${encodeURIComponent(cursoId)}&select=id`,
           {}, jwtC
         );
         if (!rSelect.ok)
           throw new Error(`SELECT como visor falló HTTP ${rSelect.status}: ${JSON.stringify(rSelect.body)}`);
-        ok('UI-VIS.1', `Usuario C (visor) puede SELECT fondo_movimientos del curso fixture (HTTP ${rSelect.status})`);
+        ok('UI-VIS.1', `Usuario C (visor) SELECT fondo_movimientos HTTP ${rSelect.status} ✓`);
       } catch (e) { ko('UI-VIS.1', 'SELECT usuario C', e); }
     }
 
