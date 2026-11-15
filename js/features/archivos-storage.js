@@ -59,16 +59,22 @@ async function generarUrlFirmadaStorage(storagePath, expiresIn) {
       return null;
     }
     const data = await res.json();
-    // Supabase devuelve { signedURL: '/storage/v1/object/sign/…?token=…' }
-    // El campo puede llamarse signedURL o signedUrl según la versión.
+    // Supabase devuelve { signedURL: '…' }; el campo puede llamarse signedURL o signedUrl.
+    // La ruta relativa puede llegar con o sin el prefijo '/storage/v1':
+    //   - forma nueva: '/storage/v1/object/sign/comprobantes/…?token=…'
+    //   - forma antigua: '/object/sign/comprobantes/…?token=…'
+    // Normalizamos siempre antes de concatenar SUPA_URL.
     const relativePath = data.signedURL || data.signedUrl || null;
     if (!relativePath) {
       console.warn('[Storage] Respuesta sin signedURL:', data);
       return null;
     }
-    // Si ya es una URL completa (empieza con http) devolverla tal cual.
-    // Si es un path relativo, prepender SUPA_URL.
-    return relativePath.startsWith('http') ? relativePath : SUPA_URL + relativePath;
+    if (relativePath.startsWith('http')) return relativePath;
+    // Garantizar prefijo /storage/v1
+    const normalized = relativePath.startsWith('/storage/v1')
+      ? relativePath
+      : '/storage/v1' + (relativePath.startsWith('/') ? relativePath : '/' + relativePath);
+    return SUPA_URL + normalized;
   } catch (e) {
     console.warn('[Storage] Error al generar URL firmada:', e);
     return null;

@@ -190,11 +190,15 @@ async function teardown() {
   }
 
   // ── Limpiar filas PostgreSQL DESPUÉS de Storage: movimientos → alumnos → cursos
+  // El curso/movimiento de aislamiento (APO.3) se limpia en el finally de ese test,
+  // pero se incluye aquí como red de seguridad por si el finally falla o no alcanza.
   for (const [table, field, id] of [
     ['movimientos', 'curso_id', CURSO_ID],
+    ['movimientos', 'id',       `mov-apo3-${EXEC_ID}`],
     ['alumnos',     'id',       ALU_ID],
     ['alumnos',     'id',       ALU2_ID],
     ['cursos',      'id',       CURSO_ID],
+    ['cursos',      'id',       `crs-apo-aislamiento-${EXEC_ID}`],
   ]) {
     try {
       await req(`/${table}?cuenta_id=eq.${cuentaId}&${field}=eq.${encodeURIComponent(id)}`,
@@ -552,7 +556,16 @@ async function testMovimientos(page) {
           const signData = await signRes.json();
           const relPath = signData.signedURL || signData.signedUrl || null;
           if (relPath) {
-            urlToTest = relPath.startsWith('http') ? relPath : SUPA_URL + relPath;
+            // Normalizar: Supabase puede devolver '/object/sign/…' (sin /storage/v1)
+            // o '/storage/v1/object/sign/…'.  Garantizar el prefijo correcto.
+            if (relPath.startsWith('http')) {
+              urlToTest = relPath;
+            } else {
+              const norm = relPath.startsWith('/storage/v1')
+                ? relPath
+                : '/storage/v1' + (relPath.startsWith('/') ? relPath : '/' + relPath);
+              urlToTest = SUPA_URL + norm;
+            }
             ok('E6.M5a: URL firmada generada desde storagePath (política SELECT pasó)');
           } else {
             ko('E6.M5a: respuesta de sign sin signedURL', JSON.stringify(signData).slice(0, 200));
@@ -888,9 +901,11 @@ async function testApoderado(movIdCreado, comprobanteRef, pinNuevo) {
   } catch (e) { ko('E6.APO.2: error en test de PIN incorrecto', e.message); }
 
   // ── APO.3: Movimiento de otro curso → error movimiento_no_accesible ────────
+  // IDs fijos para poder limpiar en finally aunque el INSERT falle.
   console.log('  → E6.APO.3: Movimiento de otro curso → debe rechazar');
+  const cursoOtroId     = `crs-apo-aislamiento-${EXEC_ID}`;
+  const movAislamientoId = `mov-apo3-${EXEC_ID}`;
   try {
-    const cursoOtroId = `crs-apo-aislamiento-${EXEC_ID}`;
     await req('/cursos?select=id', {
       method: 'POST',
       headers: { 'Prefer': 'return=minimal' },
@@ -899,42 +914,39 @@ async function testApoderado(movIdCreado, comprobanteRef, pinNuevo) {
         nombre: `[test-e6 aislamiento] ${EXEC_ID}`, anio: new Date().getFullYear(), activo: true,
       }),
     });
-    const movRows = await req('/movimientos?select=id', {
+    // id es NOT NULL sin default — siempre debe especificarse explícitamente
+    await req('/movimientos?select=id', {
       method: 'POST',
-      headers: { 'Prefer': 'return=representation' },
+      headers: { 'Prefer': 'return=minimal' },
       body: JSON.stringify({
+        id: movAislamientoId,
         cuenta_id: cuentaId, curso_id: cursoOtroId,
         tipo: 'gasto', desc: `[test-e6 aislamiento] ${EXEC_ID}`,
         monto: 100, fecha: new Date().toISOString().slice(0, 10),
         visible: true, creado_por: '',
       }),
     });
-    const movOtroId = movRows?.[0]?.id;
 
-    if (movOtroId) {
-      const res = await fetch(RPC_URL, {
-        method: 'POST',
-        headers: anonHdrs,
-        body: JSON.stringify({
-          p_cuenta_id: cuentaId, p_alumno_id: ALU_ID,
-          p_pin: pinNuevo, p_mov_id: movOtroId,  // ← movimiento de OTRO curso
-        }),
-      });
-      const data = await res.json().catch(() => null);
-      data?.ok === false && data?.error === 'movimiento_no_accesible'
-        ? ok('E6.APO.3: movimiento de otro curso rechazado (aislamiento correcto)')
-        : ko('E6.APO.3: movimiento de otro curso no fue rechazado', JSON.stringify(data)?.slice(0, 200));
+    const res = await fetch(RPC_URL, {
+      method: 'POST',
+      headers: anonHdrs,
+      body: JSON.stringify({
+        p_cuenta_id: cuentaId, p_alumno_id: ALU_ID,
+        p_pin: pinNuevo, p_mov_id: movAislamientoId,  // ← movimiento de OTRO curso
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    data?.ok === false && data?.error === 'movimiento_no_accesible'
+      ? ok('E6.APO.3: movimiento de otro curso rechazado (aislamiento correcto)')
+      : ko('E6.APO.3: movimiento de otro curso no fue rechazado', JSON.stringify(data)?.slice(0, 200));
 
-      try {
-        await req(`/movimientos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(movOtroId)}`,
-          { method: 'DELETE' });
-        await req(`/cursos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(cursoOtroId)}`,
-          { method: 'DELETE' });
-      } catch (_) {}
-    } else {
-      ko('E6.APO.3: no se pudo crear movimiento de otro curso para el test', JSON.stringify(movRows));
-    }
-  } catch (e) { ko('E6.APO.3: error en test de aislamiento de cursos', e.message); }
+  } catch (e) {
+    ko('E6.APO.3: error en test de aislamiento de cursos', e.message);
+  } finally {
+    // Limpiar siempre — incluso si el INSERT del movimiento falló y el curso quedó huérfano
+    try { await req(`/movimientos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(movAislamientoId)}`, { method: 'DELETE' }); } catch (_) {}
+    try { await req(`/cursos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(cursoOtroId)}`,      { method: 'DELETE' }); } catch (_) {}
+  }
 
   // ── APO.CURSO: Curso inactivo → error curso_inactivo ─────────────────────
   // Marca temporalmente el curso fixture como activo=false, verifica el rechazo,
