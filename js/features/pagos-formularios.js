@@ -190,9 +190,28 @@ function modalEditAbono(data){
 }
 
 function saveEditAbono(planId, idx){
-  // G01-fix: bloqueado en V9_RELACIONAL hasta implementar CRUD en tabla abonos.
+  // B2: implementado en modo relacional v9.
   if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
-    alert('⚠️ La edición de abonos no está disponible en el modo relacional v9 todavía.');
+    const plan = (DB.planesPago||[]).find(p=>p.id===planId);
+    if(!plan) return;
+    const ab = plan.abonos[idx];
+    if(!ab) return;
+    const monto = parseInt(document.getElementById('ea-monto').value)||0;
+    const fecha  = document.getElementById('ea-fecha').value;
+    if(!monto) return alert('Ingresa el monto.');
+    if(!fecha)  return alert('Ingresa la fecha.');
+    if(ab.pagado) return alert('No se puede editar un abono ya pagado.');
+    const cuentaId = S._v9CuentaId;
+    if(!cuentaId || !_authToken) return alert('Sesión no disponible.');
+    actualizarAbonoV9(cuentaId, ab.id, { monto, fecha }, _authToken)
+      .then(() => {
+        ab.monto = monto;
+        ab.fecha = fecha;
+        plan.montoTotal = plan.abonos.reduce((s,a)=>s+a.monto,0);
+        showToast('✅ Abono actualizado');
+        showModal('planPago', {aluId:plan.alumnoId, cuotaId:plan.cuotaId, periodo:plan.periodo});
+      })
+      .catch(err => alert('Error al actualizar abono: ' + (err.message||err)));
     return;
   }
   const plan = (DB.planesPago||[]).find(p=>p.id===planId);
@@ -342,11 +361,36 @@ function generarFechasAbonos(){
 }
 
 function guardarPlanPago(alumnoId, cuotaId, periodo, montoTotal){
-  // G01-fix: en modo relacional v9 los planes de pago deben persistirse en la tabla
-  // `planes_pago` de Supabase, no en DB.planesPago + blob. Esta función aún no está
-  // conectada al CRUD relacional — bloquear hasta que se implemente (deuda técnica G01).
+  // B2: implementado en modo relacional v9.
   if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
-    alert('⚠️ Los planes de pago no están disponibles en el modo relacional v9 todavía.\n\nEsta función requiere integración con la tabla planes_pago de Supabase (pendiente de implementar). Registra el pago directo por mientras.');
+    const montoInputs = document.querySelectorAll('.pp-monto-input');
+    const fechaInputs = document.querySelectorAll('.pp-fecha-input');
+    if(!montoInputs.length){ alert('Genera los abonos primero.'); return; }
+    const abonos = [];
+    let totalAbonos = 0;
+    let valido = true;
+    montoInputs.forEach((inp,i)=>{
+      const monto = parseInt(inp.value)||0;
+      const fecha = fechaInputs[i]?.value||isoToday();
+      if(!monto){ alert('Todos los abonos deben tener monto.'); valido=false; return; }
+      if(!fecha){ alert('Todos los abonos deben tener fecha.'); valido=false; return; }
+      abonos.push({ monto, fecha });
+      totalAbonos += monto;
+    });
+    if(!valido || abonos.length===0) return;
+    if(abonos.length < 2){ alert('Un plan de pago requiere al menos 2 abonos.'); return; }
+    if(!confirm(`¿Crear plan de ${abonos.length} abonos por ${clp(totalAbonos)} para esta cuota?`)) return;
+    const cuentaId = S._v9CuentaId;
+    if(!cuentaId || !_authToken) return alert('Sesión no disponible.');
+    crearPlanPagoV9(cuentaId, { alumnoId, cuotaId, periodo, montoTotal:totalAbonos, abonos }, _authToken)
+      .then(plan => {
+        if(!DB.planesPago) DB.planesPago=[];
+        DB.planesPago.push(plan);
+        closeModal();
+        showToast('✅ Plan de pago creado');
+        go('pagos', S.params);
+      })
+      .catch(err => alert('Error al crear plan: ' + (err.message||err)));
     return;
   }
   const montoInputs = document.querySelectorAll('.pp-monto-input');
@@ -372,12 +416,30 @@ function guardarPlanPago(alumnoId, cuotaId, periodo, montoTotal){
 }
 
 function pagarAbono(planId, abonoIdx){
-  // G01/G05-fix: en modo relacional v9, el pago de abonos debe ir a la tabla `abonos`
-  // de Supabase. Además, al completar un plan NO se puede insertar en DB.pagos porque
-  // los RPC SQL ya cuentan los abonos — hacerlo crearía doble contabilización (G05).
-  // Bloqueado hasta implementar CRUD relacional para planes_pago/abonos.
+  // B2: implementado en modo relacional v9. G05: NO se inserta en DB.pagos/tabla pagos
+  // al completar el plan — los RPC SQL ya cuentan abonos vía abonos_por_periodo CTE.
   if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
-    alert('⚠️ El registro de abonos no está disponible en el modo relacional v9 todavía.\n\nEsta función requiere integración con la tabla abonos de Supabase (pendiente de implementar).');
+    const plan = (DB.planesPago||[]).find(p=>p.id===planId);
+    if(!plan) return;
+    const ab = plan.abonos[abonoIdx];
+    if(!ab) return;
+    if(ab.pagado) return showToast('Este abono ya está pagado.');
+    if(!confirm(`¿Marcar abono ${abonoIdx+1} de ${clp(ab.monto)} como pagado?`)) return;
+    const cuentaId = S._v9CuentaId;
+    if(!cuentaId || !_authToken) return alert('Sesión no disponible.');
+    pagarAbonoV9(cuentaId, planId, ab.id, _authToken)
+      .then(({ abono, planCerrado }) => {
+        ab.pagado = true;
+        ab.fechaPago = abono.fechaPago || isoToday();
+        if(planCerrado){
+          plan.activo = false;
+          showToast('✅ Plan completado — todos los abonos pagados');
+        } else {
+          showToast('✅ Abono registrado');
+        }
+        showModal('planPago', {aluId:plan.alumnoId, cuotaId:plan.cuotaId, periodo:plan.periodo, ultimoAbono:abonoIdx});
+      })
+      .catch(err => alert('Error al registrar abono: ' + (err.message||err)));
     return;
   }
   const plan = (DB.planesPago||[]).find(p=>p.id===planId);
@@ -406,9 +468,20 @@ function pagarAbono(planId, abonoIdx){
 }
 
 function eliminarPlanPago(planId){
-  // G01-fix: bloqueado en V9_RELACIONAL hasta implementar DELETE en tabla planes_pago.
+  // B2: implementado en modo relacional v9.
   if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
-    alert('⚠️ La eliminación de planes de pago no está disponible en el modo relacional v9 todavía.');
+    if(!confirm('¿Eliminar este plan de pago? Los abonos ya pagados no se revertirán.')) return;
+    if(!confirm('Segunda confirmación: ¿Seguro que deseas eliminar el plan?')) return;
+    const cuentaId = S._v9CuentaId;
+    if(!cuentaId || !_authToken) return alert('Sesión no disponible.');
+    eliminarPlanPagoV9(cuentaId, planId, _authToken)
+      .then(() => {
+        DB.planesPago = (DB.planesPago||[]).filter(p=>p.id!==planId);
+        closeModal();
+        showToast('✅ Plan de pago eliminado');
+        go('pagos', S.params);
+      })
+      .catch(err => alert('Error al eliminar plan: ' + (err.message||err)));
     return;
   }
   if(!confirm('¿Eliminar este plan de pago? Los abonos ya pagados no se revertirán.')) return;

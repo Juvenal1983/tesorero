@@ -54,6 +54,7 @@ function selectCurso(id){
         DB.movimientos       = datos.movimientos       || [];
         DB.fondoMovimientos  = datos.fondoMovimientos  || [];
         DB.actividades       = datos.actividades       || [];
+        DB.planesPago        = datos.planesPago        || [];
         S.cursoId  = id;
         go('dashboard');
       })
