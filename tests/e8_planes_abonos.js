@@ -468,6 +468,150 @@ async function testRls2() {
   );
 }
 
+// ─── SEC.1 Lectura de plan por ID conocido sin acceso al curso ────────────────
+// Verifica que el bloque 0 de idempotencia (SECURITY DEFINER) NO devuelve datos
+// de un plan existente a un usuario que no tiene acceso al curso al que
+// pertenece ese plan.
+//
+// El test reproduce el escenario real: un atacante que conoce cuenta_id y plan_id
+// (por ejemplo desde logs del cliente) intenta obtener datos enviando esos IDs
+// junto con parámetros distintos para forzar la ruta de idempotencia.
+//
+// La función debe lanzar permission_denied (o idempotency_conflict si las
+// validaciones previas a la auth se activan), NO devolver datos.
+//
+// Implementación: se usa un segundo JWT sin acceso al curso donde vive el plan.
+// Si STAGING_JWT_SIN_ACCESO no está definido, el test usa el mismo JWT pero con
+// un curso_id inventado para la cuota — el RPC no debería devolver datos de
+// una cuenta/plan real bajo credenciales que no los autorizan.
+async function testSec1() {
+  // Crear plan real con el JWT principal
+  var payload = planPayload();
+  var r = await rpc('crear_plan_con_abonos', payload);
+  var realPlanId  = r.plan.id;
+  var realCuenta  = CUENTA;
+
+  // JWT alternativo (sin acceso) si está disponible; si no, usar cuenta falsa
+  // para simular que el atacante conoce el plan_id pero usa otra cuenta.
+  var JWT_SIN_ACCESO = process.env.STAGING_JWT_SIN_ACCESO;
+
+  if (JWT_SIN_ACCESO) {
+    // Enviar la misma payload con JWT que no tiene rol en el curso
+    var payloadAtaque = Object.assign({}, payload);  // mismo plan_id, misma cuenta
+
+    // Función auxiliar que usa JWT alternativo
+    var rpcConJWT = function(fn, params, jwt) {
+      return new Promise(function(resolve, reject) {
+        var url  = new URL('/rest/v1/rpc/' + fn, BASE);
+        var data = JSON.stringify(params);
+        var opts = {
+          hostname: url.hostname,
+          path:     url.pathname,
+          method:   'POST',
+          headers: {
+            'Content-Type':  'application/json',
+            'apikey':        ANON_KEY,
+            'Authorization': 'Bearer ' + jwt,
+            'Content-Length': Buffer.byteLength(data),
+          },
+        };
+        var req2 = https.request(opts, function(res) {
+          var raw = '';
+          res.on('data', function(c) { raw += c; });
+          res.on('end', function() {
+            var parsed;
+            try { parsed = JSON.parse(raw); } catch(e) { parsed = raw; }
+            if (res.statusCode >= 400) {
+              var e2 = new Error('HTTP ' + res.statusCode + ': ' + raw);
+              e2.status = res.statusCode; e2.body = parsed;
+              return reject(e2);
+            }
+            resolve(parsed);
+          });
+        });
+        req2.on('error', reject);
+        req2.write(data);
+        req2.end();
+      });
+    };
+
+    await assert.rejects(
+      function() { return rpcConJWT('crear_plan_con_abonos', payloadAtaque, JWT_SIN_ACCESO); },
+      /permission_denied/,
+      'SEC.1: JWT sin acceso no debe obtener datos del plan via idempotencia'
+    );
+  } else {
+    // Sin JWT alternativo: verificar que un plan_id real con cuenta falsa
+    // no filtra datos (el RPC debería devolver permission_denied o not_found)
+    var fakeUuid    = '00000000-0000-0000-0000-000000000000';
+    var payloadFake = Object.assign({}, payload, {
+      p_cuenta_id: fakeUuid,
+      p_plan_id:   realPlanId,  // ID conocido, pero cuenta incorrecta
+    });
+    await assert.rejects(
+      function() { return rpc('crear_plan_con_abonos', payloadFake); },
+      /permission_denied|cuota_not_found/,
+      'SEC.1: plan_id conocido con cuenta incorrecta no debe devolver datos'
+    );
+  }
+
+  // Limpieza
+  await rpc('eliminar_plan', { p_cuenta_id: realCuenta, p_plan_id: realPlanId });
+}
+
+// ─── SEC.2 Idempotencia rechaza calendario modificado ─────────────────────────
+// Verifica que la identidad completa del reintento incluye fechas y montos
+// individuales de los abonos, no solo el monto_total.
+async function testSec2() {
+  var payload = planPayload();
+  var r = await rpc('crear_plan_con_abonos', payload);
+
+  // Reintento con mismos montos individuales pero fechas distintas
+  var payloadFechaDistinta = Object.assign({}, payload, {
+    p_abonos: [
+      { monto: 5000, fecha: '2026-05-01' },  // fecha cambiada
+      { monto: 5000, fecha: '2026-06-01' },  // fecha cambiada
+    ],
+  });
+  await assert.rejects(
+    function() { return rpc('crear_plan_con_abonos', payloadFechaDistinta); },
+    /idempotency_conflict/,
+    'SEC.2: mismo p_plan_id con fechas de abonos distintas debe rechazarse'
+  );
+
+  // Reintento con mismas fechas pero un monto individual distinto
+  var payloadMontoDistinto = Object.assign({}, payload, {
+    p_abonos: [
+      { monto: 3000, fecha: '2026-03-01' },  // monto cambiado
+      { monto: 7000, fecha: '2026-04-01' },  // monto cambiado (suma = 10000 igual)
+    ],
+  });
+  await assert.rejects(
+    function() { return rpc('crear_plan_con_abonos', payloadMontoDistinto); },
+    /idempotency_conflict/,
+    'SEC.2: mismo p_plan_id con distribucion de montos distinta debe rechazarse'
+  );
+
+  await rpc('eliminar_plan', { p_cuenta_id: CUENTA, p_plan_id: r.plan.id });
+}
+
+// ─── SEC.3 Idempotencia rechaza alumno o cuota distintos ─────────────────────
+// El campo identidad del reintento incluye alumno_id y cuota_id.
+async function testSec3() {
+  var payload = planPayload();
+  var r = await rpc('crear_plan_con_abonos', payload);
+
+  // Reintento con alumno_id inventado
+  var payloadAlumnoDistinto = Object.assign({}, payload, { p_alumno_id: 'alumno-falso-' + uid() });
+  await assert.rejects(
+    function() { return rpc('crear_plan_con_abonos', payloadAlumnoDistinto); },
+    /idempotency_conflict|alumno_not_in_curso/,
+    'SEC.3: mismo p_plan_id con alumno_id distinto debe rechazarse'
+  );
+
+  await rpc('eliminar_plan', { p_cuenta_id: CUENTA, p_plan_id: r.plan.id });
+}
+
 // ─── SALDO.1 Resumen CC responde correctamente ───────────────────────────────
 async function testSaldo1() {
   var resumen = await rpc('apoderado_cc_resumen_pagos', { p_codigo_cc: CC_CODE });
@@ -554,6 +698,11 @@ async function testSaldo3() {
   console.log('\n  [RLS] Autorizacion');
   await run('RLS.1  cuenta ajena denegada en crear',        testRls1);
   await run('RLS.2  cuenta ajena denegada en eliminar',     testRls2);
+
+  console.log('\n  [SEC] Seguridad de idempotencia (SECURITY DEFINER)');
+  await run('SEC.1  plan_id conocido sin acceso al curso',  testSec1);
+  await run('SEC.2  calendario modificado rechazado',       testSec2);
+  await run('SEC.3  alumno_id distinto rechazado',          testSec3);
 
   console.log('\n  [SALDO] Resumen CC con importes exactos');
   await run('SALDO.1 resumen sin abonos',                   testSaldo1);

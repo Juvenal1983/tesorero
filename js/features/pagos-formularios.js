@@ -382,10 +382,39 @@ function guardarPlanPago(alumnoId, cuotaId, periodo, montoTotal){
     if(!confirm(`¿Crear plan de ${abonos.length} abonos por ${clp(totalAbonos)} para esta cuota?`)) return;
     const cuentaId = S._v9CuentaId;
     if(!cuentaId || !_authToken) return alert('Sesión no disponible.');
-    crearPlanPagoV9(cuentaId, { alumnoId, cuotaId, periodo, montoTotal:totalAbonos, abonos }, _authToken)
+
+    // B2-fix: generar y persistir planId ANTES del envío.
+    // Se almacena en sessionStorage para sobrevivir recargas del formulario
+    // y reutilizarse si la respuesta fue incierta (error de red, timeout).
+    // Clave: combinación estable del natural key de la operación.
+    const pendingKey = `pp_pending_${cuentaId}_${alumnoId}_${cuotaId}_${periodo||''}`;
+    let pendingEntry = null;
+    try { pendingEntry = JSON.parse(sessionStorage.getItem(pendingKey) || 'null'); } catch(_){}
+
+    // Si hay una entrada pendiente con el mismo payload, reutilizar su planId.
+    // Si el payload cambió (el usuario ajustó montos), generar uno nuevo.
+    const payloadHash = JSON.stringify({ totalAbonos, abonos });
+    let planId;
+    if(pendingEntry && pendingEntry.payloadHash === payloadHash){
+      planId = pendingEntry.planId;  // reintento: mismo planId
+    } else {
+      planId = `plan-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,8)}`;
+      try {
+        sessionStorage.setItem(pendingKey, JSON.stringify({ planId, payloadHash }));
+      } catch(_){}
+    }
+
+    crearPlanPagoV9(cuentaId, { planId, alumnoId, cuotaId, periodo, montoTotal:totalAbonos, abonos }, _authToken)
       .then(plan => {
+        // Limpiar entrada pendiente tras éxito confirmado
+        try { sessionStorage.removeItem(pendingKey); } catch(_){}
+
         if(!DB.planesPago) DB.planesPago=[];
-        DB.planesPago.push(plan);
+        // B2-fix: evitar duplicado en memoria cuando el servidor devolvió un
+        // plan ya existente (idempotente=true). Solo agregar si aún no está.
+        const yaEnMemoria = DB.planesPago.some(p => p.id === plan.id);
+        if(!yaEnMemoria) DB.planesPago.push(plan);
+
         closeModal();
         showToast('✅ Plan de pago creado');
         go('pagos', S.params);

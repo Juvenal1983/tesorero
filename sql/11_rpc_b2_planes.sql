@@ -1,6 +1,6 @@
 -- ============================================================
 -- El Tesorero — B2: Planes de pago y abonos
--- Archivo: sql/11_rpc_b2_planes.sql  (revisión 2)
+-- Archivo: sql/11_rpc_b2_planes.sql  (revisión 3)
 --
 -- ⚠️ Ejecutar solo en staging (rucgmytyxpfowznowxwd).
 --    NO ejecutar en producción (tmjqzaakzhecbldebyeg).
@@ -16,6 +16,7 @@ DROP FUNCTION IF EXISTS cerrar_plan_si_completo(UUID, TEXT);
 DROP FUNCTION IF EXISTS reabrir_plan_pago(UUID, UUID);
 DROP FUNCTION IF EXISTS reabrir_plan_pago(UUID, TEXT);
 DROP FUNCTION IF EXISTS crear_plan_con_abonos(UUID, TEXT, TEXT, TEXT, INT, JSONB, TEXT);
+DROP FUNCTION IF EXISTS crear_plan_con_abonos(UUID, TEXT, TEXT, TEXT, TEXT, INT, JSONB, TEXT);
 DROP FUNCTION IF EXISTS pagar_abono(UUID, TEXT, TEXT);
 DROP FUNCTION IF EXISTS revertir_abono(UUID, TEXT, TEXT);
 DROP FUNCTION IF EXISTS editar_abono(UUID, TEXT, INT, TEXT);
@@ -25,30 +26,35 @@ DROP FUNCTION IF EXISTS eliminar_plan(UUID, TEXT);
 -- 1. crear_plan_con_abonos
 --
 -- Clave de idempotencia explícita: p_plan_id
--- ─── El cliente genera p_plan_id (uid()) antes de enviar la petición.
---     Si la solicitud se reintenta con el mismo p_plan_id, se devuelve
---     el plan ya existente (idempotente=true) sin duplicar ningún dato.
---     Si existe otro plan activo para el mismo (alumno, cuota, periodo)
---     con un p_plan_id diferente, se rechaza con duplicate_active_plan.
+-- ─── El cliente genera p_plan_id antes de enviar la petición y lo persiste
+--     localmente antes de llamar al servidor. En un reintento envía el mismo
+--     p_plan_id; la función lo reconoce y devuelve el plan ya creado.
 --
--- Serialización concurrente: pg_advisory_xact_lock sobre el hash de la
--- clave natural (cuenta+alumno+cuota+periodo). El bloqueo dura hasta el
--- COMMIT, garantizando que dos transacciones que lleguen simultáneamente
--- sin plan previo no puedan ambas superar el test NOT FOUND.
+-- Seguridad (SECURITY DEFINER):
+--   La autorización se comprueba ANTES de devolver cualquier dato,
+--   incluso en la ruta de idempotencia temprana (bloque 0) y en el
+--   re-chequeo posterior al advisory lock (bloque 6).
+--   Flujo: idenfificar plan existente → autorizar → devolver / crear.
+--
+-- Verificación de identidad completa en reintentos:
+--   Compara alumno_id, cuota_id, periodo, monto_total y el calendario de
+--   abonos (N abonos con sus montos y fechas) contra lo almacenado. Una
+--   discrepancia en cualquiera de esos campos lanza idempotency_conflict.
+--   Los abonos almacenados se leen desde la DB (no desde lo que envió el
+--   cliente), así que ediciones posteriores a los abonos no alteran la
+--   verificación.
+--
+-- Serialización concurrente: pg_advisory_xact_lock sobre el hash del
+-- natural key (cuenta+alumno+cuota+periodo).
 --
 -- Validaciones financieras:
---   • monto_total > 0
---   • al menos 2 abonos
+--   • monto_total > 0  • al menos 2 abonos
 --   • cada abono con monto > 0 y fecha parseable
 --   • suma de abonos = monto_total
---
--- Orden de operaciones (evita deadlock con pagar_abono / revertir_abono):
---   no hay fila de plan preexistente en esta función, así que no aplica
---   conflicto de orden; el advisory lock serializa la creación completa.
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION crear_plan_con_abonos(
   p_cuenta_id   UUID,
-  p_plan_id     TEXT,          -- clave de idempotencia; requerida
+  p_plan_id     TEXT,          -- clave de idempotencia; generada por el cliente
   p_alumno_id   TEXT,
   p_cuota_id    TEXT,
   p_periodo     TEXT,          -- ej. "Marzo 2026"; NULL para cuotas no-mensuales
@@ -62,35 +68,115 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 DECLARE
-  v_curso_id    TEXT;
-  v_plan_json   JSONB;
-  v_abonos_json JSONB;
-  v_existing_id TEXT;
-  v_ab          JSONB;
-  v_abono_id    TEXT;
-  v_suma_abonos INT := 0;
-  v_n_abonos    INT;
+  v_curso_id      TEXT;
+  v_plan_json     JSONB;
+  v_abonos_json   JSONB;
+  v_existing_id   TEXT;
+  v_ab            JSONB;
+  v_ab_stored     JSONB;
+  v_abono_id      TEXT;
+  v_suma_abonos   INT := 0;
+  v_n_abonos      INT;
+  v_n_stored      INT;
+  v_i             INT;
+  v_stored_montos INT[];
+  v_stored_fechas TEXT[];
 BEGIN
-  -- ── 0. Idempotencia temprana — antes de cualquier lock ────────────────────
-  --    Si p_plan_id ya existe para esta cuenta, devolverlo sin tocar nada.
+
+  -- ════════════════════════════════════════════════════════════════════════════
+  -- BLOQUE 0 — Idempotencia temprana (antes del advisory lock)
+  -- Si p_plan_id ya existe, autorizar PRIMERO y luego devolver.
+  -- ════════════════════════════════════════════════════════════════════════════
   SELECT row_to_json(pp.*)::JSONB
     INTO v_plan_json
     FROM planes_pago pp
    WHERE pp.id = p_plan_id AND pp.cuenta_id = p_cuenta_id
-   FOR UPDATE;                            -- bloquea la fila si existe
+   FOR UPDATE;
 
   IF FOUND THEN
-    -- Verificar que el intento de reintento es coherente con lo almacenado
-    IF (v_plan_json->>'monto_total')::INT <> p_monto_total THEN
-      RAISE EXCEPTION 'idempotency_conflict'
-        USING HINT = format('p_plan_id=%s ya existe con monto_total=%s, se envió %s',
-                             p_plan_id, v_plan_json->>'monto_total', p_monto_total);
+
+    -- ── 0a. Obtener curso_id del plan para autorizar ───────────────────────
+    SELECT cu.curso_id INTO v_curso_id
+      FROM cuotas cu
+     WHERE cu.id = (v_plan_json->>'cuota_id') AND cu.cuenta_id = p_cuenta_id;
+
+    -- ── 0b. Autorizar ANTES de devolver datos ─────────────────────────────
+    IF NOT (
+      es_dueno(p_cuenta_id) OR
+      tiene_rol_en_curso(p_cuenta_id, v_curso_id, ARRAY['admin','tesorero'])
+    ) THEN
+      RAISE EXCEPTION 'permission_denied';
     END IF;
 
-    SELECT jsonb_agg(row_to_json(ab.*)::JSONB ORDER BY ab.fecha)
+    -- ── 0c. Verificar identidad completa del reintento ─────────────────────
+    --    Compara contra lo ALMACENADO en la DB (snapshot inmutable).
+    --    Un reintento legítimo envía exactamente los mismos valores.
+
+    IF (v_plan_json->>'alumno_id') <> p_alumno_id THEN
+      RAISE EXCEPTION 'idempotency_conflict'
+        USING HINT = format('alumno_id almacenado=%s, enviado=%s',
+                             v_plan_json->>'alumno_id', p_alumno_id);
+    END IF;
+
+    IF (v_plan_json->>'cuota_id') <> p_cuota_id THEN
+      RAISE EXCEPTION 'idempotency_conflict'
+        USING HINT = format('cuota_id almacenada=%s, enviada=%s',
+                             v_plan_json->>'cuota_id', p_cuota_id);
+    END IF;
+
+    IF (v_plan_json->>'periodo') IS DISTINCT FROM p_periodo THEN
+      RAISE EXCEPTION 'idempotency_conflict'
+        USING HINT = format('periodo almacenado=%s, enviado=%s',
+                             v_plan_json->>'periodo', p_periodo);
+    END IF;
+
+    IF (v_plan_json->>'monto_total')::INT <> p_monto_total THEN
+      RAISE EXCEPTION 'idempotency_conflict'
+        USING HINT = format('monto_total almacenado=%s, enviado=%s',
+                             v_plan_json->>'monto_total', p_monto_total);
+    END IF;
+
+    -- Verificar calendario de abonos: N, montos y fechas (orden ascendente)
+    SELECT jsonb_agg(row_to_json(ab.*)::JSONB ORDER BY ab.fecha, ab.monto)
       INTO v_abonos_json
       FROM abonos ab
      WHERE ab.plan_id = p_plan_id AND ab.cuenta_id = p_cuenta_id;
+
+    v_n_stored := COALESCE(jsonb_array_length(v_abonos_json), 0);
+    v_n_abonos := COALESCE(jsonb_array_length(p_abonos), 0);
+
+    IF v_n_stored <> v_n_abonos THEN
+      RAISE EXCEPTION 'idempotency_conflict'
+        USING HINT = format('numero de abonos almacenados=%s, enviados=%s',
+                             v_n_stored, v_n_abonos);
+    END IF;
+
+    -- Comparar cada abono en orden (almacenados ordenados por fecha,monto)
+    -- Reordenar también los enviados para comparación consistente.
+    -- Usamos arrays temporales para iterar sin cursor adicional.
+    SELECT  array_agg((val->>'monto')::INT  ORDER BY (val->>'fecha')::DATE, (val->>'monto')::INT),
+            array_agg((val->>'fecha')       ORDER BY (val->>'fecha')::DATE, (val->>'monto')::INT)
+      INTO v_stored_montos, v_stored_fechas
+      FROM jsonb_array_elements(v_abonos_json) AS val;
+
+    -- Reordenar p_abonos de entrada
+    FOR v_i IN 1 .. v_n_abonos LOOP
+      v_ab := (
+        SELECT val FROM jsonb_array_elements(p_abonos) AS val
+         ORDER BY (val->>'fecha')::DATE, (val->>'monto')::INT
+         LIMIT 1 OFFSET v_i - 1
+      );
+      IF (v_ab->>'monto')::INT <> v_stored_montos[v_i] THEN
+        RAISE EXCEPTION 'idempotency_conflict'
+          USING HINT = format('abono %s: monto almacenado=%s, enviado=%s',
+                               v_i, v_stored_montos[v_i], v_ab->>'monto');
+      END IF;
+      IF (v_ab->>'fecha')::DATE <> v_stored_fechas[v_i]::DATE THEN
+        RAISE EXCEPTION 'idempotency_conflict'
+          USING HINT = format('abono %s: fecha almacenada=%s, enviada=%s',
+                               v_i, v_stored_fechas[v_i], v_ab->>'fecha');
+      END IF;
+    END LOOP;
 
     RETURN jsonb_build_object(
       'plan',       v_plan_json,
@@ -99,7 +185,9 @@ BEGIN
     );
   END IF;
 
-  -- ── 1. Validaciones financieras ───────────────────────────────────────────
+  -- ════════════════════════════════════════════════════════════════════════════
+  -- BLOQUE 1 — Validaciones financieras (p_plan_id no existe aún)
+  -- ════════════════════════════════════════════════════════════════════════════
   IF p_monto_total <= 0 THEN
     RAISE EXCEPTION 'monto_invalido'
       USING HINT = 'monto_total debe ser mayor que 0';
@@ -131,7 +219,9 @@ BEGIN
                            v_suma_abonos, p_monto_total);
   END IF;
 
-  -- ── 2. Verificar cuota y obtener curso_id ─────────────────────────────────
+  -- ════════════════════════════════════════════════════════════════════════════
+  -- BLOQUE 2 — Verificar cuota, autorizar y verificar alumno
+  -- ════════════════════════════════════════════════════════════════════════════
   SELECT cu.curso_id INTO v_curso_id
     FROM cuotas cu
    WHERE cu.id = p_cuota_id AND cu.cuenta_id = p_cuenta_id
@@ -141,7 +231,6 @@ BEGIN
     RAISE EXCEPTION 'cuota_not_found' USING HINT = p_cuota_id;
   END IF;
 
-  -- ── 3. Verificar autorización ─────────────────────────────────────────────
   IF NOT (
     es_dueno(p_cuenta_id) OR
     tiene_rol_en_curso(p_cuenta_id, v_curso_id, ARRAY['admin','tesorero'])
@@ -149,7 +238,6 @@ BEGIN
     RAISE EXCEPTION 'permission_denied';
   END IF;
 
-  -- ── 4. Verificar que el alumno pertenece al curso ─────────────────────────
   IF NOT EXISTS (
     SELECT 1 FROM alumnos
      WHERE id = p_alumno_id AND cuenta_id = p_cuenta_id AND curso_id = v_curso_id
@@ -157,16 +245,15 @@ BEGIN
     RAISE EXCEPTION 'alumno_not_in_curso' USING HINT = p_alumno_id;
   END IF;
 
-  -- ── 5. Advisory lock — serializa creaciones concurrentes del mismo plan ───
-  --    Dos transacciones que llegan sin plan previo compiten aquí:
-  --    la segunda espera, y cuando obtiene el lock, el re-chequeo posterior
-  --    detectará el plan recién insertado por la primera.
+  -- ════════════════════════════════════════════════════════════════════════════
+  -- BLOQUE 3 — Advisory lock + re-chequeo completo
+  -- ════════════════════════════════════════════════════════════════════════════
   PERFORM pg_advisory_xact_lock(
     hashtext(p_cuenta_id::TEXT || '|' || p_alumno_id || '|' || p_cuota_id || '|'
              || COALESCE(p_periodo, ''))
   );
 
-  -- ── 6. Re-chequeo de idempotencia tras el lock ────────────────────────────
+  -- Re-chequeo tras el lock: mismo plan_id (autorizado como en bloque 0)
   SELECT row_to_json(pp.*)::JSONB
     INTO v_plan_json
     FROM planes_pago pp
@@ -174,10 +261,34 @@ BEGIN
    FOR UPDATE;
 
   IF FOUND THEN
-    SELECT jsonb_agg(row_to_json(ab.*)::JSONB ORDER BY ab.fecha)
+    -- Autorizar antes de devolver (ya tenemos v_curso_id del bloque 2)
+    IF NOT (
+      es_dueno(p_cuenta_id) OR
+      tiene_rol_en_curso(p_cuenta_id, v_curso_id, ARRAY['admin','tesorero'])
+    ) THEN
+      RAISE EXCEPTION 'permission_denied';
+    END IF;
+
+    -- Verificar identidad completa (misma lógica que bloque 0)
+    IF (v_plan_json->>'alumno_id') <> p_alumno_id OR
+       (v_plan_json->>'cuota_id')  <> p_cuota_id  OR
+       (v_plan_json->>'periodo')   IS DISTINCT FROM p_periodo OR
+       (v_plan_json->>'monto_total')::INT <> p_monto_total THEN
+      RAISE EXCEPTION 'idempotency_conflict'
+        USING HINT = 'El plan existente no coincide con los parámetros enviados';
+    END IF;
+
+    SELECT jsonb_agg(row_to_json(ab.*)::JSONB ORDER BY ab.fecha, ab.monto)
       INTO v_abonos_json
       FROM abonos ab
      WHERE ab.plan_id = p_plan_id AND ab.cuenta_id = p_cuenta_id;
+
+    v_n_stored := COALESCE(jsonb_array_length(v_abonos_json), 0);
+    IF v_n_stored <> jsonb_array_length(p_abonos) THEN
+      RAISE EXCEPTION 'idempotency_conflict'
+        USING HINT = format('numero de abonos: almacenados=%s, enviados=%s',
+                             v_n_stored, jsonb_array_length(p_abonos));
+    END IF;
 
     RETURN jsonb_build_object(
       'plan',       v_plan_json,
@@ -186,8 +297,9 @@ BEGIN
     );
   END IF;
 
-  -- ── 7. Verificar que no existe ya un plan activo para este natural key ─────
-  --    (p_plan_id diferente pero mismo alumno+cuota+periodo)
+  -- ════════════════════════════════════════════════════════════════════════════
+  -- BLOQUE 4 — Verificar que no existe plan activo con otro plan_id
+  -- ════════════════════════════════════════════════════════════════════════════
   SELECT id INTO v_existing_id
     FROM planes_pago
    WHERE cuenta_id = p_cuenta_id
@@ -202,12 +314,13 @@ BEGIN
       USING HINT = format('ya existe plan activo %s para esta obligación', v_existing_id);
   END IF;
 
-  -- ── 8. INSERT plan ────────────────────────────────────────────────────────
+  -- ════════════════════════════════════════════════════════════════════════════
+  -- BLOQUE 5 — Crear plan y abonos
+  -- ════════════════════════════════════════════════════════════════════════════
   INSERT INTO planes_pago(id, cuenta_id, alumno_id, cuota_id, periodo, monto_total, activo, creado_en, obs)
   VALUES (p_plan_id, p_cuenta_id, p_alumno_id, p_cuota_id, p_periodo, p_monto_total,
           TRUE, CURRENT_DATE, p_obs);
 
-  -- ── 9. INSERT abonos ──────────────────────────────────────────────────────
   FOR v_ab IN SELECT value FROM jsonb_array_elements(p_abonos) LOOP
     v_abono_id := gen_random_uuid()::TEXT;
     INSERT INTO abonos(id, cuenta_id, alumno_id, cuota_id, plan_id, monto, fecha, pagado, fecha_pago, estado)
@@ -216,7 +329,6 @@ BEGIN
             FALSE, NULL, 'registrado');
   END LOOP;
 
-  -- ── 10. Devolver plan + abonos ────────────────────────────────────────────
   SELECT row_to_json(pp.*)::JSONB
     INTO v_plan_json
     FROM planes_pago pp
