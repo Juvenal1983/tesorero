@@ -383,10 +383,16 @@ async function testMovimientos(page) {
       await new Promise(r => setTimeout(r, 2000));
     }
     comprobanteUrl = rows?.[0]?.comprobante || null;
-    const urlValida = comprobanteUrl && comprobanteUrl.startsWith('http') && !comprobanteUrl.startsWith('data:');
+    // Con bucket privado, la URL almacenada es una URL firmada:
+    // https://…supabase.co/storage/v1/object/sign/comprobantes/…?token=…
+    // Validar: empieza con https, no es base64, contiene /storage/
+    const urlValida = comprobanteUrl
+      && comprobanteUrl.startsWith('https://')
+      && !comprobanteUrl.startsWith('data:')
+      && comprobanteUrl.includes('/storage/');
     urlValida
-      ? ok('E6.M3a: comprobante URL persistida en PostgreSQL (Storage → PG, no base64)')
-      : ko('E6.M3a: comprobante no persistido o no disponible', String(comprobanteUrl));
+      ? ok('E6.M3a: URL firmada persistida en PostgreSQL (bucket privado, no base64)')
+      : ko('E6.M3a: comprobante no persistido o URL inválida', String(comprobanteUrl));
 
     // Si no se persistió, mostrar errores de Storage capturados para diagnóstico
     if (!urlValida && storageErrors.length > 0) {
@@ -395,14 +401,18 @@ async function testMovimientos(page) {
         console.warn(`     ${e.status} ${e.url.replace(/.*\/storage\//, '/storage/')}\n     ${e.body.slice(0, 400)}`)
       );
     } else if (!urlValida) {
-      console.warn('  ℹ️  Sin errores de Storage interceptados — puede que Storage no esté configurado en staging');
-      console.warn('     Verificar: Supabase Dashboard → Storage → Buckets → "comprobantes" debe existir');
+      console.warn('  ℹ️  Sin errores de Storage interceptados — verificar:');
+      console.warn('     1. Bucket "comprobantes" existe en staging (sql/E6_storage_comprobantes.sql)');
+      console.warn('     2. Función _tiene_acceso_a_mov_storage() creada en staging');
+      console.warn('     3. Políticas comprobantes_insert/select/update/delete activas');
     }
 
     const archivos = rows?.[0]?.archivos;
+    // Con el nuevo formato, cada elemento tiene { storagePath, url, nombre, tipo }
+    const archivosConStoragePath = Array.isArray(archivos) && archivos.some(a => a.storagePath);
     Array.isArray(archivos) && archivos.length > 0
-      ? ok('E6.M3b: campo archivos (JSONB) persistido')
-      : ko('E6.M3b: campo archivos vacío (Storage puede no estar configurado)', JSON.stringify(archivos));
+      ? ok('E6.M3b: campo archivos (JSONB) persistido' + (archivosConStoragePath ? ' con storagePath' : ''))
+      : ko('E6.M3b: campo archivos vacío', JSON.stringify(archivos));
 
     try { fs.unlinkSync(pdfMinimo); } catch (_) {}
   } catch (e) {
@@ -429,14 +439,22 @@ async function testMovimientos(page) {
     comprobanteUrl = comprobanteUrl || urlPost;
   } catch (e) { ko('E6.M4: error al recargar', e.message); }
 
-  // ── E6.M5: Abrir URL del comprobante ─────────────────────────────────────
-  console.log('  → E6.M5: Verificar accesibilidad de la URL del comprobante');
+  // ── E6.M5: Verificar accesibilidad de la URL firmada ─────────────────────
+  // La URL firmada lleva el token en el query string (?token=…).
+  // No requiere cabecera Authorization — el token en la URL ES la autorización.
+  // Respuesta esperada: 200 (el archivo fue subido y la firma es válida).
+  // Si responde 400 o 403: la firma falló, el bucket aún es público, o las
+  // políticas no permiten el SELECT para este usuario/movimiento.
+  console.log('  → E6.M5: Verificar accesibilidad de la URL firmada del comprobante');
   if (comprobanteUrl) {
     try {
+      // HEAD sin Authorization — la URL firmada es auto-portante
       const res = await fetch(comprobanteUrl, { method: 'HEAD' });
+      const esUrlFirmada = comprobanteUrl.includes('/object/sign/');
       res.ok
-        ? ok(`E6.M5: URL del comprobante responde ${res.status} (accesible)`)
-        : ko(`E6.M5: URL del comprobante responde ${res.status}`, comprobanteUrl);
+        ? ok(`E6.M5: URL ${esUrlFirmada ? 'firmada' : ''} del comprobante responde ${res.status}`)
+        : ko(`E6.M5: URL del comprobante responde ${res.status} — revisar política SELECT o firma expirada`,
+             comprobanteUrl.slice(0, 120) + '…');
     } catch (e) { ko('E6.M5: error al verificar URL', e.message); }
   } else {
     ko('E6.M5: sin URL de comprobante — se omite verificación HTTP');
