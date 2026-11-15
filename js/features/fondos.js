@@ -167,9 +167,29 @@ function modalEditMovFondo(data){
 }
 
 function guardarEditMovFondo(id){
-  // B4-fix: bloquear en modo V9_RELACIONAL
   if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
-    alert('⚠️ Función no disponible en modo V9: la edición de movimientos de fondos requiere implementación CRUD relacional.');
+    if(!S._v9CuentaId){ alert('⚠️ Sesión relacional no inicializada.'); return; }
+    const m = (DB.fondoMovimientos||[]).find(x=>x.id===id);
+    if(!m) return;
+    const nombre = document.getElementById('emov-nombre').value.trim();
+    const fecha  = document.getElementById('emov-fecha').value;
+    const monto  = parseInt(document.getElementById('emov-monto').value)||0;
+    if(!nombre) return alert('Ingresa una descripción.');
+    if(!monto)  return alert('Ingresa el monto.');
+    // Recalcular montoIndividual proporcional si cambia el monto
+    let newMontoInd = m.montoIndividual || null;
+    if(monto !== m.montoTotal && m.montoIndividual){
+      const factor = monto / m.montoTotal;
+      newMontoInd = {};
+      Object.keys(m.montoIndividual).forEach(k=>{ newMontoInd[k] = Math.round(m.montoIndividual[k]*factor); });
+    }
+    actualizarFondoMovimientoV9(S._v9CuentaId, id, { nombre, fecha, montoTotal: monto, montoIndividual: newMontoInd }, _authToken)
+      .then(row => {
+        const i = (DB.fondoMovimientos||[]).findIndex(x=>x.id===id);
+        if(i>=0) DB.fondoMovimientos[i] = row;
+        closeModal(); go('fondo-especial');
+      })
+      .catch(e => { console.error('[fondos] guardarEditMovFondo V9:', e); alert('⚠️ Error al guardar: '+e.message); });
     return;
   }
   const m = (DB.fondoMovimientos||[]).find(x=>x.id===id);
@@ -179,7 +199,6 @@ function guardarEditMovFondo(id){
   const monto  = parseInt(document.getElementById('emov-monto').value)||0;
   if(!nombre) return alert('Ingresa una descripción.');
   if(!monto)  return alert('Ingresa el monto.');
-  // Recalcular montoIndividual si cambia el monto
   if(monto !== m.montoTotal && m.montoIndividual){
     const factor = monto / m.montoTotal;
     const newInd = {};
@@ -195,13 +214,18 @@ function guardarEditMovFondo(id){
 }
 
 function eliminarMovFondo(id){
-  // B4-fix: bloquear en modo V9_RELACIONAL
-  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
-    alert('⚠️ Función no disponible en modo V9: la eliminación de movimientos de fondos requiere implementación CRUD relacional.');
-    return;
-  }
   if(!confirm('¿Eliminar este movimiento? Los saldos de los alumnos se recalcularán automáticamente.')) return;
   if(!confirm('Segunda confirmación: ¿Seguro que deseas eliminar este movimiento?')) return;
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    if(!S._v9CuentaId){ alert('⚠️ Sesión relacional no inicializada.'); return; }
+    eliminarFondoMovimientoV9(S._v9CuentaId, id, _authToken)
+      .then(() => {
+        DB.fondoMovimientos = (DB.fondoMovimientos||[]).filter(m=>m.id!==id);
+        go('fondo-especial');
+      })
+      .catch(e => { console.error('[fondos] eliminarMovFondo V9:', e); alert('⚠️ Error al eliminar: '+e.message); });
+    return;
+  }
   DB.fondoMovimientos = (DB.fondoMovimientos||[]).filter(m=>m.id!==id);
   saveDB();
   go('fondo-especial');
@@ -308,19 +332,13 @@ function calcPreviewFondo(){
 }
 
 function saveMovFondo(){
-  // B4-fix: en modo V9_RELACIONAL bloquear escrituras sin CRUD relacional para fondos.
-  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
-    alert('⚠️ Función no disponible en modo V9: el registro de movimientos de fondos requiere implementación CRUD relacional.');
-    return;
-  }
   const tipo   = document.getElementById('fmov-tipo').value;
   const nombre = document.getElementById('fmov-nombre').value.trim();
   const fecha  = document.getElementById('fmov-fecha').value;
   if(!nombre) return alert('Ingresa una descripción.');
   if(!fecha)  return alert('Selecciona una fecha.');
 
-  if(!DB.fondoMovimientos) DB.fondoMovimientos=[];
-  const base = { id:uid(), cursoId:S.cursoId, tipo, nombre, fecha };
+  let data = { tipo, nombre, fecha, cursoId: S.cursoId };
 
   if(tipo==='aporte'){
     const modo = document.querySelector('[name="aporte-modo"]:checked')?.value||'igual';
@@ -331,27 +349,41 @@ function saveMovFondo(){
       const montoCada = Math.round(monto / alumnos.length);
       const montoInd = {};
       alumnos.forEach(a=>montoInd[a.id]=montoCada);
-      DB.fondoMovimientos.push({...base, montoTotal:monto, montoIndividual:montoInd});
+      data = {...data, montoTotal:monto, montoIndividual:montoInd};
     } else {
       const inputs = document.querySelectorAll('.fmov-ind-input');
       const montoInd = {};
       let total = 0;
       inputs.forEach(inp=>{ const v=parseInt(inp.value)||0; if(v>0){ montoInd[inp.dataset.id]=v; total+=v; } });
       if(!total) return alert('Ingresa al menos un monto.');
-      DB.fondoMovimientos.push({...base, montoTotal:total, montoIndividual:montoInd});
+      data = {...data, montoTotal:total, montoIndividual:montoInd};
     }
   } else if(tipo==='rendimiento'){
     const monto = parseInt(document.getElementById('fmov-monto').value)||0;
     if(!monto) return alert('Ingresa el monto total del rendimiento.');
-    DB.fondoMovimientos.push({...base, montoTotal:monto});
+    data = {...data, montoTotal:monto};
   } else if(tipo==='actividad'||tipo==='multa'){
     const monto = parseInt(document.getElementById('fmov-monto').value)||0;
     if(!monto) return alert('Ingresa el monto total.');
     const participantes = [...document.querySelectorAll('.fmov-check:checked')].map(c=>c.value);
     if(!participantes.length) return alert('Selecciona al menos un participante.');
-    DB.fondoMovimientos.push({...base, montoTotal:monto, participantes});
+    data = {...data, montoTotal:monto, participantes};
   }
 
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    if(!S._v9CuentaId){ alert('⚠️ Sesión relacional no inicializada.'); return; }
+    crearFondoMovimientoV9(S._v9CuentaId, S.cursoId, data, _authToken)
+      .then(row => {
+        if(!DB.fondoMovimientos) DB.fondoMovimientos = [];
+        DB.fondoMovimientos.push(row);
+        closeModal(); go('fondo-especial');
+      })
+      .catch(e => { console.error('[fondos] saveMovFondo V9:', e); alert('⚠️ Error al guardar: '+e.message); });
+    return;
+  }
+
+  if(!DB.fondoMovimientos) DB.fondoMovimientos=[];
+  DB.fondoMovimientos.push({id:uid(), ...data});
   saveDB(); closeModal(); go('fondo-especial');
 }
 
@@ -514,11 +546,6 @@ function seleccionarTodosAct(sel){
 }
 
 function saveActividad(id){
-  // B4-fix: bloquear en modo V9_RELACIONAL
-  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
-    alert('⚠️ Función no disponible en modo V9: la gestión de actividades requiere implementación CRUD relacional.');
-    return;
-  }
   const nombre = document.getElementById('act-nombre').value.trim();
   const monto  = parseInt(document.getElementById('act-monto').value)||0;
   const fecha  = document.getElementById('act-fecha').value;
@@ -527,6 +554,29 @@ function saveActividad(id){
   if(!monto)  return alert('Ingresa el monto total recaudado.');
   const participantes = [...document.querySelectorAll('.act-check:checked')].map(c=>c.value);
   if(!participantes.length) return alert('Selecciona al menos un alumno participante.');
+
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    if(!S._v9CuentaId){ alert('⚠️ Sesión relacional no inicializada.'); return; }
+    if(id){
+      actualizarActividadV9(S._v9CuentaId, id, { nombre, montoTotal: monto, fecha, obs, participantes }, _authToken)
+        .then(row => {
+          const i = (DB.actividades||[]).findIndex(x=>x.id===id);
+          if(i>=0) DB.actividades[i] = row;
+          closeModal(); go('actividades');
+        })
+        .catch(e => { console.error('[fondos] saveActividad update V9:', e); alert('⚠️ Error al guardar: '+e.message); });
+    } else {
+      crearActividadV9(S._v9CuentaId, S.cursoId, { nombre, montoTotal: monto, fecha, obs, participantes }, _authToken)
+        .then(row => {
+          if(!DB.actividades) DB.actividades = [];
+          DB.actividades.push(row);
+          closeModal(); go('actividades');
+        })
+        .catch(e => { console.error('[fondos] saveActividad create V9:', e); alert('⚠️ Error al guardar: '+e.message); });
+    }
+    return;
+  }
+
   if(!DB.actividades) DB.actividades=[];
   if(id){
     const i=DB.actividades.findIndex(x=>x.id===id);
@@ -538,12 +588,17 @@ function saveActividad(id){
 }
 
 function eliminarActividad(id){
-  // B4-fix: bloquear en modo V9_RELACIONAL
+  if(!confirm('¿Eliminar esta actividad? Se perderán los fondos asignados.')) return;
   if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
-    alert('⚠️ Función no disponible en modo V9: la eliminación de actividades requiere implementación CRUD relacional.');
+    if(!S._v9CuentaId){ alert('⚠️ Sesión relacional no inicializada.'); return; }
+    eliminarActividadV9(S._v9CuentaId, id, _authToken)
+      .then(() => {
+        DB.actividades = (DB.actividades||[]).filter(x=>x.id!==id);
+        go('actividades');
+      })
+      .catch(e => { console.error('[fondos] eliminarActividad V9:', e); alert('⚠️ Error al eliminar: '+e.message); });
     return;
   }
-  if(!confirm('¿Eliminar esta actividad? Se perderán los fondos asignados.')) return;
   DB.actividades=(DB.actividades||[]).filter(x=>x.id!==id);
   saveDB(); go('actividades');
 }

@@ -901,21 +901,27 @@ async function cargarSesionV9(authId, accessToken, cursoId) {
 
   // 3. Alumnos del primer curso (se recargan al cambiar de curso en selectCurso)
   if (primerCursoId) {
-    const [alumnosRaw, cuotasRaw, apoderadosRaw, movimientosRaw] = await Promise.all([
+    const [alumnosRaw, cuotasRaw, apoderadosRaw, movimientosRaw, fondoMovsRaw, actividadesRaw] = await Promise.all([
       cargarAlumnos(cuentaId, primerCursoId, accessToken),
       cargarCuotas(cuentaId, primerCursoId, accessToken),
       cargarTodosApoderadosV9(cuentaId, accessToken),
       cargarMovimientosV9(cuentaId, primerCursoId, accessToken),
+      cargarFondoMovimientosV9(cuentaId, primerCursoId, accessToken),
+      cargarActividadesV9(cuentaId, primerCursoId, accessToken),
     ]);
-    DB.alumnos      = alumnosRaw.map(_mapAlumno);
-    DB.cuotas       = cuotasRaw.map(_mapCuota);
-    DB.apoderados   = apoderadosRaw.map(_mapApoderado);
-    DB.movimientos  = movimientosRaw.map(_mapMovimiento);
+    DB.alumnos           = alumnosRaw.map(_mapAlumno);
+    DB.cuotas            = cuotasRaw.map(_mapCuota);
+    DB.apoderados        = apoderadosRaw.map(_mapApoderado);
+    DB.movimientos       = movimientosRaw.map(_mapMovimiento);
+    DB.fondoMovimientos  = fondoMovsRaw.map(_mapFondoMovimiento);
+    DB.actividades       = actividadesRaw.map(_mapActividad);
   } else {
-    DB.alumnos      = [];
-    DB.cuotas       = [];
-    DB.apoderados   = [];
-    DB.movimientos  = [];
+    DB.alumnos           = [];
+    DB.cuotas            = [];
+    DB.apoderados        = [];
+    DB.movimientos       = [];
+    DB.fondoMovimientos  = [];
+    DB.actividades       = [];
   }
 
   // 4. Pagos de la cuenta (todos los cursos)
@@ -954,22 +960,26 @@ async function recargarCursoV9(cursoId, accessToken) {
   const cuentaId = (typeof S !== 'undefined' && S._v9CuentaId);
   if (!cuentaId) throw new Error('[v9] recargarCursoV9: S._v9CuentaId no disponible');
 
-  const [alumnosRaw, cuotasRaw, pagosRaw, apoderadosRaw, movimientosRaw] = await Promise.all([
+  const [alumnosRaw, cuotasRaw, pagosRaw, apoderadosRaw, movimientosRaw, fondoMovsRaw, actividadesRaw] = await Promise.all([
     cargarAlumnos(cuentaId, cursoId, accessToken),
     cargarCuotas(cuentaId, cursoId, accessToken),
     cargarPagos(cuentaId, accessToken),
     cargarTodosApoderadosV9(cuentaId, accessToken),
     cargarMovimientosV9(cuentaId, cursoId, accessToken),
+    cargarFondoMovimientosV9(cuentaId, cursoId, accessToken),
+    cargarActividadesV9(cuentaId, cursoId, accessToken),
   ]);
 
   // Devolver los datos mapeados sin escribir en DB.
   // El llamador es responsable de verificar el epoch y aplicar los datos.
   return {
-    alumnos:     alumnosRaw.map(_mapAlumno),
-    cuotas:      cuotasRaw.map(_mapCuota),
-    pagos:       pagosRaw.map(_mapPago),
-    apoderados:  apoderadosRaw.map(_mapApoderado),
-    movimientos: movimientosRaw.map(_mapMovimiento),
+    alumnos:          alumnosRaw.map(_mapAlumno),
+    cuotas:           cuotasRaw.map(_mapCuota),
+    pagos:            pagosRaw.map(_mapPago),
+    apoderados:       apoderadosRaw.map(_mapApoderado),
+    movimientos:      movimientosRaw.map(_mapMovimiento),
+    fondoMovimientos: fondoMovsRaw.map(_mapFondoMovimiento),
+    actividades:      actividadesRaw.map(_mapActividad),
   };
 }
 
@@ -1303,4 +1313,204 @@ async function v9CcRevocar(cuentaId, cursoId) {
     throw new Error(`[datos_v9] v9CcRevocar → HTTP ${res.status}: ${body}`);
   }
   return await res.json();
+}
+
+// ─── CRUD fondo_movimientos (E7) ──────────────────────────────────────────────
+
+/**
+ * Carga todos los movimientos de fondo especial del curso.
+ */
+async function cargarFondoMovimientosV9(cuentaId, cursoId, accessToken) {
+  const rows = await _v9Fetch(
+    `/fondo_movimientos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&curso_id=eq.${encodeURIComponent(cursoId)}&select=*&order=fecha.desc`,
+    { method: 'GET' },
+    accessToken
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+/**
+ * Convierte una fila de fondo_movimientos al shape legado esperado por fondos.js.
+ */
+function _mapFondoMovimiento(row) {
+  return {
+    id:              row.id,
+    cursoId:         row.curso_id,
+    tipo:            row.tipo,
+    nombre:          row.nombre,
+    montoTotal:      row.monto_total || 0,
+    montoIndividual: row.monto_individual || null,
+    participantes:   row.participantes   || null,
+    desc:            row.desc            || null,
+    fecha:           row.fecha,
+    obs:             row.obs             || null,
+    creadoPor:       row.creado_por      || null,
+    _v9: true,
+  };
+}
+
+/**
+ * Crea un movimiento de fondo especial.
+ * @param {string} cuentaId
+ * @param {string} cursoId
+ * @param {Object} data — { tipo, nombre, montoTotal, montoIndividual?, participantes?, fecha, obs? }
+ * @param {string} accessToken
+ */
+async function crearFondoMovimientoV9(cuentaId, cursoId, data, accessToken) {
+  const id = data.id || uid();
+  const payload = {
+    cuenta_id:        cuentaId,
+    id,
+    curso_id:         cursoId,
+    tipo:             data.tipo                || 'aporte',
+    nombre:           data.nombre              || null,
+    monto_total:      Math.round(Number(data.montoTotal  || data.monto_total  || 0)),
+    monto_individual: data.montoIndividual     || data.monto_individual     || null,
+    participantes:    data.participantes       || null,
+    desc:             data.desc                || null,
+    fecha:            data.fecha               || new Date().toISOString().slice(0, 10),
+    obs:              data.obs                 || null,
+    creado_por:       data.creadoPor           || data.creado_por           || null,
+  };
+  const rows = await _v9Fetch(
+    '/fondo_movimientos?select=*',
+    { method: 'POST', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(payload) },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error('[datos_v9] crearFondoMovimientoV9: INSERT sin respuesta — verifica RLS y permisos.');
+  return { ..._mapFondoMovimiento(rows[0]), id };
+}
+
+/**
+ * Actualiza un movimiento de fondo especial.
+ */
+async function actualizarFondoMovimientoV9(cuentaId, movId, data, accessToken) {
+  const patch = {};
+  if (data.nombre           !== undefined) patch.nombre           = data.nombre           || null;
+  if (data.monto_total      !== undefined) patch.monto_total      = Math.round(Number(data.monto_total));
+  if (data.montoTotal       !== undefined) patch.monto_total      = Math.round(Number(data.montoTotal));
+  if (data.monto_individual !== undefined) patch.monto_individual = data.monto_individual || null;
+  if (data.montoIndividual  !== undefined) patch.monto_individual = data.montoIndividual  || null;
+  if (data.participantes    !== undefined) patch.participantes    = data.participantes    || null;
+  if (data.fecha            !== undefined) patch.fecha            = data.fecha;
+  if (data.obs              !== undefined) patch.obs              = data.obs              || null;
+  const rows = await _v9Fetch(
+    `/fondo_movimientos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(movId)}&select=*`,
+    { method: 'PATCH', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(patch) },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error(`[datos_v9] actualizarFondoMovimientoV9: movimiento ${movId} no encontrado.`);
+  return _mapFondoMovimiento(rows[0]);
+}
+
+/**
+ * Elimina un movimiento de fondo especial.
+ */
+async function eliminarFondoMovimientoV9(cuentaId, movId, accessToken) {
+  const rows = await _v9Fetch(
+    `/fondo_movimientos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(movId)}&select=*`,
+    { method: 'DELETE', headers: { 'Prefer': 'return=representation' } },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error(`[datos_v9] eliminarFondoMovimientoV9: movimiento ${movId} no encontrado o sin permiso.`);
+  return rows;
+}
+
+// ─── CRUD actividades (E7) ────────────────────────────────────────────────────
+
+/**
+ * Carga todas las actividades de recaudación del curso.
+ */
+async function cargarActividadesV9(cuentaId, cursoId, accessToken) {
+  const rows = await _v9Fetch(
+    `/actividades?cuenta_id=eq.${encodeURIComponent(cuentaId)}&curso_id=eq.${encodeURIComponent(cursoId)}&select=*&order=fecha.desc`,
+    { method: 'GET' },
+    accessToken
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+/**
+ * Convierte una fila de actividades al shape legado esperado por fondos.js.
+ */
+function _mapActividad(row) {
+  return {
+    id:            row.id,
+    cursoId:       row.curso_id,
+    nombre:        row.nombre,
+    montoTotal:    row.monto_total  || 0,
+    participantes: row.participantes || null,
+    fecha:         row.fecha,
+    obs:           row.obs          || null,
+    creadoPor:     row.creado_por   || null,
+    _v9: true,
+  };
+}
+
+/**
+ * Crea una actividad de recaudación.
+ * @param {string} cuentaId
+ * @param {string} cursoId
+ * @param {Object} data — { nombre, montoTotal, participantes?, fecha, obs? }
+ * @param {string} accessToken
+ */
+async function crearActividadV9(cuentaId, cursoId, data, accessToken) {
+  const id = data.id || uid();
+  const payload = {
+    cuenta_id:     cuentaId,
+    id,
+    curso_id:      cursoId,
+    nombre:        data.nombre        || null,
+    monto_total:   Math.round(Number(data.montoTotal  || data.monto_total  || 0)),
+    participantes: data.participantes || null,
+    fecha:         data.fecha         || new Date().toISOString().slice(0, 10),
+    obs:           data.obs           || null,
+    creado_por:    data.creadoPor     || data.creado_por || null,
+  };
+  const rows = await _v9Fetch(
+    '/actividades?select=*',
+    { method: 'POST', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(payload) },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error('[datos_v9] crearActividadV9: INSERT sin respuesta — verifica RLS y permisos.');
+  return { ..._mapActividad(rows[0]), id };
+}
+
+/**
+ * Actualiza una actividad existente.
+ */
+async function actualizarActividadV9(cuentaId, actividadId, data, accessToken) {
+  const patch = {};
+  if (data.nombre        !== undefined) patch.nombre        = data.nombre        || null;
+  if (data.monto_total   !== undefined) patch.monto_total   = Math.round(Number(data.monto_total));
+  if (data.montoTotal    !== undefined) patch.monto_total   = Math.round(Number(data.montoTotal));
+  if (data.participantes !== undefined) patch.participantes = data.participantes || null;
+  if (data.fecha         !== undefined) patch.fecha         = data.fecha;
+  if (data.obs           !== undefined) patch.obs           = data.obs           || null;
+  const rows = await _v9Fetch(
+    `/actividades?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(actividadId)}&select=*`,
+    { method: 'PATCH', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(patch) },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error(`[datos_v9] actualizarActividadV9: actividad ${actividadId} no encontrada.`);
+  return _mapActividad(rows[0]);
+}
+
+/**
+ * Elimina una actividad.
+ */
+async function eliminarActividadV9(cuentaId, actividadId, accessToken) {
+  const rows = await _v9Fetch(
+    `/actividades?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(actividadId)}&select=*`,
+    { method: 'DELETE', headers: { 'Prefer': 'return=representation' } },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error(`[datos_v9] eliminarActividadV9: actividad ${actividadId} no encontrada o sin permiso.`);
+  return rows;
 }
