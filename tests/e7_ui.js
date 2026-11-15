@@ -712,8 +712,28 @@ async function navegar(page, ruta, waitSelector) {
       await page.locator('#act-fecha').fill('2026-08-20');
       await page.locator('#act-monto').fill(String(MONTO_ACT));
       await page.locator('#act-obs').fill(`obs-e7ui-${EXEC_ID}`);
+
+      // saveActividad() exige al menos un participante — marcar todos los .act-check del modal
+      const nChecks = await page.locator('.act-check').count();
+      if (nChecks === 0)
+        throw new Error('No se encontraron checkboxes .act-check en el modal de nueva actividad');
+      await page.locator('.act-check').evaluateAll(cbs => cbs.forEach(cb => { cb.checked = true; }));
+      console.log(`  [act] ${nChecks} participante(s) seleccionado(s)`);
+
+      // Capturar alertas de validación antes de hacer clic en guardar
+      let alertMsg = null;
+      const alertHandler = d => { alertMsg = d.message(); d.accept(); };
+      page.on('dialog', alertHandler);
       await page.locator('button[onclick*="saveActividad"]').click();
-      await page.waitForTimeout(2000);
+      // Esperar que go('actividades') se complete (indica que el save fue exitoso y la modal se cerró)
+      await page.waitForFunction(
+        () => typeof S !== 'undefined' && S.route === 'actividades' && !S.modal,
+        { timeout: TIMEOUT_LARGO }
+      );
+      page.off('dialog', alertHandler);
+      if (alertMsg)
+        throw new Error(`saveActividad disparó alerta de validación: "${alertMsg}"`);
+      await page.waitForTimeout(500); // breve estabilización
 
       const rAct = await rest(
         `/actividades?cuenta_id=eq.${cuentaId}&curso_id=eq.${cursoId}&nombre=like.${encodeURIComponent(`Act-${EXEC_ID}%`)}&select=id,nombre,monto_total`,
@@ -738,8 +758,20 @@ async function navegar(page, ruta, waitSelector) {
       await page.locator('#act-nombre').fill(`Act-Edit-${EXEC_ID}`);
       await page.locator('#act-monto').clear();
       await page.locator('#act-monto').fill(String(MONTO_ACT_EDIT));
+      // Participantes quedan tal como los dejó ACT.1 (todos marcados)
+
+      let alertMsg2 = null;
+      const alertHandler2 = d => { alertMsg2 = d.message(); d.accept(); };
+      page.on('dialog', alertHandler2);
       await page.locator(`button[onclick*="saveActividad"][onclick*="${actId}"]`).click();
-      await page.waitForTimeout(2000);
+      await page.waitForFunction(
+        () => typeof S !== 'undefined' && S.route === 'actividades' && !S.modal,
+        { timeout: TIMEOUT_LARGO }
+      );
+      page.off('dialog', alertHandler2);
+      if (alertMsg2)
+        throw new Error(`saveActividad (edit) disparó alerta: "${alertMsg2}"`);
+      await page.waitForTimeout(500);
 
       const rActEdit = await rest(`/actividades?id=eq.${actId}&select=nombre,monto_total`, {}, jwt);
       const nom   = rActEdit.body?.[0]?.nombre || '';
