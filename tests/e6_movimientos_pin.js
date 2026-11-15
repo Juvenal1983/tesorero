@@ -12,6 +12,8 @@
  *   E6.PIN1 Configurar PIN desde el modal de alumno (nuevo alumno)
  *   E6.PIN2 retryPin — cambiar PIN desde el botón 🔑 sin recrear el alumno
  *   E6.APO  apoderado_abrir_comprobante — URL firmada vía Edge Function + RPC
+ *           Incluye: APO.NULL, APO.EMPTY, APO.1 (Edge), APO.CONTADOR (shared),
+ *                    APO.2, APO.3, APO.CURSO
  *   E6.M6   Eliminar movimiento (tras el test de apoderado)
  *
  * Orden de ejecución: M1-M5 → PIN1-PIN2 → APO → M6
@@ -767,6 +769,75 @@ async function testApoderado(movIdCreado, comprobanteRef, pinNuevo) {
       }
     } catch (e) { ko('E6.APO.1: error al llamar Edge Function', e.message); }
   }
+
+  // ── APO.CONTADOR: Verificar contador unificado (no eludible alternando endpoints)
+  // Demuestra que apoderado_abrir_comprobante y apoderado_acceso comparten el mismo
+  // contador de intentos (apoderado_intentos via _apoderado_verificar_pin).
+  // Después de APO.1 (success) el contador está a 0.
+  // 2 fallos via apoderado_acceso (RPC anon directo) + 2 via apoderado_abrir_comprobante
+  // deben sumar 4 en el contador compartido; el 5.º intento debe devolver bloqueado.
+  console.log('  → E6.APO.CONTADOR: contador unificado (no eludible alternando endpoints)');
+  try {
+    const wrongPin = 'PIN_MALO_CONTADOR_99';
+
+    // 2 fallos via apoderado_acceso
+    for (let i = 0; i < 2; i++) {
+      await fetch(`${SUPA_URL}/rest/v1/rpc/apoderado_acceso`, {
+        method: 'POST',
+        headers: anonHdrs,
+        body: JSON.stringify({ p_cuenta_id: cuentaId, p_alumno_id: ALU_ID, p_pin: wrongPin }),
+      });
+    }
+
+    // 2 fallos via apoderado_abrir_comprobante (RPC directo para no depender del deploy)
+    for (let i = 0; i < 2; i++) {
+      await fetch(RPC_URL, {
+        method: 'POST',
+        headers: anonHdrs,
+        body: JSON.stringify({
+          p_cuenta_id: cuentaId, p_alumno_id: ALU_ID,
+          p_pin: wrongPin, p_mov_id: movIdCreado || 'mov-inexistente',
+        }),
+      });
+    }
+
+    // 5.º intento via apoderado_acceso → debe devolver bloqueado
+    const resBlocked = await fetch(`${SUPA_URL}/rest/v1/rpc/apoderado_acceso`, {
+      method: 'POST',
+      headers: anonHdrs,
+      body: JSON.stringify({ p_cuenta_id: cuentaId, p_alumno_id: ALU_ID, p_pin: wrongPin }),
+    });
+    const dataBlocked = await resBlocked.json().catch(() => null);
+
+    // apoderado_acceso retorna {"error": "bloqueado"}; apoderado_abrir_comprobante retorna {"ok":false,"error":"cuenta_bloqueada"}
+    const estaBloqueado = dataBlocked?.error === 'bloqueado' || dataBlocked?.error === 'cuenta_bloqueada';
+    estaBloqueado
+      ? ok('E6.APO.CONTADOR: 5.º intento alternando endpoints devuelve bloqueado (contador compartido ✓)')
+      : ko('E6.APO.CONTADOR: 5.º intento no devolvió bloqueado — contador puede ser independiente',
+           JSON.stringify(dataBlocked)?.slice(0, 200));
+
+    // Desbloquear: una llamada con PIN correcto via apoderado_acceso resetea el contador
+    await fetch(`${SUPA_URL}/rest/v1/rpc/apoderado_acceso`, {
+      method: 'POST',
+      headers: anonHdrs,
+      body: JSON.stringify({ p_cuenta_id: cuentaId, p_alumno_id: ALU_ID, p_pin: pinNuevo }),
+    });
+    // Verificar que ya no está bloqueado
+    const resUnlock = await fetch(RPC_URL, {
+      method: 'POST',
+      headers: anonHdrs,
+      body: JSON.stringify({
+        p_cuenta_id: cuentaId, p_alumno_id: ALU_ID,
+        p_pin: pinNuevo, p_mov_id: movIdCreado || 'mov-inexistente',
+      }),
+    });
+    const dataUnlock = await resUnlock.json().catch(() => null);
+    // Debe responder algo distinto a cuenta_bloqueada (p.ej. ok, sin_comprobante, movimiento_no_accesible…)
+    dataUnlock?.error !== 'cuenta_bloqueada' && dataUnlock?.error !== 'bloqueado'
+      ? ok('E6.APO.CONTADOR.reset: contador reiniciado tras PIN correcto (ya no bloqueado)')
+      : ko('E6.APO.CONTADOR.reset: cuenta sigue bloqueada tras PIN correcto', JSON.stringify(dataUnlock)?.slice(0, 200));
+
+  } catch (e) { ko('E6.APO.CONTADOR: error en test de contador unificado', e.message); }
 
   // ── APO.2: PIN incorrecto → error pin_incorrecto ──────────────────────────
   console.log('  → E6.APO.2: PIN incorrecto → debe rechazar');

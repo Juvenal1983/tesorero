@@ -1,9 +1,35 @@
 -- =============================================================================
--- E6_storage_comprobantes.sql  (v4 — Edge Function, sin Vault, sin pgjwt)
+-- E6_storage_comprobantes.sql  (v5 — Edge Function, sin Vault, sin pgjwt)
 -- Bucket "comprobantes" privado + políticas RLS + RPC validación + Edge Function
 --
 -- EJECUTAR SOLO EN STAGING (rucgmytyxpfowznowxwd.supabase.co)
 -- NO ejecutar en producción.
+--
+-- ── Cambios en v5 respecto a v4 ───────────────────────────────────────────────
+--
+-- [FIX-C1] verify_jwt = false en supabase/config.toml
+--   Los apoderados no tienen sesión Supabase Auth; el gateway rechazaría con 401
+--   cualquier request sin JWT válido. La protección real es el PIN con bcrypt.
+--   Configurado en supabase/config.toml (no como flag en el comando deploy).
+--
+-- [FIX-C2] GRANT EXECUTE a service_role
+--   v4: solo anon y authenticated. La Edge Function invoca la RPC con service_role
+--   y, aunque postgres-superusuario llama directamente, el GRANT explícito es
+--   necesario para evitar depender de defaults o de privilegios heredados.
+--
+-- [FIX-C3] starts_with() en lugar de LIKE
+--   v4: `v_path NOT LIKE (v_prefix || '%')` — LIKE interpreta % y _ como comodines.
+--   curso_id y p_mov_id son TEXT y podrían contener esos caracteres.
+--   v5: `NOT starts_with(v_path, v_prefix)` — comparación literal, sin comodines.
+--
+-- [FIX-C4] Contador de intentos unificado con _apoderado_verificar_pin
+--   v4: apoderado_abrir_comprobante mantenía su propio contador en pin_intentos_fallidos.
+--   Problema: apoderado_acceso, apoderado_ver_pagos, etc. usan _apoderado_verificar_pin
+--   que escribe en apoderado_intentos. Dos tablas → eludir el límite alternando endpoints.
+--   v5: apoderado_abrir_comprobante delega a _apoderado_verificar_pin (misma tabla
+--   apoderado_intentos que todos los demás RPCs). La tabla pin_intentos_fallidos se
+--   mantiene (con sus REVOKEs) por idempotencia de migraciones anteriores, pero la
+--   función ya no escribe en ella.
 --
 -- ── Cambios en v4 respecto a v3 ───────────────────────────────────────────────
 --
@@ -19,16 +45,17 @@
 --   v3: extensions.sign() de pgjwt generaba el token JWT directamente en PostgreSQL.
 --       Problema: requería que el usuario copiara manualmente el JWT Secret al Vault
 --       sin demostración previa de que el token sea compatible con Storage.
---   v4: La RPC apoderado_abrir_comprobante solo VALIDA y devuelve el storagePath.
+--   v5: La RPC apoderado_abrir_comprobante solo VALIDA y devuelve el storagePath.
 --       La firma real la hace la Edge Function `apoderado-comprobante` en Deno,
 --       usando supabase.storage.createSignedUrl() — la API oficial — con la
 --       service_role key inyectada automáticamente por Supabase (SUPABASE_SERVICE_ROLE_KEY),
 --       sin ninguna configuración manual de Vault.
 --
--- [FIX-B3] Verificación de curso activo agregada
+-- [FIX-B3] Verificación de curso activo agregada (delegada a _apoderado_verificar_pin en v5)
 --   v3: La RPC verificaba alumno activo pero no consultaba cursos.activo.
---   v4: Después de obtener v_curso_id del alumno, se consulta cursos.activo.
---       Si el curso no existe o está inactivo → error 'curso_inactivo'.
+--   v4: Después de obtener v_curso_id del alumno, se consultaba cursos.activo.
+--   v5: La verificación la realiza _apoderado_verificar_pin; apoderado_abrir_comprobante
+--       distingue entre 'alumno_inactivo' y 'curso_inactivo' en el mapeo de errores.
 --
 -- ── Arquitectura v4 ───────────────────────────────────────────────────────────
 --
@@ -80,6 +107,13 @@
 
 
 -- ── PARTE 0a: Tabla pin_intentos_fallidos ─────────────────────────────────────
+-- NOTA v5: apoderado_abrir_comprobante ya NO escribe en esta tabla.
+-- El control de intentos se delega a _apoderado_verificar_pin, que usa
+-- la tabla apoderado_intentos (compartida con apoderado_acceso y todos
+-- los demás RPCs de apoderado).
+--
+-- Esta sección se mantiene por idempotencia: si se ejecutó v3 o v4 antes,
+-- los REVOKEs y el DROP POLICY siguen siendo necesarios para limpiar el estado.
 CREATE TABLE IF NOT EXISTS public.pin_intentos_fallidos (
   cuenta_id       UUID         NOT NULL,
   alumno_id       TEXT         NOT NULL,
@@ -90,22 +124,18 @@ CREATE TABLE IF NOT EXISTS public.pin_intentos_fallidos (
 );
 
 -- RLS habilitado para que los roles cliente NO accedan directamente.
--- Las funciones SECURITY DEFINER ejecutan como postgres (superusuario),
--- que bypasea RLS sin necesidad de ninguna política permisiva.
 ALTER TABLE public.pin_intentos_fallidos ENABLE ROW LEVEL SECURITY;
 
 -- [FIX-B1] Eliminar cualquier política permisiva que hubiera en v3.
 DROP POLICY IF EXISTS "pin_intentos_svc" ON public.pin_intentos_fallidos;
 
 -- [FIX-B1] Revocar acceso directo a anon y authenticated.
--- Con RLS habilitado y sin política permisiva, estos roles no pueden
--- leer ni escribir la tabla aunque tuvieran permisos de tabla.
 REVOKE ALL ON TABLE public.pin_intentos_fallidos FROM anon;
 REVOKE ALL ON TABLE public.pin_intentos_fallidos FROM authenticated;
 
 COMMENT ON TABLE public.pin_intentos_fallidos IS
-  'Contador de intentos fallidos de PIN por alumno. '
-  'Accesible SOLO por funciones SECURITY DEFINER (propietario = postgres). '
+  'Tabla legacy (v3/v4). En v5, apoderado_abrir_comprobante usa apoderado_intentos '
+  'a través de _apoderado_verificar_pin. Esta tabla ya no recibe escrituras nuevas. '
   'Sin políticas permisivas — anon y authenticated no pueden consultarla directamente.';
 
 
@@ -256,25 +286,30 @@ USING (
 );
 
 
--- ── PARTE 4: RPC apoderado_abrir_comprobante (v4 — solo validación, sin firma) ─
+-- ── PARTE 4: RPC apoderado_abrir_comprobante (v5 — solo validación, sin firma) ─
 --
 -- Esta función VALIDA el acceso del apoderado y devuelve el storagePath.
 -- La firma real de la URL la hace la Edge Function `apoderado-comprobante`
 -- (ver supabase/functions/apoderado-comprobante/index.ts).
 --
--- Flujo:
---   1. Rechaza PIN nulo/vacío.
---   2. Verifica bloqueo de intentos.
---   3. Verifica PIN con bcrypt (IS DISTINCT FROM — NULL-safe).
---   4. Incrementa/reinicia contador de intentos.
---   5. Verifica alumno activo.
---   6. Verifica curso activo.          ← NUEVO en v4
---   7. Verifica movimiento visible=TRUE del curso del alumno.
---   8. Valida que storagePath empieza con {cuentaId}/{cursoId}/{movId}/.
---   9. Devuelve {ok:true, storage_path:"..."}.
+-- [FIX-C4] Control de intentos unificado:
+--   Delega a _apoderado_verificar_pin (06_rpcs_apoderado.sql), que escribe en
+--   apoderado_intentos — la misma tabla que apoderado_acceso, apoderado_ver_pagos
+--   y todos los demás RPCs de apoderado. Alternar entre este endpoint y los demás
+--   NO elude el límite de 5 intentos.
 --
--- La firma la hace la Edge Function sobre storage_path.
--- (Sin Vault. Sin pgjwt. Sin pg_net.)
+-- [FIX-C3] starts_with() en lugar de LIKE:
+--   LIKE interpreta % y _ como comodines; curso_id y p_mov_id son TEXT y podrían
+--   contener esos caracteres. starts_with() es comparación literal.
+--
+-- Flujo:
+--   1. _apoderado_verificar_pin: rechaza PIN nulo, verifica bloqueo, bcrypt, incrementa.
+--   2. Distingue alumno_inactivo vs curso_inactivo (error granular).
+--   3. Obtiene curso_id del alumno (ya validado activo por step 1).
+--   4. Verifica movimiento visible=TRUE del curso del alumno.
+--   5. Extrae storagePath desde comprobante o archivos[0].storagePath.
+--   6. Valida prefijo con starts_with (sin comodines).
+--   7. Devuelve {ok:true, storage_path:"..."}.
 --
 -- Parámetros:
 --   p_cuenta_id  UUID  — cuenta donde está el alumno y el movimiento
@@ -298,73 +333,62 @@ SECURITY DEFINER
 SET search_path = public, extensions
 AS $$
 DECLARE
-  v_hash           TEXT;
-  v_intentos       INT;
-  v_bloqueado_hasta TIMESTAMPTZ;
-  v_curso_id       TEXT;
-  v_alumno_estado  TEXT;
-  v_curso_activo   BOOLEAN;
-  v_archivos       JSONB;
-  v_comprobante    TEXT;
-  v_path           TEXT;
-  v_prefix         TEXT;
+  v_pin_result    TEXT;
+  v_alumno_estado TEXT;
+  v_curso_id      TEXT;
+  v_archivos      JSONB;
+  v_comprobante   TEXT;
+  v_path          TEXT;
+  v_prefix        TEXT;
 BEGIN
 
-  -- ── 1. Rechazar PIN nulo o vacío ──────────────────────────────────────────
-  IF p_pin IS NULL OR trim(p_pin) = '' THEN
-    RETURN jsonb_build_object('ok', false, 'error', 'pin_requerido');
-  END IF;
+  -- ── 1. Validar PIN + control unificado de intentos ─────────────────────────
+  -- [FIX-C4] Delega a _apoderado_verificar_pin (06_rpcs_apoderado.sql).
+  -- Escribe en apoderado_intentos — MISMA tabla que apoderado_acceso, etc.
+  -- No hay contador independiente: alternar endpoints no elude el límite.
+  v_pin_result := _apoderado_verificar_pin(p_cuenta_id, p_alumno_id, p_pin);
 
-  -- ── 2. Verificar bloqueo por intentos fallidos ────────────────────────────
-  SELECT intentos, bloqueado_hasta
-  INTO   v_intentos, v_bloqueado_hasta
-  FROM   public.pin_intentos_fallidos
-  WHERE  cuenta_id = p_cuenta_id AND alumno_id = p_alumno_id;
+  CASE v_pin_result
+    WHEN 'ok' THEN
+      NULL;  -- continuar
 
-  IF FOUND AND v_bloqueado_hasta IS NOT NULL AND v_bloqueado_hasta > now() THEN
-    RETURN jsonb_build_object(
-      'ok',      false,
-      'error',   'cuenta_bloqueada',
-      'detalle', 'Demasiados intentos fallidos. Vuelve a intentarlo en unos minutos.',
-      'hasta',   to_char(v_bloqueado_hasta AT TIME ZONE 'UTC', 'HH24:MI UTC')
-    );
-  END IF;
+    WHEN 'pin_requerido' THEN
+      RETURN jsonb_build_object('ok', false, 'error', 'pin_requerido');
 
-  -- ── 3. Obtener PIN hash del alumno ────────────────────────────────────────
-  SELECT pin_hash INTO v_hash
-  FROM   public.alumnos_credenciales
-  WHERE  cuenta_id = p_cuenta_id AND alumno_id = p_alumno_id;
+    WHEN 'bloqueado' THEN
+      RETURN jsonb_build_object(
+        'ok',      false,
+        'error',   'cuenta_bloqueada',
+        'detalle', 'Demasiados intentos fallidos. Vuelve a intentarlo en unos minutos.'
+      );
 
-  IF NOT FOUND THEN
-    RETURN jsonb_build_object('ok', false, 'error', 'alumno_sin_pin');
-  END IF;
+    WHEN 'sin_credencial' THEN
+      RETURN jsonb_build_object('ok', false, 'error', 'alumno_sin_pin');
 
-  -- ── 4. Verificar PIN con bcrypt (NULL-safe) ───────────────────────────────
-  -- IS DISTINCT FROM evita el bypass: crypt(NULL, hash) = NULL,
-  -- pero NULL IS DISTINCT FROM hash → TRUE → el bloque se ejecuta siempre.
-  IF crypt(p_pin, v_hash) IS DISTINCT FROM v_hash THEN
+    WHEN 'pin_incorrecto' THEN
+      RETURN jsonb_build_object('ok', false, 'error', 'pin_incorrecto');
 
-    INSERT INTO public.pin_intentos_fallidos (cuenta_id, alumno_id, intentos, ultimo_intento)
-    VALUES (p_cuenta_id, p_alumno_id, 1, now())
-    ON CONFLICT (cuenta_id, alumno_id) DO UPDATE
-      SET intentos       = pin_intentos_fallidos.intentos + 1,
-          ultimo_intento = now(),
-          bloqueado_hasta = CASE
-            WHEN pin_intentos_fallidos.intentos + 1 >= 5
-            THEN now() + interval '15 minutes'
-            ELSE NULL
-          END;
+    WHEN 'alumno_inactivo' THEN
+      -- _apoderado_verificar_pin retorna 'alumno_inactivo' para AMBOS casos:
+      -- alumno inactivo y curso inactivo.  Distinguir para el código preciso.
+      SELECT a.estado, a.curso_id INTO v_alumno_estado, v_curso_id
+      FROM   public.alumnos a
+      WHERE  a.cuenta_id = p_cuenta_id AND a.id = p_alumno_id;
 
-    RETURN jsonb_build_object('ok', false, 'error', 'pin_incorrecto');
-  END IF;
+      IF NOT FOUND OR v_alumno_estado IS DISTINCT FROM 'activo' THEN
+        RETURN jsonb_build_object('ok', false, 'error', 'alumno_inactivo');
+      END IF;
+      -- Alumno activo pero curso inactivo
+      RETURN jsonb_build_object('ok', false, 'error', 'curso_inactivo');
 
-  -- ── 5. PIN correcto: reiniciar contador ──────────────────────────────────
-  UPDATE public.pin_intentos_fallidos
-  SET intentos = 0, bloqueado_hasta = NULL, ultimo_intento = now()
-  WHERE cuenta_id = p_cuenta_id AND alumno_id = p_alumno_id;
+    ELSE
+      -- Código desconocido devuelto por _apoderado_verificar_pin (ej: futuro)
+      RETURN jsonb_build_object('ok', false, 'error', v_pin_result);
+  END CASE;
 
-  -- ── 6. Verificar alumno activo ────────────────────────────────────────────
-  SELECT a.curso_id, a.estado INTO v_curso_id, v_alumno_estado
+  -- ── 2. Obtener curso_id del alumno ────────────────────────────────────────
+  -- Alumno y curso ya validados activos por _apoderado_verificar_pin.
+  SELECT a.curso_id INTO v_curso_id
   FROM   public.alumnos a
   WHERE  a.cuenta_id = p_cuenta_id AND a.id = p_alumno_id;
 
@@ -372,21 +396,7 @@ BEGIN
     RETURN jsonb_build_object('ok', false, 'error', 'alumno_no_encontrado');
   END IF;
 
-  IF v_alumno_estado IS DISTINCT FROM 'activo' THEN
-    RETURN jsonb_build_object('ok', false, 'error', 'alumno_inactivo');
-  END IF;
-
-  -- ── 7. Verificar curso activo ─────────────────────────────────────────────
-  -- [FIX-B3] Consulta explícita a cursos.activo.
-  SELECT activo INTO v_curso_activo
-  FROM   public.cursos
-  WHERE  cuenta_id = p_cuenta_id AND id = v_curso_id;
-
-  IF NOT FOUND OR NOT v_curso_activo THEN
-    RETURN jsonb_build_object('ok', false, 'error', 'curso_inactivo');
-  END IF;
-
-  -- ── 8. Verificar movimiento: visible=TRUE, del curso del alumno ───────────
+  -- ── 3. Verificar movimiento: visible=TRUE, del curso del alumno ───────────
   SELECT archivos, comprobante INTO v_archivos, v_comprobante
   FROM   public.movimientos
   WHERE  cuenta_id = p_cuenta_id
@@ -398,11 +408,11 @@ BEGIN
     RETURN jsonb_build_object('ok', false, 'error', 'movimiento_no_accesible');
   END IF;
 
-  -- ── 9. Extraer storagePath ────────────────────────────────────────────────
+  -- ── 4. Extraer storagePath ────────────────────────────────────────────────
   v_path := v_comprobante;
   IF v_path IS NULL OR v_path = ''
-     OR v_path LIKE 'https://%'
-     OR v_path LIKE 'data:%'
+     OR starts_with(v_path, 'https://')
+     OR starts_with(v_path, 'data:')
   THEN
     IF jsonb_array_length(COALESCE(v_archivos, '[]'::jsonb)) > 0 THEN
       v_path := v_archivos->0->>'storagePath';
@@ -413,9 +423,12 @@ BEGIN
     RETURN jsonb_build_object('ok', false, 'error', 'sin_comprobante');
   END IF;
 
-  -- ── 10. Validar que el storagePath pertenece a esta cuenta/curso/movimiento ─
+  -- ── 5. Validar prefijo con starts_with (sin LIKE — evita comodines) ───────
+  -- [FIX-C3] LIKE interpreta % y _ como comodines en el patrón.
+  -- curso_id y p_mov_id son TEXT; podrían contener esos caracteres.
+  -- starts_with() hace comparación literal, sin interpretación de comodines.
   v_prefix := p_cuenta_id::text || '/' || v_curso_id || '/' || p_mov_id || '/';
-  IF v_path NOT LIKE (v_prefix || '%') THEN
+  IF NOT starts_with(v_path, v_prefix) THEN
     RETURN jsonb_build_object(
       'ok',      false,
       'error',   'ruta_invalida',
@@ -423,21 +436,26 @@ BEGIN
     );
   END IF;
 
-  -- ── 11. Devolver storagePath validado (la firma la hace la Edge Function) ──
+  -- ── 6. Devolver storagePath validado (la firma la hace la Edge Function) ──
   RETURN jsonb_build_object('ok', true, 'storage_path', v_path);
 END;
 $$;
 
 COMMENT ON FUNCTION public.apoderado_abrir_comprobante(UUID, TEXT, TEXT, TEXT) IS
   'Valida acceso del apoderado y devuelve storage_path (NO firma). '
-  'Verificaciones: PIN null-safe (IS DISTINCT FROM), bloqueo 5 intentos/15 min, '
-  'alumno activo, curso activo, movimiento visible=TRUE, ruta {cuenta}/{curso}/{mov}/. '
+  'v5: delega PIN+intentos a _apoderado_verificar_pin (apoderado_intentos, '
+  'misma tabla que todos los RPCs de apoderado). starts_with() en lugar de LIKE. '
+  'Verificaciones: PIN, bloqueo 5 intentos/15 min, alumno activo, curso activo, '
+  'movimiento visible=TRUE, ruta {cuenta}/{curso}/{mov}/. '
   'La URL firmada la genera la Edge Function apoderado-comprobante. '
-  'Sin Vault. Sin pgjwt. Sin pg_net.';
+  'verify_jwt=false en supabase/config.toml. Sin Vault. Sin pgjwt. Sin pg_net.';
 
 REVOKE ALL    ON FUNCTION public.apoderado_abrir_comprobante(UUID, TEXT, TEXT, TEXT) FROM PUBLIC;
 GRANT  EXECUTE ON FUNCTION public.apoderado_abrir_comprobante(UUID, TEXT, TEXT, TEXT) TO anon;
 GRANT  EXECUTE ON FUNCTION public.apoderado_abrir_comprobante(UUID, TEXT, TEXT, TEXT) TO authenticated;
+-- [FIX-C2] La Edge Function invoca la RPC con service_role.
+-- Conceder EXECUTE explícito sin depender de privilegios de superusuario heredados.
+GRANT  EXECUTE ON FUNCTION public.apoderado_abrir_comprobante(UUID, TEXT, TEXT, TEXT) TO service_role;
 
 
 -- ── PARTE 5: Verificación ─────────────────────────────────────────────────────
@@ -475,30 +493,48 @@ WHERE table_name = 'pin_intentos_fallidos'
   AND grantee IN ('anon', 'authenticated')
 ORDER BY grantee, privilege_type;
 
--- 5e. Funciones
+-- 5e. Funciones — verificar grants incluyendo service_role
 SELECT
   p.proname AS funcion,
   p.pronargs AS n_params,
   array_to_string(p.proconfig, ', ') AS search_path,
   CASE WHEN has_function_privilege('authenticated', p.oid, 'EXECUTE')
-       THEN 'authenticated ✓' ELSE 'SIN GRANT ⚠' END AS grant_authenticated,
+       THEN 'authenticated ✓' ELSE 'SIN GRANT ⚠' END AS grant_auth,
   CASE WHEN p.proname = 'apoderado_abrir_comprobante'
         AND has_function_privilege('anon', p.oid, 'EXECUTE')
        THEN 'anon ✓'
        WHEN p.proname = 'apoderado_abrir_comprobante'
-       THEN 'SIN GRANT anon ⚠' ELSE '(solo authenticated)' END AS grant_anon
+       THEN 'SIN GRANT anon ⚠' ELSE '(no aplica)' END AS grant_anon,
+  -- [FIX-C2] La Edge Function usa service_role; debe tener EXECUTE.
+  CASE WHEN p.proname = 'apoderado_abrir_comprobante'
+        AND has_function_privilege('service_role', p.oid, 'EXECUTE')
+       THEN 'service_role ✓'
+       WHEN p.proname = 'apoderado_abrir_comprobante'
+       THEN 'SIN GRANT service_role ⚠' ELSE '(no aplica)' END AS grant_service_role
 FROM pg_proc p
 JOIN pg_namespace n ON n.oid = p.pronamespace
 WHERE n.nspname = 'public'
   AND p.proname IN ('_tiene_acceso_a_mov_storage', 'apoderado_abrir_comprobante')
 ORDER BY p.proname;
 
--- 5f. Verificar que la función devuelve storage_path (no url) con un PIN inválido
--- (safe: solo prueba la ruta de error, nunca devuelve datos reales)
+-- 5f. Verificar que el contador de intentos de apoderado_abrir_comprobante
+-- es el mismo que usan apoderado_acceso y los demás RPCs: apoderado_intentos.
+-- (pin_intentos_fallidos ya no recibe escrituras nuevas desde v5.)
+SELECT
+  relname AS tabla,
+  'existe ✓' AS estado
+FROM pg_class
+WHERE relname IN ('apoderado_intentos', 'pin_intentos_fallidos')
+  AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+ORDER BY relname;
+
+-- 5g. Smoke test: función devuelve error reconocible con alumno/PIN inexistente
+-- (safe: nunca devuelve datos reales)
 SELECT public.apoderado_abrir_comprobante(
   '00000000-0000-0000-0000-000000000000'::UUID,
   'alumno-inexistente',
   'pin-de-prueba',
   'mov-inexistente'
 ) AS respuesta_esperada;
--- Esperado: {"ok": false, "error": "alumno_sin_pin"}
+-- Esperado: {"ok": false, "error": "alumno_inactivo"}  (via _apoderado_verificar_pin)
+-- o {"ok": false, "error": "sin_credencial"} si no encuentra el alumno en las tablas.

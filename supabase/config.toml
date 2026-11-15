@@ -1,0 +1,14 @@
+# supabase/config.toml
+# Configuración de la CLI de Supabase para el proyecto.
+# Ver: https://supabase.com/docs/guides/cli/config
+#
+# STAGING project-ref : rucgmytyxpfowznowxwd
+# PRODUCCIÓN         : NO tocar (tmjqzaakzhecbldebyeg)
+
+[functions.apoderado-comprobante]
+# verify_jwt = false porque la autorización se realiza mediante PIN
+# dentro del servidor (RPC apoderado_abrir_comprobante).
+# Los apoderados NO tienen sesión Supabase Auth; el gateway no puede
+# verificar un JWT que no existe.  La protección de acceso es el PIN
+# con bcrypt + control de intentos fallidos compartido.
+verify_jwt = false
