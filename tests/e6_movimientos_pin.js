@@ -83,6 +83,8 @@ const TIMEOUT_LARGO = 30_000;
 // IDs de fixtures exclusivos de este run
 const CURSO_ID     = `crs-e6-${EXEC_ID}`;
 const ALU_ID       = `alu-e6-${EXEC_ID}`;
+// Fixture EXCLUSIVO para APO.CONTADOR — no comparte estado de bloqueo con ALU_ID
+const ALU2_ID      = `alu-e6-b-${EXEC_ID}`;
 
 let pass = 0, fail = 0;
 const failures = [];
@@ -150,53 +152,38 @@ async function setup() {
       nombres: 'E6Fixture', apellidos: `PIN${EXEC_ID}`, estado: 'activo',
     }),
   });
+  // Alumno fixture EXCLUSIVO para APO.CONTADOR (mantiene su propio contador de intentos)
+  await req('/alumnos?select=id', {
+    method: 'POST',
+    headers: { 'Prefer': 'return=minimal' },
+    body: JSON.stringify({
+      cuenta_id: cuentaId, curso_id: CURSO_ID, id: ALU2_ID,
+      nombres: 'E6ContadorFixture', apellidos: `CNTDR${EXEC_ID}`, estado: 'activo',
+    }),
+  });
+  // Asignar PIN a ALU2 via RPC tesorero_set_pin (requiere token autenticado)
+  const resSetPin2 = await req('/rpc/tesorero_set_pin', {
+    method: 'POST',
+    body: JSON.stringify({ p_cuenta_id: cuentaId, p_alumno_id: ALU2_ID, p_pin: 'CONTADOR99' }),
+  });
+  if (resSetPin2?.ok !== true) throw new Error(`tesorero_set_pin ALU2 falló: ${JSON.stringify(resSetPin2)}`);
 }
 
 async function teardown() {
   console.log('\n🧹 Limpiando fixtures de prueba…');
 
   // ── Limpiar archivos de Storage ANTES de borrar filas de PostgreSQL ────────
-  // La ruta es {cuentaId}/{cursoId}/{movId}/{archivo}.
-  // Listamos con el prefijo {cuentaId}/{cursoId}/ para encontrar todos los
-  // archivos del curso fixture en este run.
+  // Ruta real: {cuentaId}/{cursoId}/{movId}/{archivo}  (4 segmentos)
+  // Listar {cuentaId}/{cursoId}/ devuelve entradas de "carpeta" (id=null) con
+  // name={movId}. Los archivos reales están un nivel más abajo; hay que hacer
+  // un segundo listado por cada carpeta.
   try {
-    // El prefijo correcto para las rutas de 4 segmentos incluye el cuentaId.
-    const storagePrefix = cuentaId + '/' + CURSO_ID + '/';
-    const listUrl = `${SUPA_URL}/storage/v1/object/list/comprobantes`;
-    const listRes = await fetch(listUrl, {
-      method: 'POST',
-      headers: {
-        'apikey': ANON_KEY,
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ prefix: storagePrefix, limit: 200 }),
-    });
-    if (listRes.ok) {
-      const items = await listRes.json();
-      // Filtrar solo objetos reales (id != null); excluir entradas de "carpetas" virtuales
-      const nombres = (items || [])
-        .filter(i => i.id !== null && i.id !== undefined)
-        .map(i => storagePrefix + i.name)
-        .filter(Boolean);
-      if (nombres.length > 0) {
-        const delRes = await fetch(`${SUPA_URL}/storage/v1/object/comprobantes`, {
-          method: 'DELETE',
-          headers: {
-            'apikey': ANON_KEY,
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ prefixes: nombres }),
-        });
-        delRes.ok
-          ? console.log(`  🗑  storage/comprobantes (${nombres.length} archivos)`)
-          : console.warn(`  ⚠  storage DELETE ${delRes.status}: ${await delRes.text().catch(() => '')}`);
-      } else {
-        console.log('  🗑  storage/comprobantes (sin archivos del fixture)');
-      }
+    const paths = await listarArchivosStorageCurso(cuentaId, CURSO_ID);
+    if (paths.length > 0) {
+      await eliminarStorageRutas(paths);
+      console.log(`  🗑  storage/comprobantes (${paths.length} archivos)`);
     } else {
-      console.warn(`  ⚠  storage LIST ${listRes.status} — puede no existir el bucket aún`);
+      console.log('  🗑  storage/comprobantes (sin archivos del fixture)');
     }
   } catch (e) {
     console.warn(`  ⚠  no pudo limpiar storage: ${e.message}`);
@@ -206,6 +193,7 @@ async function teardown() {
   for (const [table, field, id] of [
     ['movimientos', 'curso_id', CURSO_ID],
     ['alumnos',     'id',       ALU_ID],
+    ['alumnos',     'id',       ALU2_ID],
     ['cursos',      'id',       CURSO_ID],
   ]) {
     try {
@@ -265,6 +253,63 @@ async function screenshot(page, nombre) {
     await page.screenshot({ path: p, fullPage: true });
     console.log(`    📸 ${p}`);
   } catch (_) {}
+}
+
+// ── Storage helpers ───────────────────────────────────────────────────────────
+// Devuelve los items (entradas de Supabase Storage) bajo un prefijo dado.
+// Las entradas con id=null son "carpetas virtuales" (un nivel más de directorio).
+async function listarStoragePrefix(prefix) {
+  const res = await fetch(`${SUPA_URL}/storage/v1/object/list/comprobantes`, {
+    method: 'POST',
+    headers: {
+      'apikey': ANON_KEY,
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ prefix, limit: 200 }),
+  });
+  if (!res.ok) return [];
+  return (await res.json()) || [];
+}
+
+// Recorre dos niveles de profundidad bajo {cuentaId}/{cursoId}/ y devuelve
+// las rutas completas de los archivos reales (id !== null).
+// Estructura esperada: {cuentaId}/{cursoId}/{movId}/{archivo}
+async function listarArchivosStorageCurso(cuentaId, cursoId) {
+  const prefix1 = `${cuentaId}/${cursoId}/`;
+  const nivel1 = await listarStoragePrefix(prefix1);
+  const rutas = [];
+  for (const carpeta of nivel1) {
+    if (!carpeta.name) continue;
+    const prefix2 = `${prefix1}${carpeta.name}/`;
+    const nivel2 = await listarStoragePrefix(prefix2);
+    for (const archivo of nivel2) {
+      if (archivo.id !== null && archivo.id !== undefined && archivo.name) {
+        rutas.push(prefix2 + archivo.name);
+      }
+    }
+  }
+  return rutas;
+}
+
+// Elimina un array de rutas del bucket "comprobantes".
+async function eliminarStorageRutas(rutas) {
+  if (!rutas.length) return true;
+  const res = await fetch(`${SUPA_URL}/storage/v1/object/comprobantes`, {
+    method: 'DELETE',
+    headers: {
+      'apikey': ANON_KEY,
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ prefixes: rutas }),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    console.warn(`  ⚠  storage DELETE ${res.status}: ${txt}`);
+    return false;
+  }
+  return true;
 }
 
 // ── Login UI ──────────────────────────────────────────────────────────────────
@@ -771,71 +816,57 @@ async function testApoderado(movIdCreado, comprobanteRef, pinNuevo) {
   }
 
   // ── APO.CONTADOR: Verificar contador unificado (no eludible alternando endpoints)
-  // Demuestra que apoderado_abrir_comprobante y apoderado_acceso comparten el mismo
-  // contador de intentos (apoderado_intentos via _apoderado_verificar_pin).
-  // Después de APO.1 (success) el contador está a 0.
-  // 2 fallos via apoderado_acceso (RPC anon directo) + 2 via apoderado_abrir_comprobante
-  // deben sumar 4 en el contador compartido; el 5.º intento debe devolver bloqueado.
-  console.log('  → E6.APO.CONTADOR: contador unificado (no eludible alternando endpoints)');
+  // Usa ALU2_ID (fixture exclusivo) para no contaminar el estado de bloqueo de ALU_ID.
+  // Regla de _apoderado_verificar_pin: comprueba el bloqueo ANTES de validar el PIN.
+  // → con la cuenta bloqueada, incluso el PIN correcto devuelve 'bloqueado'.
+  //
+  // Secuencia:
+  //   intentos 1-3 (PIN malo) via apoderado_acceso
+  //   intentos 4-5 (PIN malo) via apoderado_abrir_comprobante  → 5 fallos acumulados → bloqueado
+  //   intento  6   (PIN bueno 'CONTADOR99') via apoderado_acceso → debe devolver 'bloqueado'
+  console.log('  → E6.APO.CONTADOR: 5 fallos acumulados alternando endpoints; 6.º con PIN correcto sigue bloqueado');
   try {
     const wrongPin = 'PIN_MALO_CONTADOR_99';
 
-    // 2 fallos via apoderado_acceso
-    for (let i = 0; i < 2; i++) {
+    // 3 fallos via apoderado_acceso
+    for (let i = 0; i < 3; i++) {
       await fetch(`${SUPA_URL}/rest/v1/rpc/apoderado_acceso`, {
         method: 'POST',
         headers: anonHdrs,
-        body: JSON.stringify({ p_cuenta_id: cuentaId, p_alumno_id: ALU_ID, p_pin: wrongPin }),
+        body: JSON.stringify({ p_cuenta_id: cuentaId, p_alumno_id: ALU2_ID, p_pin: wrongPin }),
       });
     }
 
-    // 2 fallos via apoderado_abrir_comprobante (RPC directo para no depender del deploy)
+    // 2 fallos via apoderado_abrir_comprobante (RPC directo; total = 5 → bloqueado)
     for (let i = 0; i < 2; i++) {
       await fetch(RPC_URL, {
         method: 'POST',
         headers: anonHdrs,
         body: JSON.stringify({
-          p_cuenta_id: cuentaId, p_alumno_id: ALU_ID,
+          p_cuenta_id: cuentaId, p_alumno_id: ALU2_ID,
           p_pin: wrongPin, p_mov_id: movIdCreado || 'mov-inexistente',
         }),
       });
     }
 
-    // 5.º intento via apoderado_acceso → debe devolver bloqueado
+    // 6.º intento con el PIN CORRECTO ('CONTADOR99') via apoderado_acceso
+    // → debe devolver 'bloqueado': el bloqueo se evalúa ANTES del PIN
     const resBlocked = await fetch(`${SUPA_URL}/rest/v1/rpc/apoderado_acceso`, {
       method: 'POST',
       headers: anonHdrs,
-      body: JSON.stringify({ p_cuenta_id: cuentaId, p_alumno_id: ALU_ID, p_pin: wrongPin }),
+      body: JSON.stringify({ p_cuenta_id: cuentaId, p_alumno_id: ALU2_ID, p_pin: 'CONTADOR99' }),
     });
     const dataBlocked = await resBlocked.json().catch(() => null);
 
-    // apoderado_acceso retorna {"error": "bloqueado"}; apoderado_abrir_comprobante retorna {"ok":false,"error":"cuenta_bloqueada"}
+    // apoderado_acceso retorna {"error":"bloqueado"};
+    // apoderado_abrir_comprobante retorna {"ok":false,"error":"cuenta_bloqueada"}
     const estaBloqueado = dataBlocked?.error === 'bloqueado' || dataBlocked?.error === 'cuenta_bloqueada';
     estaBloqueado
-      ? ok('E6.APO.CONTADOR: 5.º intento alternando endpoints devuelve bloqueado (contador compartido ✓)')
-      : ko('E6.APO.CONTADOR: 5.º intento no devolvió bloqueado — contador puede ser independiente',
+      ? ok('E6.APO.CONTADOR: 5 fallos acumulados (alternando) + 6.º con PIN correcto = bloqueado ✓')
+      : ko('E6.APO.CONTADOR: 6.º intento con PIN correcto no devolvió bloqueado — protección incompleta',
            JSON.stringify(dataBlocked)?.slice(0, 200));
 
-    // Desbloquear: una llamada con PIN correcto via apoderado_acceso resetea el contador
-    await fetch(`${SUPA_URL}/rest/v1/rpc/apoderado_acceso`, {
-      method: 'POST',
-      headers: anonHdrs,
-      body: JSON.stringify({ p_cuenta_id: cuentaId, p_alumno_id: ALU_ID, p_pin: pinNuevo }),
-    });
-    // Verificar que ya no está bloqueado
-    const resUnlock = await fetch(RPC_URL, {
-      method: 'POST',
-      headers: anonHdrs,
-      body: JSON.stringify({
-        p_cuenta_id: cuentaId, p_alumno_id: ALU_ID,
-        p_pin: pinNuevo, p_mov_id: movIdCreado || 'mov-inexistente',
-      }),
-    });
-    const dataUnlock = await resUnlock.json().catch(() => null);
-    // Debe responder algo distinto a cuenta_bloqueada (p.ej. ok, sin_comprobante, movimiento_no_accesible…)
-    dataUnlock?.error !== 'cuenta_bloqueada' && dataUnlock?.error !== 'bloqueado'
-      ? ok('E6.APO.CONTADOR.reset: contador reiniciado tras PIN correcto (ya no bloqueado)')
-      : ko('E6.APO.CONTADOR.reset: cuenta sigue bloqueada tras PIN correcto', JSON.stringify(dataUnlock)?.slice(0, 200));
+    // No se desbloquea ni se resetea: ALU2_ID tiene su propio contador y se elimina en teardown.
 
   } catch (e) { ko('E6.APO.CONTADOR: error en test de contador unificado', e.message); }
 
@@ -958,6 +989,61 @@ async function testEliminarMovimiento(page, movIdCreado) {
     return;
   }
   try {
+    // ── M6.storage: limpiar archivos de Storage ANTES de borrar en PostgreSQL ──
+    // Obtenemos las rutas actuales del movimiento desde la fila de BBDD (fuente
+    // de verdad) y las eliminamos. Si la UI ya las borró (flujo correcto), la
+    // lista estará vacía y el sub-test lo informa sin fallar.
+    try {
+      const filasMov = await req(
+        `/movimientos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(movIdCreado)}&select=comprobante,archivos`
+      );
+      const fila = filasMov?.[0];
+      const storageRutas = [];
+
+      // comprobante: puede ser storagePath (4 segmentos) o URL/data-URI (ignorar)
+      const compPath = fila?.comprobante;
+      if (compPath &&
+          !compPath.startsWith('https://') &&
+          !compPath.startsWith('http://') &&
+          !compPath.startsWith('data:')) {
+        storageRutas.push(compPath);
+      }
+
+      // archivos: array JSONB con {storagePath, ...}
+      if (Array.isArray(fila?.archivos)) {
+        for (const a of fila.archivos) {
+          if (a?.storagePath && !storageRutas.includes(a.storagePath)) {
+            storageRutas.push(a.storagePath);
+          }
+        }
+      }
+
+      if (storageRutas.length > 0) {
+        await eliminarStorageRutas(storageRutas);
+
+        // Verificar eliminación: listar el directorio padre y confirmar que el
+        // archivo ya no aparece.
+        let quedaAlguno = false;
+        for (const ruta of storageRutas) {
+          const dir = ruta.slice(0, ruta.lastIndexOf('/') + 1);
+          const nombre = ruta.slice(ruta.lastIndexOf('/') + 1);
+          const items = await listarStoragePrefix(dir);
+          if (items.some(i => i.name === nombre && i.id !== null)) {
+            quedaAlguno = true;
+            break;
+          }
+        }
+        !quedaAlguno
+          ? ok('E6.M6.storage: archivos de Storage eliminados y verificados ✓')
+          : ko('E6.M6.storage: uno o más archivos siguen existiendo tras DELETE', storageRutas.join(', '));
+      } else {
+        console.log('    ℹ️  M6: no hay archivos de Storage para limpiar en la fila del movimiento');
+      }
+    } catch (eStor) {
+      ko('E6.M6.storage: error limpiando Storage antes de eliminar movimiento', eStor.message);
+    }
+
+    // ── M6.ui / M6.db: eliminar a través de la UI y verificar en PostgreSQL ───
     // ⚠️  NO hacer `await` en el evaluate que llama delMov:
     //   window.confirm() es SÍNCRONO en la página y pausa la ejecución JS
     //   hasta que Playwright resuelva el diálogo. Si await-amos evaluate aquí,
