@@ -2009,15 +2009,17 @@ function _apV9RenderComprobantes(comps) {
 }
 
 // ── abrirComprobanteApoderado ─────────────────────────────────────────────────
-// Llama a la RPC apoderado_abrir_comprobante con el PIN del apoderado y abre
+// Llama a la Edge Function apoderado-comprobante con el PIN del apoderado y abre
 // la URL firmada resultante en una ventana nueva.
+//
+// La Edge Function (Deno):
+//   1. Llama a apoderado_abrir_comprobante() RPC con service_role.
+//   2. Si ok → genera URL firmada con supabase.storage.createSignedUrl().
+//   3. Devuelve {ok: true, url: "..."}.
 //
 // Popup-safe: window.open('about:blank') se llama SINCRÓNICAMENTE antes de
 // cualquier await; los navegadores bloquean ventanas abiertas fuera del
 // gesto del usuario, pero permiten la asignación a w.location.href después.
-//
-// La petición va como anon (sin Authorization header): los apoderados no
-// tienen sesión Supabase Auth — el PIN es su único factor de autenticación.
 //
 async function abrirComprobanteApoderado(movId) {
   const ses = S.session;
@@ -2029,13 +2031,14 @@ async function abrirComprobanteApoderado(movId) {
   // Abrir ventana ANTES del await — mantenemos el gesto del usuario activo.
   const w = window.open('about:blank', '_blank');
   try {
-    const res = await fetch(SUPA_URL + '/rest/v1/rpc/apoderado_abrir_comprobante', {
+    // La Edge Function usa service_role automáticamente (sin Vault).
+    // URL: {SUPA_URL}/functions/v1/apoderado-comprobante
+    const res = await fetch(SUPA_URL + '/functions/v1/apoderado-comprobante', {
       method: 'POST',
       headers: {
         'apikey': SUPA_KEY,
         'Content-Type': 'application/json',
         'Accept': 'application/json'
-        // SIN Authorization: apoderado usa solo anon key
       },
       body: JSON.stringify({
         p_cuenta_id: ses._v9CuentaId,

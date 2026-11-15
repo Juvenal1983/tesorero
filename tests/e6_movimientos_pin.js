@@ -11,7 +11,7 @@
  *   E6.M5   Generar URL firmada desde storagePath y verificar HTTP 200
  *   E6.PIN1 Configurar PIN desde el modal de alumno (nuevo alumno)
  *   E6.PIN2 retryPin — cambiar PIN desde el botón 🔑 sin recrear el alumno
- *   E6.APO  apoderado_abrir_comprobante — URL firmada vía RPC con PIN
+ *   E6.APO  apoderado_abrir_comprobante — URL firmada vía Edge Function + RPC
  *   E6.M6   Eliminar movimiento (tras el test de apoderado)
  *
  * Orden de ejecución: M1-M5 → PIN1-PIN2 → APO → M6
@@ -653,16 +653,23 @@ async function testPin(page) {
 }
 
 // ── T: Apoderado comprobante ──────────────────────────────────────────────────
-// Verifica la RPC apoderado_abrir_comprobante:
-//   APO.1 PIN correcto + movimiento visible → URL firmada (5 min)
-//   APO.2 PIN incorrecto → error pin_incorrecto
-//   APO.3 Movimiento de otro curso → error movimiento_no_accesible
-//   APO.4 Vault no configurado → error vault_no_configurado (si no está configurado)
+// Arquitectura (v4):
+//   • RPC apoderado_abrir_comprobante (SECURITY DEFINER) valida PIN, alumno/curso
+//     activos, movimiento visible y aislamiento de cuenta. Devuelve storage_path.
+//   • Edge Function apoderado-comprobante llama al RPC con service_role y luego
+//     genera la URL firmada con supabase.storage.createSignedUrl(). No usa Vault.
+//     URL: {SUPA_URL}/functions/v1/apoderado-comprobante
 //
-// NOTA: APO.1 requiere que Vault tenga configurados "supabase_url" y
-// "jwt_secret" (ver sql/E6_storage_comprobantes.sql, instrucciones al inicio).
-// Si Vault no está configurado, APO.1 falla con vault_no_configurado — se reporta
-// como FALLO (el Vault DEBE estar configurado para que E6 esté completo).
+// Tests:
+//   APO.NULL PIN nulo → pin_requerido  (RPC directo — prueba robustez del guard)
+//   APO.EMPTY PIN vacío → pin_requerido (RPC directo)
+//   APO.1  PIN correcto + movimiento visible → URL firmada (Edge Function)
+//   APO.2  PIN incorrecto → pin_incorrecto (RPC directo)
+//   APO.3  Movimiento de otro curso → movimiento_no_accesible (RPC directo)
+//   APO.CURSO Curso inactivo → curso_inactivo (RPC directo)
+//
+// Requisito de despliegue: Edge Function debe estar desplegada en staging:
+//   supabase functions deploy apoderado-comprobante --project-ref rucgmytyxpfowznowxwd
 async function testApoderado(movIdCreado, comprobanteRef, pinNuevo) {
   console.log('\n── E6.APO: Acceso de apoderado a comprobante ──');
 
@@ -671,33 +678,59 @@ async function testApoderado(movIdCreado, comprobanteRef, pinNuevo) {
     return;
   }
 
-  // Verificar que el movimiento es visible=TRUE (requisito para apoderado)
-  let movVisible = false;
+  const RPC_URL  = `${SUPA_URL}/rest/v1/rpc/apoderado_abrir_comprobante`;
+  const EDGE_URL = `${SUPA_URL}/functions/v1/apoderado-comprobante`;
+  const anonHdrs = { 'apikey': ANON_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' };
+
+  // ── Verificar que el movimiento es visible=TRUE ───────────────────────────
   try {
     const rows = await req(
       `/movimientos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(movIdCreado)}&select=visible`
     );
-    movVisible = rows?.[0]?.visible === true;
-    movVisible
+    rows?.[0]?.visible === true
       ? ok('E6.APO.0: movimiento es visible=TRUE (apoderado puede acceder)')
       : ko('E6.APO.0: movimiento no es visible=TRUE — test de apoderado puede fallar');
   } catch (e) {
     ko('E6.APO.0: error verificando visibilidad', e.message);
   }
 
-  // ── APO.1: PIN correcto + movimiento visible → URL firmada ────────────────
-  console.log('  → E6.APO.1: PIN correcto, movimiento visible → URL firmada');
+  // ── APO.NULL: PIN nulo → pin_requerido ────────────────────────────────────
+  console.log('  → E6.APO.NULL: PIN nulo → debe rechazar');
+  try {
+    const res = await fetch(RPC_URL, {
+      method: 'POST',
+      headers: anonHdrs,
+      body: JSON.stringify({ p_cuenta_id: cuentaId, p_alumno_id: ALU_ID, p_pin: null, p_mov_id: movIdCreado }),
+    });
+    const data = await res.json().catch(() => null);
+    data?.ok === false && data?.error === 'pin_requerido'
+      ? ok('E6.APO.NULL: PIN nulo rechazado con pin_requerido')
+      : ko('E6.APO.NULL: PIN nulo no rechazado como esperado', JSON.stringify(data)?.slice(0, 200));
+  } catch (e) { ko('E6.APO.NULL: error en test de PIN nulo', e.message); }
+
+  // ── APO.EMPTY: PIN vacío → pin_requerido ──────────────────────────────────
+  console.log('  → E6.APO.EMPTY: PIN vacío → debe rechazar');
+  try {
+    const res = await fetch(RPC_URL, {
+      method: 'POST',
+      headers: anonHdrs,
+      body: JSON.stringify({ p_cuenta_id: cuentaId, p_alumno_id: ALU_ID, p_pin: '', p_mov_id: movIdCreado }),
+    });
+    const data = await res.json().catch(() => null);
+    data?.ok === false && data?.error === 'pin_requerido'
+      ? ok('E6.APO.EMPTY: PIN vacío rechazado con pin_requerido')
+      : ko('E6.APO.EMPTY: PIN vacío no rechazado como esperado', JSON.stringify(data)?.slice(0, 200));
+  } catch (e) { ko('E6.APO.EMPTY: error en test de PIN vacío', e.message); }
+
+  // ── APO.1: PIN correcto + movimiento visible → URL firmada (Edge Function) ─
+  console.log('  → E6.APO.1: PIN correcto, movimiento visible → URL firmada (Edge Function)');
   if (!comprobanteRef) {
     ko('E6.APO.1: sin storagePath disponible — el movimiento no tiene comprobante');
   } else {
     try {
-      const res = await fetch(`${SUPA_URL}/rest/v1/rpc/apoderado_abrir_comprobante`, {
+      const res = await fetch(EDGE_URL, {
         method: 'POST',
-        headers: {
-          'apikey': ANON_KEY,  // anon (apoderado no tiene sesión Auth)
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
+        headers: anonHdrs,
         body: JSON.stringify({
           p_cuenta_id: cuentaId,
           p_alumno_id: ALU_ID,
@@ -711,7 +744,7 @@ async function testApoderado(movIdCreado, comprobanteRef, pinNuevo) {
         const urlFirmada = data.url;
         const esUrlValida = urlFirmada.startsWith('https://') && urlFirmada.includes('/storage/');
         esUrlValida
-          ? ok(`E6.APO.1a: URL firmada recibida (${urlFirmada.slice(0, 70)}…)`)
+          ? ok(`E6.APO.1a: URL firmada recibida vía Edge Function (${urlFirmada.slice(0, 70)}…)`)
           : ko('E6.APO.1a: respuesta ok pero URL no parece válida', urlFirmada.slice(0, 120));
 
         // Verificar que la URL firmada es accesible (HEAD sin Authorization)
@@ -723,45 +756,38 @@ async function testApoderado(movIdCreado, comprobanteRef, pinNuevo) {
                  urlFirmada.slice(0, 100));
         } catch (e) { ko('E6.APO.1b: error al verificar URL firmada', e.message); }
 
-      } else if (data?.error === 'vault_no_configurado') {
-        // Vault no configurado = E6 incompleto; debe ser un fallo, no un pase.
-        ko('E6.APO.1: Vault no configurado — ejecutar instrucciones en sql/E6_storage_comprobantes.sql');
-        console.warn('      Crear secrets "supabase_url" y "jwt_secret" en Supabase Vault antes de ejecutar el test.');
+      } else if (!res.ok && res.status >= 500) {
+        ko('E6.APO.1: Edge Function no desplegada o error interno',
+           `HTTP ${res.status}: ${JSON.stringify(data)?.slice(0, 200)}\n` +
+           `      Desplegar con: supabase functions deploy apoderado-comprobante --project-ref rucgmytyxpfowznowxwd`);
       } else if (data?.error === 'sin_comprobante') {
-        ko('E6.APO.1: RPC respondió sin_comprobante — el archivo puede no haberse subido', JSON.stringify(data));
+        ko('E6.APO.1: Edge Function respondió sin_comprobante — el archivo puede no haberse subido', JSON.stringify(data));
       } else {
-        ko('E6.APO.1: RPC no devolvió URL firmada', `HTTP ${res.status}: ${JSON.stringify(data)?.slice(0, 200)}`);
+        ko('E6.APO.1: Edge Function no devolvió URL firmada', `HTTP ${res.status}: ${JSON.stringify(data)?.slice(0, 200)}`);
       }
-    } catch (e) { ko('E6.APO.1: error al llamar RPC', e.message); }
+    } catch (e) { ko('E6.APO.1: error al llamar Edge Function', e.message); }
   }
 
   // ── APO.2: PIN incorrecto → error pin_incorrecto ──────────────────────────
   console.log('  → E6.APO.2: PIN incorrecto → debe rechazar');
   try {
-    const res = await fetch(`${SUPA_URL}/rest/v1/rpc/apoderado_abrir_comprobante`, {
+    const res = await fetch(RPC_URL, {
       method: 'POST',
-      headers: { 'apikey': ANON_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      headers: anonHdrs,
       body: JSON.stringify({
-        p_cuenta_id: cuentaId,
-        p_alumno_id: ALU_ID,
-        p_pin:       'PIN_INCORRECTO_XYZ',
-        p_mov_id:    movIdCreado,
+        p_cuenta_id: cuentaId, p_alumno_id: ALU_ID,
+        p_pin: 'PIN_INCORRECTO_XYZ', p_mov_id: movIdCreado,
       }),
     });
     const data = await res.json().catch(() => null);
-    // La RPC devuelve JSONB { ok: false, error: 'pin_incorrecto' }
-    // HTTP status puede ser 200 (es JSONB, no excepción PostgreSQL)
     data?.ok === false && data?.error === 'pin_incorrecto'
       ? ok('E6.APO.2: PIN incorrecto rechazado correctamente')
       : ko('E6.APO.2: PIN incorrecto no fue rechazado como esperado', JSON.stringify(data)?.slice(0, 200));
   } catch (e) { ko('E6.APO.2: error en test de PIN incorrecto', e.message); }
 
   // ── APO.3: Movimiento de otro curso → error movimiento_no_accesible ────────
-  // Creamos un movimiento en un curso diferente y verificamos que el apoderado
-  // no puede acceder a él (aislamiento entre cursos).
   console.log('  → E6.APO.3: Movimiento de otro curso → debe rechazar');
   try {
-    // Crear curso temporal para el test de aislamiento
     const cursoOtroId = `crs-apo-aislamiento-${EXEC_ID}`;
     await req('/cursos?select=id', {
       method: 'POST',
@@ -771,7 +797,6 @@ async function testApoderado(movIdCreado, comprobanteRef, pinNuevo) {
         nombre: `[test-e6 aislamiento] ${EXEC_ID}`, anio: new Date().getFullYear(), activo: true,
       }),
     });
-    // Crear movimiento en ese otro curso
     const movRows = await req('/movimientos?select=id', {
       method: 'POST',
       headers: { 'Prefer': 'return=representation' },
@@ -785,14 +810,12 @@ async function testApoderado(movIdCreado, comprobanteRef, pinNuevo) {
     const movOtroId = movRows?.[0]?.id;
 
     if (movOtroId) {
-      const res = await fetch(`${SUPA_URL}/rest/v1/rpc/apoderado_abrir_comprobante`, {
+      const res = await fetch(RPC_URL, {
         method: 'POST',
-        headers: { 'apikey': ANON_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        headers: anonHdrs,
         body: JSON.stringify({
-          p_cuenta_id: cuentaId,
-          p_alumno_id: ALU_ID,
-          p_pin:       pinNuevo,
-          p_mov_id:    movOtroId,  // ← movimiento de OTRO curso
+          p_cuenta_id: cuentaId, p_alumno_id: ALU_ID,
+          p_pin: pinNuevo, p_mov_id: movOtroId,  // ← movimiento de OTRO curso
         }),
       });
       const data = await res.json().catch(() => null);
@@ -800,7 +823,6 @@ async function testApoderado(movIdCreado, comprobanteRef, pinNuevo) {
         ? ok('E6.APO.3: movimiento de otro curso rechazado (aislamiento correcto)')
         : ko('E6.APO.3: movimiento de otro curso no fue rechazado', JSON.stringify(data)?.slice(0, 200));
 
-      // Limpiar el movimiento y curso temporal
       try {
         await req(`/movimientos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(movOtroId)}`,
           { method: 'DELETE' });
@@ -811,6 +833,48 @@ async function testApoderado(movIdCreado, comprobanteRef, pinNuevo) {
       ko('E6.APO.3: no se pudo crear movimiento de otro curso para el test', JSON.stringify(movRows));
     }
   } catch (e) { ko('E6.APO.3: error en test de aislamiento de cursos', e.message); }
+
+  // ── APO.CURSO: Curso inactivo → error curso_inactivo ─────────────────────
+  // Marca temporalmente el curso fixture como activo=false, verifica el rechazo,
+  // y lo restaura a activo=true.
+  console.log('  → E6.APO.CURSO: Curso inactivo → debe rechazar');
+  try {
+    // Marcar como inactivo
+    await req(`/cursos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(CURSO_ID)}`, {
+      method: 'PATCH',
+      headers: { 'Prefer': 'return=minimal' },
+      body: JSON.stringify({ activo: false }),
+    });
+
+    const res = await fetch(RPC_URL, {
+      method: 'POST',
+      headers: anonHdrs,
+      body: JSON.stringify({
+        p_cuenta_id: cuentaId, p_alumno_id: ALU_ID,
+        p_pin: pinNuevo, p_mov_id: movIdCreado,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    data?.ok === false && data?.error === 'curso_inactivo'
+      ? ok('E6.APO.CURSO: curso inactivo rechazado correctamente')
+      : ko('E6.APO.CURSO: curso inactivo no fue rechazado como esperado', JSON.stringify(data)?.slice(0, 200));
+
+    // Restaurar a activo=true (siempre, independiente del resultado)
+    await req(`/cursos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(CURSO_ID)}`, {
+      method: 'PATCH',
+      headers: { 'Prefer': 'return=minimal' },
+      body: JSON.stringify({ activo: true }),
+    }).catch(e => console.warn('  ⚠ no se pudo restaurar curso a activo=true:', e.message));
+
+  } catch (e) {
+    ko('E6.APO.CURSO: error en test de curso inactivo', e.message);
+    // Intentar restaurar el curso aunque haya habido un error
+    req(`/cursos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(CURSO_ID)}`, {
+      method: 'PATCH',
+      headers: { 'Prefer': 'return=minimal' },
+      body: JSON.stringify({ activo: true }),
+    }).catch(() => {});
+  }
 }
 
 // ── T: M6 Eliminar movimiento ─────────────────────────────────────────────────
