@@ -207,14 +207,27 @@ function toggleFondoEspecial(activo){
   const ci=(DB.cursos||[]).findIndex(c=>c.id===S.cursoId);
   if(ci<0) return;
   if(!DB.cursos[ci].fondoEspecial) DB.cursos[ci].fondoEspecial={nombre:'Fondo Especial'};
+  const cfgActual = DB.cursos[ci].fondoEspecial;
+
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    if(!S._v9CuentaId){ alert('⚠️ Sesión relacional no inicializada.'); return; }
+    actualizarFondoEspecialV9(S._v9CuentaId, S.cursoId, { activo, nombre: cfgActual.nombre || 'Fondo Especial' }, _authToken)
+      .then(cfg => {
+        DB.cursos[ci].fondoEspecial = cfg;
+        if(!activo && (S.route==='actividades'||S.route==='fondo-especial')){ go('dashboard'); return; }
+        renderNavOnly();
+        renderPage();
+      })
+      .catch(e => { console.error('[pref] toggleFondoEspecial V9:', e); alert('⚠️ Error al guardar configuración: '+e.message); });
+    return;
+  }
+
   DB.cursos[ci].fondoEspecial.activo = activo;
   saveDB();
-  // Redirect if on actividades/fondo-especial and now disabled
   if(!activo && (S.route==='actividades'||S.route==='fondo-especial')){
     go('dashboard');
     return;
   }
-  // Actualizar menú + contenido sin mover el scroll
   renderNavOnly();
   renderPage();
 }
@@ -263,6 +276,19 @@ function guardarNombreFondo(){
   const ci=(DB.cursos||[]).findIndex(c=>c.id===S.cursoId);
   if(ci<0) return;
   if(!DB.cursos[ci].fondoEspecial) DB.cursos[ci].fondoEspecial={activo:true};
+  const cfgActual = DB.cursos[ci].fondoEspecial;
+
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    if(!S._v9CuentaId){ alert('⚠️ Sesión relacional no inicializada.'); return; }
+    actualizarFondoEspecialV9(S._v9CuentaId, S.cursoId, { activo: cfgActual.activo !== false, nombre }, _authToken)
+      .then(cfg => {
+        DB.cursos[ci].fondoEspecial = cfg;
+        go('config');
+      })
+      .catch(e => { console.error('[pref] guardarNombreFondo V9:', e); alert('⚠️ Error al guardar nombre: '+e.message); });
+    return;
+  }
+
   DB.cursos[ci].fondoEspecial.nombre = nombre;
   saveDB();
   go('config');

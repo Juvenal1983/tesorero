@@ -1514,3 +1514,41 @@ async function eliminarActividadV9(cuentaId, actividadId, accessToken) {
     throw new Error(`[datos_v9] eliminarActividadV9: actividad ${actividadId} no encontrada o sin permiso.`);
   return rows;
 }
+
+// ─── Config fondo especial (E7) ───────────────────────────────────────────────
+
+/**
+ * Persiste la config del fondo especial (activo + nombre) en la columna
+ * fondo_especial JSONB de la tabla cursos.
+ *
+ * La política cursos_update solo permite UPDATE al dueño (es_dueno).
+ * Un visor o editor NO puede activar/desactivar el fondo.
+ *
+ * @param {string} cuentaId
+ * @param {string} cursoId
+ * @param {{ activo: boolean, nombre?: string }} cfg
+ * @param {string} accessToken
+ */
+async function actualizarFondoEspecialV9(cuentaId, cursoId, cfg, accessToken) {
+  // Leer config actual para hacer merge (no sobrescribir campos no enviados)
+  const existing = await _v9Fetch(
+    `/cursos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(cursoId)}&select=fondo_especial`,
+    { method: 'GET' },
+    accessToken
+  );
+  const current = (Array.isArray(existing) && existing[0]?.fondo_especial) || {};
+  const merged  = { ...current, ...cfg };
+
+  const rows = await _v9Fetch(
+    `/cursos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(cursoId)}&select=id,fondo_especial`,
+    {
+      method: 'PATCH',
+      headers: { 'Prefer': 'return=representation' },
+      body: JSON.stringify({ fondo_especial: merged }),
+    },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error(`[datos_v9] actualizarFondoEspecialV9: curso ${cursoId} no encontrado o sin permiso (solo el dueño puede actualizar).`);
+  return rows[0].fondo_especial || merged;
+}

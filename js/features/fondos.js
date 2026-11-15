@@ -176,12 +176,21 @@ function guardarEditMovFondo(id){
     const monto  = parseInt(document.getElementById('emov-monto').value)||0;
     if(!nombre) return alert('Ingresa una descripción.');
     if(!monto)  return alert('Ingresa el monto.');
-    // Recalcular montoIndividual proporcional si cambia el monto
+    // Recalcular montoIndividual proporcional si cambia el monto.
+    // Distribución exacta: el último alumno absorbe el residuo para que
+    // sum(montoIndividual) === monto.
     let newMontoInd = m.montoIndividual || null;
     if(monto !== m.montoTotal && m.montoIndividual){
-      const factor = monto / m.montoTotal;
+      const keys = Object.keys(m.montoIndividual);
       newMontoInd = {};
-      Object.keys(m.montoIndividual).forEach(k=>{ newMontoInd[k] = Math.round(m.montoIndividual[k]*factor); });
+      let asignado = 0;
+      keys.forEach((k, i) => {
+        const v = (i === keys.length - 1)
+          ? monto - asignado
+          : Math.floor(m.montoIndividual[k] * monto / m.montoTotal);
+        newMontoInd[k] = v;
+        asignado += v;
+      });
     }
     actualizarFondoMovimientoV9(S._v9CuentaId, id, { nombre, fecha, montoTotal: monto, montoIndividual: newMontoInd }, _authToken)
       .then(row => {
@@ -200,9 +209,16 @@ function guardarEditMovFondo(id){
   if(!nombre) return alert('Ingresa una descripción.');
   if(!monto)  return alert('Ingresa el monto.');
   if(monto !== m.montoTotal && m.montoIndividual){
-    const factor = monto / m.montoTotal;
+    const keys = Object.keys(m.montoIndividual);
     const newInd = {};
-    Object.keys(m.montoIndividual).forEach(k=>{ newInd[k] = Math.round(m.montoIndividual[k]*factor); });
+    let asignado = 0;
+    keys.forEach((k, i) => {
+      const v = (i === keys.length - 1)
+        ? monto - asignado
+        : Math.floor(m.montoIndividual[k] * monto / m.montoTotal);
+      newInd[k] = v;
+      asignado += v;
+    });
     m.montoIndividual = newInd;
   }
   m.nombre = nombre;
@@ -346,9 +362,16 @@ function saveMovFondo(){
       const monto = parseInt(document.getElementById('fmov-monto').value)||0;
       if(!monto) return alert('Ingresa el monto total a dividir.');
       const alumnos = getAlumnos();
-      const montoCada = Math.round(monto / alumnos.length);
+      // Distribución exacta: el último alumno absorbe el residuo para que
+      // sum(montoIndividual) === montoTotal (Math.round puede sumar de más o menos).
       const montoInd = {};
-      alumnos.forEach(a=>montoInd[a.id]=montoCada);
+      const base = Math.floor(monto / alumnos.length);
+      let asignado = 0;
+      alumnos.forEach((a, i) => {
+        const v = (i === alumnos.length - 1) ? monto - asignado : base;
+        montoInd[a.id] = v;
+        asignado += v;
+      });
       data = {...data, montoTotal:monto, montoIndividual:montoInd};
     } else {
       const inputs = document.querySelectorAll('.fmov-ind-input');
