@@ -660,9 +660,9 @@ async function testPin(page) {
 //   APO.4 Vault no configurado → error vault_no_configurado (si no está configurado)
 //
 // NOTA: APO.1 requiere que Vault tenga configurados "supabase_url" y
-// "service_role_key" (ver sql/E6_storage_comprobantes.sql, instrucciones al inicio).
+// "jwt_secret" (ver sql/E6_storage_comprobantes.sql, instrucciones al inicio).
 // Si Vault no está configurado, APO.1 falla con vault_no_configurado — se reporta
-// como advertencia, no como error bloqueante, para permitir continuar el test.
+// como FALLO (el Vault DEBE estar configurado para que E6 esté completo).
 async function testApoderado(movIdCreado, comprobanteRef, pinNuevo) {
   console.log('\n── E6.APO: Acceso de apoderado a comprobante ──');
 
@@ -724,11 +724,9 @@ async function testApoderado(movIdCreado, comprobanteRef, pinNuevo) {
         } catch (e) { ko('E6.APO.1b: error al verificar URL firmada', e.message); }
 
       } else if (data?.error === 'vault_no_configurado') {
-        // Vault no está configurado en staging — es un error de setup, no de código
-        console.warn('  ⚠️  E6.APO.1: Vault no configurado — ejecutar instrucciones en sql/E6_storage_comprobantes.sql');
-        console.warn('      (Este fallo NO indica un bug de código; requiere setup manual del Vault)');
-        // No contabilizar como fallo bloqueante
-        pass++; console.log('  ✅ E6.APO.1: Vault sin configurar (setup pendiente, no es bug de código)');
+        // Vault no configurado = E6 incompleto; debe ser un fallo, no un pase.
+        ko('E6.APO.1: Vault no configurado — ejecutar instrucciones en sql/E6_storage_comprobantes.sql');
+        console.warn('      Crear secrets "supabase_url" y "jwt_secret" en Supabase Vault antes de ejecutar el test.');
       } else if (data?.error === 'sin_comprobante') {
         ko('E6.APO.1: RPC respondió sin_comprobante — el archivo puede no haberse subido', JSON.stringify(data));
       } else {

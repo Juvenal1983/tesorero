@@ -220,10 +220,38 @@ function renderGaleriaModal(){
 function previewComprobanteModal(input){ agregarArchivoModal(input); } // compat
 function clearComprobanteModal(){ window._acArchivos=[]; renderGaleriaModal(); }
 
-function saveComprobante(movId){
+async function saveComprobante(movId){
   const i=(DB.movimientos||[]).findIndex(m=>m.id===movId); if(i<0) return;
-  DB.movimientos[i].archivos=[...window._acArchivos];
-  // Limpiar campos de formato antiguo si existen
+  const nuevosArchivos=[...(window._acArchivos||[])];
+
+  // ── V9_RELACIONAL: subir y persistir en PostgreSQL ────────────────────────
+  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
+    const btn=document.querySelector('[onclick*="saveComprobante"]');
+    if(btn){btn.disabled=true;btn.textContent='Guardando…';}
+    try{
+      const urls=await subirArchivosStorage(nuevosArchivos, movId);
+      const primerArchivo=urls.find(u=>u.storagePath||u.url)||{};
+      const primerRef=primerArchivo.storagePath||primerArchivo.url||null;
+      const patchData={archivos:urls};
+      if(primerRef) patchData.comprobante=primerRef;
+      else          patchData.comprobante=null;
+      await actualizarMovimientoV9(S._v9CuentaId, movId, patchData, _authToken);
+      // Actualizar caché local solo tras confirmación del servidor
+      DB.movimientos[i].archivos=urls;
+      if(primerRef) DB.movimientos[i].comprobante=primerRef;
+      else{ delete DB.movimientos[i].comprobante; delete DB.movimientos[i].comprobanteNombre; delete DB.movimientos[i].comprobanteTipo; }
+      window._acArchivos=[];
+      showToast('✅ Comprobantes guardados');
+      closeModal(); go('movimientos');
+    }catch(e){
+      showToast('❌ Error al guardar: '+(e.message||e));
+      if(btn){btn.disabled=false;btn.textContent='Guardar cambios';}
+    }
+    return;
+  }
+
+  // ── Legado: memoria + localStorage ───────────────────────────────────────
+  DB.movimientos[i].archivos=nuevosArchivos;
   delete DB.movimientos[i].comprobante;
   delete DB.movimientos[i].comprobanteNombre;
   delete DB.movimientos[i].comprobanteTipo;
@@ -231,9 +259,25 @@ function saveComprobante(movId){
   saveDB(); closeModal(); go('movimientos');
 }
 
-function quitarComprobante(movId){
+async function quitarComprobante(movId){
   if(!confirm('¿Eliminar todos los comprobantes de este gasto?')) return;
   const i=(DB.movimientos||[]).findIndex(m=>m.id===movId); if(i<0) return;
+
+  // ── V9_RELACIONAL: persistir eliminación en PostgreSQL ────────────────────
+  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL){
+    try{
+      await actualizarMovimientoV9(S._v9CuentaId, movId, {archivos:[], comprobante:null}, _authToken);
+      DB.movimientos[i].archivos=[];
+      delete DB.movimientos[i].comprobante;
+      delete DB.movimientos[i].comprobanteNombre;
+      delete DB.movimientos[i].comprobanteTipo;
+      showToast('✅ Comprobantes eliminados');
+      closeModal(); go('movimientos');
+    }catch(e){ showToast('❌ Error al eliminar: '+(e.message||e)); }
+    return;
+  }
+
+  // ── Legado ────────────────────────────────────────────────────────────────
   DB.movimientos[i].archivos=[];
   delete DB.movimientos[i].comprobante;
   delete DB.movimientos[i].comprobanteNombre;

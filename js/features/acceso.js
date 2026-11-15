@@ -1990,8 +1990,9 @@ function _apV9RenderComprobantes(comps) {
   const rows = comps.slice(0, 8).map(m => {
     const fecha = (m.fecha||'').substring(0,10);
     const esGasto = ['gasto','egreso'].includes(m.tipo);
-    const urlBtn = m.comprobante_url
-      ? `<a href="${escHtml(m.comprobante_url)}" target="_blank" rel="noopener" style="font-size:11px;color:var(--gm);text-decoration:none">📎 Ver</a>`
+    const tieneComprobante = m.comprobante_url || m.comprobante;
+    const urlBtn = tieneComprobante
+      ? `<button onclick="abrirComprobanteApoderado('${escHtml(m.id)}')" style="font-size:11px;color:var(--gm);background:none;border:none;cursor:pointer;padding:0;text-decoration:underline">📎 Ver</button>`
       : '';
     return `<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--brd)">
       <div style="flex:1;min-width:0">
@@ -2005,6 +2006,67 @@ function _apV9RenderComprobantes(comps) {
     </div>`;
   }).join('');
   el.innerHTML = title + rows;
+}
+
+// ── abrirComprobanteApoderado ─────────────────────────────────────────────────
+// Llama a la RPC apoderado_abrir_comprobante con el PIN del apoderado y abre
+// la URL firmada resultante en una ventana nueva.
+//
+// Popup-safe: window.open('about:blank') se llama SINCRÓNICAMENTE antes de
+// cualquier await; los navegadores bloquean ventanas abiertas fuera del
+// gesto del usuario, pero permiten la asignación a w.location.href después.
+//
+// La petición va como anon (sin Authorization header): los apoderados no
+// tienen sesión Supabase Auth — el PIN es su único factor de autenticación.
+//
+async function abrirComprobanteApoderado(movId) {
+  const ses = S.session;
+  const pin = typeof window._v9PinEnMemoria === 'function' ? window._v9PinEnMemoria() : null;
+  if (!ses || !pin) {
+    alert('Sesión expirada. Vuelve a ingresar tu PIN.');
+    return;
+  }
+  // Abrir ventana ANTES del await — mantenemos el gesto del usuario activo.
+  const w = window.open('about:blank', '_blank');
+  try {
+    const res = await fetch(SUPA_URL + '/rest/v1/rpc/apoderado_abrir_comprobante', {
+      method: 'POST',
+      headers: {
+        'apikey': SUPA_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+        // SIN Authorization: apoderado usa solo anon key
+      },
+      body: JSON.stringify({
+        p_cuenta_id: ses._v9CuentaId,
+        p_alumno_id: ses.alumnoId,
+        p_pin:       pin,
+        p_mov_id:    movId
+      })
+    });
+    const data = await res.json().catch(() => null);
+    if (data && data.ok && data.url) {
+      if (w) w.location.href = data.url;
+    } else {
+      const msg = data && data.error === 'cuenta_bloqueada'
+        ? '🔒 Cuenta bloqueada por demasiados intentos fallidos. ' + (data.detalle || '')
+        : data && data.error === 'pin_incorrecto'
+          ? '❌ PIN incorrecto. Verifica e inténtalo de nuevo.'
+          : '⚠️ No se pudo obtener el comprobante: ' + escHtml((data && data.error) || 'Error desconocido');
+      if (w) {
+        w.document.write(
+          '<html><body style="font-family:sans-serif;padding:40px;text-align:center">' +
+          '<h3>' + msg + '</h3>' +
+          '<p><small>Recarga la página e inténtalo de nuevo.</small></p>' +
+          '</body></html>'
+        );
+        w.document.close();
+      }
+    }
+  } catch (e) {
+    console.warn('[apoderado] Error al abrir comprobante:', e);
+    if (w) w.close();
+  }
 }
 
 function _apV9RenderContactos(apods) {
