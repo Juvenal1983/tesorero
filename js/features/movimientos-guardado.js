@@ -42,23 +42,28 @@ async function saveMov(){
               showToast('⚠️ No se pudo subir el comprobante — queda pendiente. Usa "↑ Subir pendientes" para reintentar.');
               return;
             }
-            const todosConUrl = urls.every(u => u.url);
-            const primerUrl   = (urls.find(u => u.url) || {}).url || null;
+            // ── Corrección #3/#5: persistir storagePath, no URL firmada ─────
+            // subirArchivosStorage devuelve { storagePath, nombre, tipo } por
+            // cada archivo nuevo. La URL firmada se genera on-demand al abrir.
+            // Para compatibilidad con datos legados, aceptar también 'url'.
+            const todosPersistidos = urls.every(u => u.storagePath || u.url);
+            const primerArchivo    = urls.find(u => u.storagePath || u.url) || {};
+            // Priorizar storagePath; caer a url si es un archivo legado
+            const primerRef = primerArchivo.storagePath || primerArchivo.url || null;
 
-            // Persistir URLs en PostgreSQL ANTES de anunciar éxito
-            // Nunca guardar base64 como solución permanente
+            // Persistir en PostgreSQL: campo archivos (JSONB) + comprobante (storagePath)
             const patchData = { archivos: urls };
-            if (primerUrl) patchData.comprobante = primerUrl;
+            if (primerRef) patchData.comprobante = primerRef;
             await actualizarMovimientoV9(S._v9CuentaId, dbRow.id, patchData, _authToken);
 
             // Actualizar caché local solo tras confirmación del servidor
             const idx = (DB.movimientos||[]).findIndex(m => m.id === dbRow.id);
             if (idx >= 0) {
               DB.movimientos[idx].archivos   = urls;
-              if (primerUrl) DB.movimientos[idx].comprobante = primerUrl;
-              if (todosConUrl) delete DB.movimientos[idx]._pendienteStorage;
+              if (primerRef) DB.movimientos[idx].comprobante = primerRef;
+              if (todosPersistidos) delete DB.movimientos[idx]._pendienteStorage;
             }
-            showToast(todosConUrl ? '✅ Comprobante guardado correctamente' : '⚠️ Comprobante guardado parcialmente');
+            showToast(todosPersistidos ? '✅ Comprobante guardado correctamente' : '⚠️ Comprobante guardado parcialmente');
             go('movimientos');
           } catch(e) {
             console.warn('[saveMov v9] Error subiendo/persistiendo comprobante:', e);

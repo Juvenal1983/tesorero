@@ -1,37 +1,44 @@
-// js/features/archivos-storage.js — extraído de la copia de demostración.
+// js/features/archivos-storage.js
 //
 // ── Notas de acceso (bucket privado) ─────────────────────────────────────────
-// El bucket "comprobantes" es PRIVADO. Los archivos no tienen URL pública.
-// El acceso se realiza mediante URLs firmadas (signed URLs) con un token en
-// el query string. La función generarUrlFirmadaStorage() las genera usando
-// el JWT del tesorero autenticado; no requiere cabecera Authorization al
-// abrirlas (el token va en ?token=…).
+// El bucket "comprobantes" es PRIVADO. Los archivos NO tienen URL pública.
+//
+// Lo que se persiste en PostgreSQL es la RUTA DEL ARCHIVO (storagePath), NO
+// una URL firmada. Las URLs firmadas se generan de CORTA DURACIÓN al momento
+// de abrir el comprobante, verificando autorización en ese instante.
+//
+// Esto garantiza que si un movimiento se oculta (visible=FALSE), las URLs
+// anteriores expiran y no se pueden renovar para no-propietarios.
 //
 // Ruta de 4 segmentos: {cuentaId}/{cursoId}/{movId}/{uid}.{ext}
 //   - cuentaId (UUID)  → primer segmento, aísla cuentas con IDs legacy iguales
 //   - cursoId  (TEXT)  → segundo segmento, validado en Storage RLS
-//   - movId    (TEXT)  → tercer segmento, validado en _tiene_acceso_a_mov_storage
+//   - movId    (TEXT)  → tercer segmento, validado con cuenta+curso en la misma fila
 //   - {uid}.{ext}      → nombre único del archivo
 //
 // Formato devuelto por subirArchivoStorage():
-//   { storagePath, url, nombre, tipo }
-//     storagePath → ruta dentro del bucket (sin esquema ni host)
-//     url         → URL firmada lista para window.open() y para almacenar en PG
+//   { storagePath, nombre, tipo }
+//     storagePath → ruta dentro del bucket (lo que se persiste en PostgreSQL)
 //     nombre      → nombre original del archivo
 //     tipo        → MIME type
+//   (NO incluye 'url' — la URL firmada se genera on-demand en verComprobante)
 //
-// El campo "comprobante" de movimientos almacena la URL firmada.
-// El campo "archivos" (JSONB) almacena objetos { storagePath, url, nombre, tipo }.
-// Cuando la URL firmada expire, la app puede regenerarla llamando a
-// generarUrlFirmadaStorage(storagePath) con la sesión activa del tesorero.
+// El campo "comprobante" de movimientos almacena el storagePath.
+// El campo "archivos" (JSONB) almacena objetos { storagePath, nombre, tipo }.
+//
+// Para compatibilidad con datos legados:
+//   - Si comprobante empieza con 'https://': es una URL firmada antigua (posiblemente expirada).
+//   - Si comprobante empieza con 'data:': es base64 antiguo.
+//   - En cualquier otro caso: es un storagePath (nuevo formato).
 // =============================================================================
 
 // ── Generar URL firmada ───────────────────────────────────────────────────────
 // Llama al endpoint /storage/v1/object/sign/comprobantes/{storagePath}.
-// expiresIn: tiempo en segundos (por defecto 365 días = 31 536 000 s).
+// expiresIn: tiempo en segundos. Por defecto 3 600 s = 1 hora.
+// Se llama al momento de ABRIR el archivo, no al subirlo.
 // Devuelve la URL firmada completa o null si falla.
 async function generarUrlFirmadaStorage(storagePath, expiresIn) {
-  expiresIn = expiresIn || 31536000; // 1 año por defecto
+  expiresIn = expiresIn || 3600; // 1 hora por defecto (no 1 año)
   const token = _authToken || SUPA_KEY;
   try {
     const res = await fetch(
@@ -69,9 +76,9 @@ async function generarUrlFirmadaStorage(storagePath, expiresIn) {
 }
 
 // ── Subir un archivo a Storage ────────────────────────────────────────────────
-// Devuelve { storagePath, url, nombre, tipo } o null si falla.
-// storagePath → ruta dentro del bucket (para regenerar URLs firmadas).
-// url         → URL firmada lista para almacenar en PG y abrir con window.open.
+// Devuelve { storagePath, nombre, tipo } o null si falla.
+// NO devuelve 'url' — la URL firmada se genera on-demand al abrir el archivo.
+// storagePath es lo que se persiste en PostgreSQL.
 async function subirArchivoStorage(archivo, movId){
   try{
     if(!archivo.data) return null;
@@ -126,18 +133,9 @@ async function subirArchivoStorage(archivo, movId){
       return null;
     }
 
-    // ── Generar URL firmada (bucket privado) ──────────────────────────────────
-    // No usar URL pública — el bucket es privado. La URL firmada incluye un
-    // token en el query string que autoriza el acceso sin cabecera Authorization.
-    const signedUrl = await generarUrlFirmadaStorage(storagePath);
-    if (!signedUrl) {
-      console.warn('[Storage] Archivo subido pero no se pudo generar URL firmada para:', storagePath);
-      if(typeof showToast==='function') showToast('⚠️ Comprobante subido sin URL de acceso — intenta recargar');
-      return null;
-    }
-
     if(typeof showToast==='function') showToast('✅ Comprobante subido correctamente');
-    return { storagePath, url: signedUrl, nombre: archivo.nombre || 'comprobante', tipo };
+    // Devolver solo storagePath (sin url — se genera on-demand al abrir)
+    return { storagePath, nombre: archivo.nombre || 'comprobante', tipo };
   }catch(e){
     console.warn('[Storage] Error subiendo a Storage:', e);
     if(typeof showToast==='function') showToast('⚠️ Error al subir: '+e.message);
@@ -145,8 +143,9 @@ async function subirArchivoStorage(archivo, movId){
   }
 }
 
-// Migración automática de comprobantes base64 a Supabase Storage
-// Se ejecuta silenciosamente al cargar la app
+// ── Migrar comprobantes base64 a Supabase Storage ─────────────────────────────
+// Se ejecuta silenciosamente al cargar la app en modo V9 cuando hay archivos
+// con 'data' (base64) sin 'storagePath'.
 async function migrarComprobantesAStorage(){
   if(!S.session || !S.cursoId) return;
   const movs = DB.movimientos || [];
@@ -156,42 +155,67 @@ async function migrarComprobantesAStorage(){
     let cambio = false;
     const nuevosArchivos = [];
     for(const arch of m.archivos){
-      if(arch.url){ nuevosArchivos.push(arch); continue; }
+      // Mantener archivos que ya tienen storagePath o url (ya migrados)
+      if(arch.storagePath || arch.url){ nuevosArchivos.push(arch); continue; }
       if(arch.data){
-        const url = await subirArchivoStorage(arch, m.id);
-        if(url){
-          nuevosArchivos.push({url, nombre:arch.nombre||'comprobante', tipo:arch.tipo||'image/jpeg'});
+        // subirArchivoStorage ahora devuelve { storagePath, nombre, tipo } o null
+        const resultado = await subirArchivoStorage(arch, m.id);
+        if(resultado){
+          nuevosArchivos.push(resultado); // { storagePath, nombre, tipo }
           cambio = true;
           migrados++;
         } else {
-          nuevosArchivos.push(arch);
+          nuevosArchivos.push(arch); // mantener original si falla
         }
       }
     }
     if(cambio){
       m.archivos = nuevosArchivos;
-      // Solo quitar el flag de pendiente si TODOS los archivos quedaron con url
-      if(nuevosArchivos.every(a=>a.url)) delete m._pendienteStorage;
+      // Limpiar flag pendiente solo si TODOS los archivos tienen storagePath o url
+      if(nuevosArchivos.every(a => a.storagePath || a.url)) delete m._pendienteStorage;
+
+      // En V9_RELACIONAL: persistir en PostgreSQL vía RPC
+      // En modo legado: saveDB() (localStorage)
+      if(typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+        const cuentaId = S._v9CuentaId;
+        if(cuentaId){
+          // Actualizar storagePath principal en campo comprobante
+          const primerPath = (nuevosArchivos.find(a => a.storagePath) || {}).storagePath || null;
+          const patchData = { archivos: nuevosArchivos };
+          if(primerPath) patchData.comprobante = primerPath;
+          try {
+            await actualizarMovimientoV9(cuentaId, m.id, patchData, _authToken);
+          } catch(e) {
+            console.warn('[Storage] Error persistiendo migración en v9:', e);
+          }
+        }
+      } else {
+        saveDB(); // modo legado: sincronizar localStorage
+      }
     }
   }
   if(migrados > 0){
     console.log('Migrados '+migrados+' comprobantes a Storage');
-    saveDB(); // marca timestamp local optimista + sube a la nube de forma robusta
-    showToast('✅ '+migrados+' comprobante'+( migrados!==1?'s':'')+' sincronizado'+( migrados!==1?'s':'')+' con la nube');
+    if(typeof showToast==='function') {
+      showToast('✅ '+migrados+' comprobante'+( migrados!==1?'s':'')+' sincronizado'+( migrados!==1?'s':'')+' con la nube');
+    }
   }
 }
 
+// ── Subir múltiples archivos ───────────────────────────────────────────────────
+// Itera sobre los archivos adjuntos. Si un archivo ya tiene storagePath o url,
+// se mantiene sin re-subir. Si tiene 'data' (base64), se sube.
 async function subirArchivosStorage(archivos, movId){
   const resultados = [];
   for(const arch of archivos){
-    if(arch.url){
-      // Ya tiene URL (pudo subirse antes) — mantener tal cual.
-      // Si tiene storagePath podría regenerarse; por ahora se conserva.
+    if(arch.storagePath || arch.url){
+      // Ya fue subido (tiene storagePath en nuevo formato, o url en formato antiguo).
+      // Conservar tal cual para no re-subir ni perder el archivo.
       resultados.push(arch);
       continue;
     }
     if(!arch.data) continue;
-    // subirArchivoStorage devuelve { storagePath, url, nombre, tipo } o null.
+    // subirArchivoStorage devuelve { storagePath, nombre, tipo } o null.
     const resultado = await subirArchivoStorage(arch, movId);
     if(resultado){
       resultados.push(resultado);
@@ -203,4 +227,3 @@ async function subirArchivosStorage(archivos, movId){
   }
   return resultados;
 }
-

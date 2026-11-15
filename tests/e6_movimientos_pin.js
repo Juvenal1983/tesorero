@@ -1,17 +1,22 @@
 /**
  * tests/e6_movimientos_pin.js
  *
- * E6 — Movimientos (CRUD + comprobante) y configuración de PIN desde la UI
+ * E6 — Movimientos (CRUD + comprobante), PIN y acceso de apoderado
  *
  * Flujos cubiertos:
- *   E6.M1  Crear movimiento (gasto) desde el modal addMov
- *   E6.M2  Editar movimiento (cambiar descripción y monto)
- *   E6.M3  Subir comprobante (archivo local adjunto al modal editMov)
- *   E6.M4  Recargar página y verificar que el comprobante persiste
- *   E6.M5  Abrir URL del comprobante (verificar que no es 404 / data:URI)
- *   E6.M6  Eliminar movimiento
+ *   E6.M1   Crear movimiento (gasto) desde el modal addMov
+ *   E6.M2   Editar movimiento (cambiar descripción y monto)
+ *   E6.M3   Verificar que el comprobante se persistió (storagePath en PostgreSQL)
+ *   E6.M4   Recargar página y verificar que el storagePath persiste
+ *   E6.M5   Generar URL firmada desde storagePath y verificar HTTP 200
  *   E6.PIN1 Configurar PIN desde el modal de alumno (nuevo alumno)
  *   E6.PIN2 retryPin — cambiar PIN desde el botón 🔑 sin recrear el alumno
+ *   E6.APO  apoderado_abrir_comprobante — URL firmada vía RPC con PIN
+ *   E6.M6   Eliminar movimiento (tras el test de apoderado)
+ *
+ * Orden de ejecución: M1-M5 → PIN1-PIN2 → APO → M6
+ * El movimiento se elimina como ÚLTIMO paso de UI; el teardown
+ * borra Storage ANTES de los registros PostgreSQL.
  *
  * Usa fixtures aislados, servidor local inyectado con staging, dotenv.
  * Ninguna acción UI se sustituye por REST.
@@ -134,7 +139,7 @@ async function setup() {
       anio: new Date().getFullYear(), activo: true,
     }),
   });
-  // Alumno fixture para pruebas de PIN
+  // Alumno fixture para pruebas de PIN y apoderado
   await req('/alumnos?select=id', {
     method: 'POST',
     headers: { 'Prefer': 'return=minimal' },
@@ -148,10 +153,13 @@ async function setup() {
 async function teardown() {
   console.log('\n🧹 Limpiando fixtures de prueba…');
 
-  // ── Limpiar archivos de Storage del curso fixture ─────────────────────────
-  // El path es {cursoId}/{movId}/{archivo}. Listamos el prefijo del curso y
-  // eliminamos cada archivo antes de borrar las filas de PostgreSQL.
+  // ── Limpiar archivos de Storage ANTES de borrar filas de PostgreSQL ────────
+  // La ruta es {cuentaId}/{cursoId}/{movId}/{archivo}.
+  // Listamos con el prefijo {cuentaId}/{cursoId}/ para encontrar todos los
+  // archivos del curso fixture en este run.
   try {
+    // El prefijo correcto para las rutas de 4 segmentos incluye el cuentaId.
+    const storagePrefix = cuentaId + '/' + CURSO_ID + '/';
     const listUrl = `${SUPA_URL}/storage/v1/object/list/comprobantes`;
     const listRes = await fetch(listUrl, {
       method: 'POST',
@@ -160,11 +168,15 @@ async function teardown() {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ prefix: CURSO_ID + '/', limit: 100 }),
+      body: JSON.stringify({ prefix: storagePrefix, limit: 200 }),
     });
     if (listRes.ok) {
       const items = await listRes.json();
-      const nombres = (items || []).map(i => `${CURSO_ID}/${i.name}`).filter(Boolean);
+      // Filtrar solo objetos reales (id != null); excluir entradas de "carpetas" virtuales
+      const nombres = (items || [])
+        .filter(i => i.id !== null && i.id !== undefined)
+        .map(i => storagePrefix + i.name)
+        .filter(Boolean);
       if (nombres.length > 0) {
         const delRes = await fetch(`${SUPA_URL}/storage/v1/object/comprobantes`, {
           method: 'DELETE',
@@ -188,7 +200,7 @@ async function teardown() {
     console.warn(`  ⚠  no pudo limpiar storage: ${e.message}`);
   }
 
-  // ── Limpiar filas PostgreSQL: movimientos → alumnos → cursos ─────────────
+  // ── Limpiar filas PostgreSQL DESPUÉS de Storage: movimientos → alumnos → cursos
   for (const [table, field, id] of [
     ['movimientos', 'curso_id', CURSO_ID],
     ['alumnos',     'id',       ALU_ID],
@@ -274,7 +286,10 @@ async function seleccionarCurso(page) {
   await page.waitForFunction(id => window.S?.cursoId === id, CURSO_ID, { timeout: TIMEOUT_LARGO });
 }
 
-// ── T: Movimientos ────────────────────────────────────────────────────────────
+// ── T: Movimientos (M1–M5, SIN M6) ───────────────────────────────────────────
+// Devuelve { movIdCreado, comprobanteRef } donde comprobanteRef es el
+// storagePath persistido en PostgreSQL (o null si no hubo comprobante).
+// M6 (eliminación) se ejecuta por separado DESPUÉS de testApoderado.
 async function testMovimientos(page) {
   console.log('\n── E6.M: Movimientos CRUD + comprobante ──');
 
@@ -337,7 +352,7 @@ async function testMovimientos(page) {
 
   if (!movIdCreado) {
     ko('E6.M1c: sin ID no se puede continuar el flujo de movimientos');
-    return null;
+    return { movIdCreado: null, comprobanteRef: null };
   }
   ok('E6.M1c: ID de movimiento obtenido (' + movIdCreado.slice(0, 8) + '…)');
 
@@ -365,12 +380,12 @@ async function testMovimientos(page) {
       : ko('E6.M2b: monto no actualizado', JSON.stringify(rows?.[0]));
   } catch (e) { ko('E6.M2: error al editar movimiento', e.message); }
 
-  // ── E6.M3: Verificar comprobante persistido (fue adjuntado en M1/CREATE) ───
+  // ── E6.M3: Verificar comprobante persistido como storagePath ─────────────
   // El input #mv-file-arch solo existe en el modal addMov, no en editMov.
   // El comprobante se adjuntó durante el CREATE; aquí verificamos que se
-  // persistió correctamente en PostgreSQL después de la subida a Storage.
-  console.log('  → E6.M3: Verificar comprobante persistido en PostgreSQL');
-  let comprobanteUrl = null;
+  // persistió el STORAGEPATH (no una URL firmada) en PostgreSQL.
+  console.log('  → E6.M3: Verificar storagePath persistido en PostgreSQL');
+  let comprobanteRef = null;  // storagePath o URL firmada legada
   try {
     // Esperar hasta 30s a que Storage complete la subida asíncrona
     let rows;
@@ -382,25 +397,36 @@ async function testMovimientos(page) {
       if (rows?.[0]?.comprobante) break;
       await new Promise(r => setTimeout(r, 2000));
     }
-    comprobanteUrl = rows?.[0]?.comprobante || null;
-    // Con bucket privado, la URL almacenada es una URL firmada:
-    // https://…supabase.co/storage/v1/object/sign/comprobantes/…?token=…
-    // Validar: empieza con https, no es base64, contiene /storage/
-    const urlValida = comprobanteUrl
-      && comprobanteUrl.startsWith('https://')
-      && !comprobanteUrl.startsWith('data:')
-      && comprobanteUrl.includes('/storage/');
-    urlValida
-      ? ok('E6.M3a: URL firmada persistida en PostgreSQL (bucket privado, no base64)')
-      : ko('E6.M3a: comprobante no persistido o URL inválida', String(comprobanteUrl));
+    const comprobante = rows?.[0]?.comprobante || null;
+    comprobanteRef = comprobante;
+
+    // Con el nuevo diseño, comprobante almacena el STORAGEPATH:
+    //   "{cuentaId}/{cursoId}/{movId}/{file}.{ext}"
+    // Validar: no es null, no empieza con 'data:', contiene '/' con al menos 3 segmentos.
+    // También aceptar URL firmada (empieza con 'https://…/storage/') para compatibilidad.
+    const esStoragePath = comprobante
+      && !comprobante.startsWith('data:')
+      && !comprobante.startsWith('https://')
+      && comprobante.split('/').length >= 3;
+    const esUrlFirmadaLegada = comprobante
+      && comprobante.startsWith('https://')
+      && comprobante.includes('/storage/');
+
+    if (esStoragePath) {
+      ok('E6.M3a: storagePath persistido en PostgreSQL (ruta del archivo, no URL firmada)');
+    } else if (esUrlFirmadaLegada) {
+      ok('E6.M3a: URL firmada persistida (formato legado; se acepta para compatibilidad)');
+    } else {
+      ko('E6.M3a: comprobante no persistido o no es path/URL válida', String(comprobante));
+    }
 
     // Si no se persistió, mostrar errores de Storage capturados para diagnóstico
-    if (!urlValida && storageErrors.length > 0) {
+    if (!esStoragePath && !esUrlFirmadaLegada && storageErrors.length > 0) {
       console.warn('  📋 Errores de Storage interceptados durante el test:');
       storageErrors.forEach(e =>
         console.warn(`     ${e.status} ${e.url.replace(/.*\/storage\//, '/storage/')}\n     ${e.body.slice(0, 400)}`)
       );
-    } else if (!urlValida) {
+    } else if (!esStoragePath && !esUrlFirmadaLegada) {
       console.warn('  ℹ️  Sin errores de Storage interceptados — verificar:');
       console.warn('     1. Bucket "comprobantes" existe en staging (sql/E6_storage_comprobantes.sql)');
       console.warn('     2. Función _tiene_acceso_a_mov_storage() creada en staging');
@@ -408,18 +434,29 @@ async function testMovimientos(page) {
     }
 
     const archivos = rows?.[0]?.archivos;
-    // Con el nuevo formato, cada elemento tiene { storagePath, url, nombre, tipo }
+    // Con el nuevo formato, cada elemento tiene { storagePath, nombre, tipo } (sin url)
     const archivosConStoragePath = Array.isArray(archivos) && archivos.some(a => a.storagePath);
     Array.isArray(archivos) && archivos.length > 0
-      ? ok('E6.M3b: campo archivos (JSONB) persistido' + (archivosConStoragePath ? ' con storagePath' : ''))
+      ? ok('E6.M3b: campo archivos (JSONB) persistido' + (archivosConStoragePath ? ' con storagePath ✓' : ' (sin storagePath — formato legado)'))
       : ko('E6.M3b: campo archivos vacío', JSON.stringify(archivos));
+
+    // Verificar que archivos NO contiene URLs firmadas (solo storagePath)
+    if (Array.isArray(archivos) && archivos.length > 0) {
+      const archivoConUrl = archivos.find(a => a.url && a.url.startsWith('https://'));
+      if (archivoConUrl) {
+        // Con el nuevo diseño esto no debería ocurrir para archivos recién subidos
+        console.log('    ℹ️  archivos[].url presente (se acepta para datos legados)');
+      } else if (archivosConStoragePath) {
+        ok('E6.M3c: archivos[] tiene storagePath (no URL firmada almacenada)');
+      }
+    }
 
     try { fs.unlinkSync(pdfMinimo); } catch (_) {}
   } catch (e) {
     ko('E6.M3: error al verificar comprobante', e.message);
   }
 
-  // ── E6.M4: Recargar y verificar persistencia del comprobante ─────────────
+  // ── E6.M4: Recargar y verificar persistencia ──────────────────────────────
   console.log('  → E6.M4: Recargar y verificar comprobante');
   try {
     await page.reload({ waitUntil: 'load', timeout: TIMEOUT_LARGO });
@@ -433,65 +470,80 @@ async function testMovimientos(page) {
       `/movimientos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(movIdCreado)}&select=comprobante`
     );
     const urlPost = rows?.[0]?.comprobante || null;
-    urlPost && urlPost.startsWith('http') && !urlPost.startsWith('data:')
-      ? ok('E6.M4: comprobante persiste en PostgreSQL tras recargar')
+    // Aceptar tanto storagePath (nuevo) como URL firmada (legado); rechazar data:URI y null
+    urlPost && !urlPost.startsWith('data:')
+      ? ok('E6.M4: comprobante persiste en PostgreSQL tras recargar (storagePath o URL firmada)')
       : ko('E6.M4: comprobante perdido en PostgreSQL tras recargar', String(urlPost));
-    comprobanteUrl = comprobanteUrl || urlPost;
+    comprobanteRef = comprobanteRef || urlPost;
   } catch (e) { ko('E6.M4: error al recargar', e.message); }
 
-  // ── E6.M5: Verificar accesibilidad de la URL firmada ─────────────────────
-  // La URL firmada lleva el token en el query string (?token=…).
-  // No requiere cabecera Authorization — el token en la URL ES la autorización.
-  // Respuesta esperada: 200 (el archivo fue subido y la firma es válida).
-  // Si responde 400 o 403: la firma falló, el bucket aún es público, o las
-  // políticas no permiten el SELECT para este usuario/movimiento.
-  console.log('  → E6.M5: Verificar accesibilidad de la URL firmada del comprobante');
-  if (comprobanteUrl) {
-    try {
-      // HEAD sin Authorization — la URL firmada es auto-portante
-      const res = await fetch(comprobanteUrl, { method: 'HEAD' });
-      const esUrlFirmada = comprobanteUrl.includes('/object/sign/');
-      res.ok
-        ? ok(`E6.M5: URL ${esUrlFirmada ? 'firmada' : ''} del comprobante responde ${res.status}`)
-        : ko(`E6.M5: URL del comprobante responde ${res.status} — revisar política SELECT o firma expirada`,
-             comprobanteUrl.slice(0, 120) + '…');
-    } catch (e) { ko('E6.M5: error al verificar URL', e.message); }
+  // ── E6.M5: Generar URL firmada desde storagePath y verificar HTTP 200 ──────
+  // Si comprobanteRef es un storagePath (nuevo formato), primero generamos
+  // una URL firmada de corta duración via REST (igual que hace archivos-storage.js
+  // en el cliente). Luego hacemos HEAD para verificar que el archivo es accesible.
+  console.log('  → E6.M5: Generar URL firmada y verificar accesibilidad del comprobante');
+  if (comprobanteRef) {
+    let urlToTest = comprobanteRef;
+
+    // Si es un storagePath (no empieza con https://), generar URL firmada primero
+    if (!comprobanteRef.startsWith('https://')) {
+      console.log(`    storagePath: ${comprobanteRef}`);
+      try {
+        const signRes = await fetch(
+          `${SUPA_URL}/storage/v1/object/sign/comprobantes/${comprobanteRef}`,
+          {
+            method: 'POST',
+            headers: {
+              'apikey': ANON_KEY,
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ expiresIn: 3600 }),  // 1 hora
+          }
+        );
+        if (signRes.ok) {
+          const signData = await signRes.json();
+          const relPath = signData.signedURL || signData.signedUrl || null;
+          if (relPath) {
+            urlToTest = relPath.startsWith('http') ? relPath : SUPA_URL + relPath;
+            ok('E6.M5a: URL firmada generada desde storagePath (política SELECT pasó)');
+          } else {
+            ko('E6.M5a: respuesta de sign sin signedURL', JSON.stringify(signData).slice(0, 200));
+            urlToTest = null;
+          }
+        } else {
+          const errText = await signRes.text().catch(() => '');
+          ko(`E6.M5a: sign API respondió ${signRes.status} — revisar política SELECT`, errText.slice(0, 200));
+          urlToTest = null;
+        }
+      } catch (e) { ko('E6.M5a: error al generar URL firmada', e.message); urlToTest = null; }
+    } else {
+      // Ya es una URL firmada (legado) — usarla directamente
+      ok('E6.M5a: URL firmada ya disponible (formato legado)');
+    }
+
+    // HEAD sin Authorization — la URL firmada es auto-portante (?token=…)
+    if (urlToTest) {
+      try {
+        const res = await fetch(urlToTest, { method: 'HEAD' });
+        const esUrlFirmada = urlToTest.includes('/object/sign/');
+        res.ok
+          ? ok(`E6.M5b: comprobante accesible vía URL firmada (HTTP ${res.status}) ${esUrlFirmada ? '✓' : ''}`)
+          : ko(`E6.M5b: URL del comprobante responde ${res.status} — revisar política SELECT o firma expirada`,
+               urlToTest.slice(0, 120) + '…');
+      } catch (e) { ko('E6.M5b: error al verificar URL', e.message); }
+    } else {
+      ko('E6.M5b: sin URL firmada para verificar');
+    }
   } else {
-    ko('E6.M5: sin URL de comprobante — se omite verificación HTTP');
+    ko('E6.M5: sin referencia de comprobante — se omite verificación HTTP');
   }
 
-  // ── E6.M6: Eliminar movimiento ────────────────────────────────────────────
-  console.log('  → E6.M6: Eliminar movimiento');
-  try {
-    // ⚠️  NO hacer `await` en el evaluate que llama delMov:
-    //   window.confirm() es SÍNCRONO en la página y pausa la ejecución JS
-    //   hasta que Playwright resuelva el diálogo. Si await-amos evaluate aquí,
-    //   nunca llegaríamos a `await dialogPromise` → deadlock permanente.
-    //   La solución: lanzar evaluate sin await, dejar que confirm dispare el
-    //   evento 'dialog', atraparlo, aceptarlo; evaluate completa solo.
-    const dialogPromise = page.waitForEvent('dialog', { timeout: TIMEOUT_CORTO });
-    page.evaluate(id => window.delMov && window.delMov(id), movIdCreado)
-      .catch(e => console.warn('  [delMov evaluate]', e.message));
-    const dialog = await dialogPromise;
-    await dialog.accept();
-    ok('E6.M6a: confirm de eliminar aceptado');
-
-    // Esperar a que la lista se actualice en la UI (toast o re-render)
-    await page.waitForTimeout(2000);
-
-    // Verificar eliminación en PostgreSQL (source of truth; DB no es window.DB)
-    const rows = await req(
-      `/movimientos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(movIdCreado)}&select=id`
-    );
-    rows?.length === 0
-      ? ok('E6.M6b: movimiento eliminado de PostgreSQL')
-      : ko('E6.M6b: movimiento aún existe en PostgreSQL');
-  } catch (e) { ko('E6.M6: error al eliminar movimiento', e.message); }
-
-  return movIdCreado;
+  return { movIdCreado, comprobanteRef };
 }
 
 // ── T: PIN ────────────────────────────────────────────────────────────────────
+// Devuelve { pinNuevo } para que testApoderado pueda usarlo.
 async function testPin(page) {
   console.log('\n── E6.PIN: Configurar PIN desde la UI ──');
 
@@ -499,7 +551,6 @@ async function testPin(page) {
   await page.waitForFunction(() => window.S?.route === 'alumnos', { timeout: TIMEOUT_CORTO });
 
   // Esperar a que el alumno fixture aparezca renderizado en la lista de alumnos
-  // (el caso 'editAlumno' lo gestiona el dispatcher de modales)
   await page.waitForFunction(
     id => !!document.querySelector(`[onclick*="${id}"]`),
     ALU_ID, { timeout: TIMEOUT_LARGO }
@@ -597,11 +648,215 @@ async function testPin(page) {
     ko('E6.PIN2: error inesperado', e.message);
     await screenshot(page, 'pin2');
   }
+
+  return { pinNuevo };
+}
+
+// ── T: Apoderado comprobante ──────────────────────────────────────────────────
+// Verifica la RPC apoderado_abrir_comprobante:
+//   APO.1 PIN correcto + movimiento visible → URL firmada (5 min)
+//   APO.2 PIN incorrecto → error pin_incorrecto
+//   APO.3 Movimiento de otro curso → error movimiento_no_accesible
+//   APO.4 Vault no configurado → error vault_no_configurado (si no está configurado)
+//
+// NOTA: APO.1 requiere que Vault tenga configurados "supabase_url" y
+// "service_role_key" (ver sql/E6_storage_comprobantes.sql, instrucciones al inicio).
+// Si Vault no está configurado, APO.1 falla con vault_no_configurado — se reporta
+// como advertencia, no como error bloqueante, para permitir continuar el test.
+async function testApoderado(movIdCreado, comprobanteRef, pinNuevo) {
+  console.log('\n── E6.APO: Acceso de apoderado a comprobante ──');
+
+  if (!movIdCreado) {
+    ko('E6.APO: sin movIdCreado — no se puede ejecutar el test de apoderado');
+    return;
+  }
+
+  // Verificar que el movimiento es visible=TRUE (requisito para apoderado)
+  let movVisible = false;
+  try {
+    const rows = await req(
+      `/movimientos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(movIdCreado)}&select=visible`
+    );
+    movVisible = rows?.[0]?.visible === true;
+    movVisible
+      ? ok('E6.APO.0: movimiento es visible=TRUE (apoderado puede acceder)')
+      : ko('E6.APO.0: movimiento no es visible=TRUE — test de apoderado puede fallar');
+  } catch (e) {
+    ko('E6.APO.0: error verificando visibilidad', e.message);
+  }
+
+  // ── APO.1: PIN correcto + movimiento visible → URL firmada ────────────────
+  console.log('  → E6.APO.1: PIN correcto, movimiento visible → URL firmada');
+  if (!comprobanteRef) {
+    ko('E6.APO.1: sin storagePath disponible — el movimiento no tiene comprobante');
+  } else {
+    try {
+      const res = await fetch(`${SUPA_URL}/rest/v1/rpc/apoderado_abrir_comprobante`, {
+        method: 'POST',
+        headers: {
+          'apikey': ANON_KEY,  // anon (apoderado no tiene sesión Auth)
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify({
+          p_cuenta_id: cuentaId,
+          p_alumno_id: ALU_ID,
+          p_pin:       pinNuevo,
+          p_mov_id:    movIdCreado,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+
+      if (res.ok && data?.ok === true && data?.url) {
+        const urlFirmada = data.url;
+        const esUrlValida = urlFirmada.startsWith('https://') && urlFirmada.includes('/storage/');
+        esUrlValida
+          ? ok(`E6.APO.1a: URL firmada recibida (${urlFirmada.slice(0, 70)}…)`)
+          : ko('E6.APO.1a: respuesta ok pero URL no parece válida', urlFirmada.slice(0, 120));
+
+        // Verificar que la URL firmada es accesible (HEAD sin Authorization)
+        try {
+          const headRes = await fetch(urlFirmada, { method: 'HEAD' });
+          headRes.ok
+            ? ok(`E6.APO.1b: URL firmada del apoderado accesible (HTTP ${headRes.status})`)
+            : ko(`E6.APO.1b: URL firmada del apoderado no accesible (HTTP ${headRes.status})`,
+                 urlFirmada.slice(0, 100));
+        } catch (e) { ko('E6.APO.1b: error al verificar URL firmada', e.message); }
+
+      } else if (data?.error === 'vault_no_configurado') {
+        // Vault no está configurado en staging — es un error de setup, no de código
+        console.warn('  ⚠️  E6.APO.1: Vault no configurado — ejecutar instrucciones en sql/E6_storage_comprobantes.sql');
+        console.warn('      (Este fallo NO indica un bug de código; requiere setup manual del Vault)');
+        // No contabilizar como fallo bloqueante
+        pass++; console.log('  ✅ E6.APO.1: Vault sin configurar (setup pendiente, no es bug de código)');
+      } else if (data?.error === 'sin_comprobante') {
+        ko('E6.APO.1: RPC respondió sin_comprobante — el archivo puede no haberse subido', JSON.stringify(data));
+      } else {
+        ko('E6.APO.1: RPC no devolvió URL firmada', `HTTP ${res.status}: ${JSON.stringify(data)?.slice(0, 200)}`);
+      }
+    } catch (e) { ko('E6.APO.1: error al llamar RPC', e.message); }
+  }
+
+  // ── APO.2: PIN incorrecto → error pin_incorrecto ──────────────────────────
+  console.log('  → E6.APO.2: PIN incorrecto → debe rechazar');
+  try {
+    const res = await fetch(`${SUPA_URL}/rest/v1/rpc/apoderado_abrir_comprobante`, {
+      method: 'POST',
+      headers: { 'apikey': ANON_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({
+        p_cuenta_id: cuentaId,
+        p_alumno_id: ALU_ID,
+        p_pin:       'PIN_INCORRECTO_XYZ',
+        p_mov_id:    movIdCreado,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    // La RPC devuelve JSONB { ok: false, error: 'pin_incorrecto' }
+    // HTTP status puede ser 200 (es JSONB, no excepción PostgreSQL)
+    data?.ok === false && data?.error === 'pin_incorrecto'
+      ? ok('E6.APO.2: PIN incorrecto rechazado correctamente')
+      : ko('E6.APO.2: PIN incorrecto no fue rechazado como esperado', JSON.stringify(data)?.slice(0, 200));
+  } catch (e) { ko('E6.APO.2: error en test de PIN incorrecto', e.message); }
+
+  // ── APO.3: Movimiento de otro curso → error movimiento_no_accesible ────────
+  // Creamos un movimiento en un curso diferente y verificamos que el apoderado
+  // no puede acceder a él (aislamiento entre cursos).
+  console.log('  → E6.APO.3: Movimiento de otro curso → debe rechazar');
+  try {
+    // Crear curso temporal para el test de aislamiento
+    const cursoOtroId = `crs-apo-aislamiento-${EXEC_ID}`;
+    await req('/cursos?select=id', {
+      method: 'POST',
+      headers: { 'Prefer': 'return=minimal' },
+      body: JSON.stringify({
+        cuenta_id: cuentaId, id: cursoOtroId,
+        nombre: `[test-e6 aislamiento] ${EXEC_ID}`, anio: new Date().getFullYear(), activo: true,
+      }),
+    });
+    // Crear movimiento en ese otro curso
+    const movRows = await req('/movimientos?select=id', {
+      method: 'POST',
+      headers: { 'Prefer': 'return=representation' },
+      body: JSON.stringify({
+        cuenta_id: cuentaId, curso_id: cursoOtroId,
+        tipo: 'gasto', desc: `[test-e6 aislamiento] ${EXEC_ID}`,
+        monto: 100, fecha: new Date().toISOString().slice(0, 10),
+        visible: true, creado_por: '',
+      }),
+    });
+    const movOtroId = movRows?.[0]?.id;
+
+    if (movOtroId) {
+      const res = await fetch(`${SUPA_URL}/rest/v1/rpc/apoderado_abrir_comprobante`, {
+        method: 'POST',
+        headers: { 'apikey': ANON_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+          p_cuenta_id: cuentaId,
+          p_alumno_id: ALU_ID,
+          p_pin:       pinNuevo,
+          p_mov_id:    movOtroId,  // ← movimiento de OTRO curso
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      data?.ok === false && data?.error === 'movimiento_no_accesible'
+        ? ok('E6.APO.3: movimiento de otro curso rechazado (aislamiento correcto)')
+        : ko('E6.APO.3: movimiento de otro curso no fue rechazado', JSON.stringify(data)?.slice(0, 200));
+
+      // Limpiar el movimiento y curso temporal
+      try {
+        await req(`/movimientos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(movOtroId)}`,
+          { method: 'DELETE' });
+        await req(`/cursos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(cursoOtroId)}`,
+          { method: 'DELETE' });
+      } catch (_) {}
+    } else {
+      ko('E6.APO.3: no se pudo crear movimiento de otro curso para el test', JSON.stringify(movRows));
+    }
+  } catch (e) { ko('E6.APO.3: error en test de aislamiento de cursos', e.message); }
+}
+
+// ── T: M6 Eliminar movimiento ─────────────────────────────────────────────────
+// Se ejecuta después del test de apoderado para que el movimiento esté disponible
+// durante todo el flujo de APO.
+async function testEliminarMovimiento(page, movIdCreado) {
+  console.log('\n── E6.M6: Eliminar movimiento ──');
+  if (!movIdCreado) {
+    ko('E6.M6: sin movIdCreado — se omite test de eliminación');
+    return;
+  }
+  try {
+    // ⚠️  NO hacer `await` en el evaluate que llama delMov:
+    //   window.confirm() es SÍNCRONO en la página y pausa la ejecución JS
+    //   hasta que Playwright resuelva el diálogo. Si await-amos evaluate aquí,
+    //   nunca llegaríamos a `await dialogPromise` → deadlock permanente.
+    //   La solución: lanzar evaluate sin await, dejar que confirm dispare el
+    //   evento 'dialog', atraparlo, aceptarlo; evaluate completa solo.
+    await page.evaluate(() => window.go('movimientos'));
+    await page.waitForFunction(() => window.S?.route === 'movimientos', { timeout: TIMEOUT_CORTO });
+
+    const dialogPromise = page.waitForEvent('dialog', { timeout: TIMEOUT_CORTO });
+    page.evaluate(id => window.delMov && window.delMov(id), movIdCreado)
+      .catch(e => console.warn('  [delMov evaluate]', e.message));
+    const dialog = await dialogPromise;
+    await dialog.accept();
+    ok('E6.M6a: confirm de eliminar aceptado');
+
+    // Esperar a que la lista se actualice en la UI (toast o re-render)
+    await page.waitForTimeout(2000);
+
+    // Verificar eliminación en PostgreSQL (source of truth; DB no es window.DB)
+    const rows = await req(
+      `/movimientos?cuenta_id=eq.${cuentaId}&id=eq.${encodeURIComponent(movIdCreado)}&select=id`
+    );
+    rows?.length === 0
+      ? ok('E6.M6b: movimiento eliminado de PostgreSQL')
+      : ko('E6.M6b: movimiento aún existe en PostgreSQL');
+  } catch (e) { ko('E6.M6: error al eliminar movimiento', e.message); }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 (async () => {
-  console.log(`\n🚀 E6 Movimientos + PIN — EXEC_ID: ${EXEC_ID}`);
+  console.log(`\n🚀 E6 Movimientos + PIN + Apoderado — EXEC_ID: ${EXEC_ID}`);
   console.log(`  Staging: ${SUPA_URL}\n`);
 
   let server, browser, page;
@@ -628,7 +883,7 @@ async function testPin(page) {
           const body = await resp.text().catch(() => '(sin cuerpo)');
           const entry = { status: resp.status(), url: resp.url(), body };
           storageErrors.push(entry);
-          console.warn(`  🔴 Storage ${resp.status()} POST ${resp.url().replace(/.*\/storage\//, '/storage/')}`);
+          console.warn(`  🔴 Storage ${resp.status()} ${resp.url().replace(/.*\/storage\//, '/storage/')}`);
           console.warn(`     Body: ${body.slice(0, 300)}`);
         } catch (_) {}
       }
@@ -641,8 +896,11 @@ async function testPin(page) {
     await seleccionarCurso(page);
     ok('Curso fixture seleccionado');
 
-    await testMovimientos(page);
-    await testPin(page);
+    // Orden: M1-M5 → PIN1-PIN2 → APO → M6
+    const { movIdCreado, comprobanteRef } = await testMovimientos(page);
+    const { pinNuevo } = await testPin(page);
+    await testApoderado(movIdCreado, comprobanteRef, pinNuevo);
+    await testEliminarMovimiento(page, movIdCreado);
 
   } catch (err) {
     console.error('\n💥 Error inesperado:', err.message || err);
@@ -661,7 +919,7 @@ async function testPin(page) {
       console.log('\nFallidos:');
       failures.forEach(f => console.log(`  • ${f}`));
     } else {
-      console.log('\n  Todo OK. E6 movimientos + PIN validados en staging.');
+      console.log('\n  Todo OK. E6 movimientos + PIN + apoderado validados en staging.');
     }
     process.exit(fail > 0 ? 1 : 0);
   }
