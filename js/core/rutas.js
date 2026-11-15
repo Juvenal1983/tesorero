@@ -101,6 +101,7 @@ function renderRoute(){
     case 'cuotas': return renderCuotas();
     case 'pagos': return renderPagos();
     case 'fondo-especial': return renderFondoEspecial();
+    case 'actividades': return renderActividades();
     case 'movimientos': return renderMovimientos();
     case 'cobranza': return renderCobranza();
     case 'reportes': return renderReportes();

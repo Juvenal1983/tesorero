@@ -418,6 +418,19 @@ async function navegar(page, ruta, waitSelector) {
     cuentaId = rCta.body[0].id;
     console.log(`  [ok] cuenta: ${cuentaId}`);
 
+    // ── Verificar que cleanup de mwi25r2j terminó ─────────────────────────────
+    for (const exId of ['mwi25r2j', 'mwi1u7sa']) {
+      const rChk = await rest(
+        `/cursos?id=eq.crs-e7ui-${exId}&cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=id`,
+        {}, jwt
+      );
+      if (rChk.body?.length) {
+        console.warn(`  [warn] Fixture huérfano detectado: crs-e7ui-${exId}. Ejecuta: node tests/limpiar_fixtures_huerfanos.js ${exId}`);
+      } else {
+        console.log(`  [ok] cleanup ${exId}: confirmado ✓`);
+      }
+    }
+
     // Obtener auth_id de usuario C (si está configurado) para crear membresía en setup
     let userCAuthId = null;
     if (USER_C_EMAIL && USER_C_PASS) {
@@ -515,9 +528,9 @@ async function navegar(page, ruta, waitSelector) {
       await page.locator('button[onclick="saveMovFondo()"]').click();
       await page.waitForTimeout(2000);
 
-      // Verificar persistencia en DB
+      // Verificar persistencia en DB (sin columnas inexistentes)
       const rMov = await rest(
-        `/fondo_movimientos?cuenta_id=eq.${cuentaId}&curso_id=eq.${cursoId}&nombre=like.${encodeURIComponent(`Aporte-${EXEC_ID}%`)}&select=id,nombre,monto_total,montos_individuales`,
+        `/fondo_movimientos?cuenta_id=eq.${cuentaId}&curso_id=eq.${cursoId}&nombre=like.${encodeURIComponent(`Aporte-${EXEC_ID}%`)}&select=id,nombre,monto_total`,
         {}, jwt
       );
       if (!rMov.ok || !rMov.body?.length)
@@ -525,28 +538,29 @@ async function navegar(page, ruta, waitSelector) {
       movId = rMov.body[0].id;
 
       // Verificar suma de asignaciones individuales con getFondoAlumno real
-      // Necesitamos los movimientos del curso para el mock
       const rMovAll = await rest(
         `/fondo_movimientos?cuenta_id=eq.${cuentaId}&curso_id=eq.${cursoId}&select=*`,
         {}, jwt
       );
-      // Mapear al formato que usa fondos.js (camelCase)
+      // Mapear al formato que usa fondos.js (camelCase) — columna real: monto_individual
       const movsMapped = (rMovAll.body || []).map(m => ({
         id: m.id, tipo: m.tipo, nombre: m.nombre,
         fecha: m.fecha, montoTotal: m.monto_total || 0,
         participantes: m.participantes || [],
-        montosIndividuales: m.montos_individuales || {},
+        montoIndividual: m.monto_individual || null,
         cursoId: m.curso_id,
       }));
-      const aluMapped = alumnos.map(a => ({ id: a.id, nombre: a.nombre, cursoId }));
+      const aluMapped = alumnos.map(a => ({ id: a.id, cursoId }));
       const saldos = verificarSumaAsignaciones(movsMapped, aluMapped, cursoId, MONTO_APORTE_1);
 
       ok('UI-FM.1', `saveMovFondo aporte ${MONTO_APORTE_1} → id=${movId}; sum(asignaciones)=${MONTO_APORTE_1} ✓; saldos=[${saldos}]`);
     } catch (e) { ko('UI-FM.1', 'saveMovFondo', e); await screenshot(page, 'fm1'); }
 
     // FM.2 — editar monto
+    if (!movId) {
+      pend('UI-FM.2', 'guardarEditMovFondo', 'FM.1 no creó el movimiento (bloqueado)');
+    } else {
     try {
-      if (!movId) throw new Error('movId no disponible (FM.1 falló)');
 
       await page.locator(`button[onclick*="editarMovFondo"][onclick*="${movId}"]`).click();
       await page.waitForSelector('#emov-monto', { timeout: TIMEOUT_CORTO });
@@ -571,23 +585,21 @@ async function navegar(page, ruta, waitSelector) {
         id: m.id, tipo: m.tipo, nombre: m.nombre,
         fecha: m.fecha, montoTotal: m.monto_total || 0,
         participantes: m.participantes || [],
-        montosIndividuales: m.montos_individuales || {},
+        montoIndividual: m.monto_individual || null,
         cursoId: m.curso_id,
       }));
-      const aluMapped = alumnos.map(a => ({ id: a.id, nombre: a.nombre, cursoId }));
+      const aluMapped = alumnos.map(a => ({ id: a.id, cursoId }));
       const saldos = verificarSumaAsignaciones(movsMapped, aluMapped, cursoId, MONTO_APORTE_2);
 
       ok('UI-FM.2', `guardarEditMovFondo → monto_total=${MONTO_APORTE_2}; sum(asignaciones)=${MONTO_APORTE_2} ✓; saldos=[${saldos}]`);
     } catch (e) { ko('UI-FM.2', 'guardarEditMovFondo', e); await screenshot(page, 'fm2'); }
+    } // end if (movId) for FM.2
 
-    // FM.3 — recarga de página
+    // FM.3 — recarga de página (patrón E6: 'load' + _v9CuentaId + seleccionarCurso)
     try {
-      await page.reload({ waitUntil: 'networkidle', timeout: TIMEOUT_LARGO });
-      await page.waitForFunction(
-        (id) => typeof S !== 'undefined' && S.cursoId === id,
-        cursoId,
-        { timeout: TIMEOUT_LARGO }
-      );
+      await page.reload({ waitUntil: 'load', timeout: TIMEOUT_LARGO });
+      await page.waitForFunction(() => !!window.S?._v9CuentaId, { timeout: TIMEOUT_LARGO });
+      await seleccionarCurso(page, cursoId);
       await navegar(page, 'fondo-especial', 'button[onclick*="showModal"]');
 
       if (movId) {
@@ -603,10 +615,10 @@ async function navegar(page, ruta, waitSelector) {
         id: m.id, tipo: m.tipo, nombre: m.nombre,
         fecha: m.fecha, montoTotal: m.monto_total || 0,
         participantes: m.participantes || [],
-        montosIndividuales: m.montos_individuales || {},
+        montoIndividual: m.monto_individual || null,
         cursoId: m.curso_id,
       }));
-      const aluMapped = alumnos.map(a => ({ id: a.id, nombre: a.nombre, cursoId }));
+      const aluMapped = alumnos.map(a => ({ id: a.id, cursoId }));
       const saldos = verificarSumaAsignaciones(movsMapped, aluMapped, cursoId, MONTO_APORTE_2);
 
       ok('UI-FM.3', `recarga → movimiento visible; sum(asignaciones)=${MONTO_APORTE_2} ✓ tras reload; saldos=[${saldos}]`);
@@ -629,8 +641,10 @@ async function navegar(page, ruta, waitSelector) {
     } catch (e) { ko('UI-FM.4', 'aislamiento de cursos', e); await screenshot(page, 'fm4'); }
 
     // FM.5 — eliminar movimiento
+    if (!movId) {
+      pend('UI-FM.5', 'eliminarMovFondo', 'FM.1 no creó el movimiento (bloqueado)');
+    } else {
     try {
-      if (!movId) throw new Error('movId no disponible (FM.1 falló)');
 
       await navegar(page, 'fondo-especial',
         `button[onclick*="eliminarMovFondo"][onclick*="${movId}"]`);
@@ -644,6 +658,7 @@ async function navegar(page, ruta, waitSelector) {
       ok('UI-FM.5', `eliminarMovFondo → ausente en DB`);
       movId = null;
     } catch (e) { ko('UI-FM.5', 'eliminarMovFondo', e); await screenshot(page, 'fm5'); }
+    } // end if (movId) for FM.5
 
     // ══════════════════════════════════════════════════════════════════════════
     // UI-ACT — CRUD actividades
@@ -654,14 +669,28 @@ async function navegar(page, ruta, waitSelector) {
     const MONTO_ACT = 48000;
     const MONTO_ACT_EDIT = 50000;
 
-    // Asegurarse de estar en el curso fixture
+    // Asegurarse de estar en el curso fixture con fondo activo
     if (fixtures.cursoId) {
       try { await seleccionarCurso(page, cursoId); } catch (_) {}
     }
 
-    // ACT.1 — crear actividad
+    // Verificar que el fondo esté activo antes de navegar a 'actividades'
+    // (preferencias.js redirige a dashboard si no lo está)
+    let fondoActivo = false;
     try {
-      await navegar(page, 'fondo-especial', 'button[onclick*="addActividad"]');
+      const rFondoAct = await rest(`/cursos?id=eq.${cursoId}&select=fondo_especial`, {}, jwt);
+      fondoActivo = rFondoAct.body?.[0]?.fondo_especial?.activo === true;
+    } catch (_) {}
+    if (!fondoActivo) {
+      pend('UI-ACT.1', 'saveActividad crear', 'fondo_especial no activo (UI-CFG.1 no pasó)');
+      pend('UI-ACT.2', 'saveActividad editar', 'bloqueado por UI-ACT.1');
+      pend('UI-ACT.3', 'recarga actividad', 'bloqueado por UI-ACT.1');
+      pend('UI-ACT.4', 'eliminarActividad', 'bloqueado por UI-ACT.1');
+    } else {
+
+    // ACT.1 — crear actividad (ruta 'actividades' — registrada en rutas.js)
+    try {
+      await navegar(page, 'actividades', 'button[onclick*="addActividad"]');
       await page.locator('button[onclick*="addActividad"]').click();
       await page.waitForSelector('#act-nombre', { timeout: TIMEOUT_CORTO });
 
@@ -683,8 +712,10 @@ async function navegar(page, ruta, waitSelector) {
     } catch (e) { ko('UI-ACT.1', 'saveActividad crear', e); await screenshot(page, 'act1'); }
 
     // ACT.2 — editar actividad
+    if (!actId) {
+      pend('UI-ACT.2', 'saveActividad editar', 'ACT.1 no creó la actividad (bloqueado)');
+    } else {
     try {
-      if (!actId) throw new Error('actId no disponible (ACT.1 falló)');
 
       await page.locator(`button[onclick*="editActividad"][onclick*="${actId}"]`).click();
       await page.waitForSelector('#act-nombre', { timeout: TIMEOUT_CORTO });
@@ -703,16 +734,14 @@ async function navegar(page, ruta, waitSelector) {
         throw new Error(`Edición no persistida; nombre="${nom}", monto=${monto}`);
       ok('UI-ACT.2', `saveActividad editar → "${nom}", monto_total=${monto}`);
     } catch (e) { ko('UI-ACT.2', 'saveActividad editar', e); await screenshot(page, 'act2'); }
+    } // end if (actId) for ACT.2
 
-    // ACT.3 — recarga
+    // ACT.3 — recarga (patrón E6)
     try {
-      await page.reload({ waitUntil: 'networkidle', timeout: TIMEOUT_LARGO });
-      await page.waitForFunction(
-        (id) => typeof S !== 'undefined' && S.cursoId === id,
-        cursoId,
-        { timeout: TIMEOUT_LARGO }
-      );
-      await navegar(page, 'fondo-especial');
+      await page.reload({ waitUntil: 'load', timeout: TIMEOUT_LARGO });
+      await page.waitForFunction(() => !!window.S?._v9CuentaId, { timeout: TIMEOUT_LARGO });
+      await seleccionarCurso(page, cursoId);
+      await navegar(page, 'actividades');
       await page.waitForTimeout(1500);
 
       if (actId) {
@@ -723,8 +752,10 @@ async function navegar(page, ruta, waitSelector) {
     } catch (e) { ko('UI-ACT.3', 'recarga actividad', e); await screenshot(page, 'act3'); }
 
     // ACT.4 — eliminar actividad
+    if (!actId) {
+      pend('UI-ACT.4', 'eliminarActividad', 'ACT.1 no creó la actividad (bloqueado)');
+    } else {
     try {
-      if (!actId) throw new Error('actId no disponible (ACT.1 falló)');
 
       page.once('dialog', d => d.accept());
       await page.locator(`button[onclick*="eliminarActividad"][onclick*="${actId}"]`).click();
@@ -736,6 +767,9 @@ async function navegar(page, ruta, waitSelector) {
       ok('UI-ACT.4', `eliminarActividad → ausente en DB`);
       actId = null;
     } catch (e) { ko('UI-ACT.4', 'eliminarActividad', e); await screenshot(page, 'act4'); }
+    } // end if (actId) for ACT.4
+
+    } // end if (fondoActivo) for UI-ACT
 
     // ══════════════════════════════════════════════════════════════════════════
     // UI-RPT — Reporte: datasets de Chart.js contra importes exactos del fixture
@@ -751,13 +785,16 @@ async function navegar(page, ruta, waitSelector) {
     const IDX_RPT      = MES_RPT - 1;  // índice 0-based en Chart.js
 
     try {
-      // Crear movimiento tipo 'actividad' con monto conocido en agosto
+      // Crear movimiento tipo 'actividad' con id explícito y monto conocido en agosto
+      // ID determinista: return=minimal no devuelve body, necesitamos el ID de antemano
+      const movRptId = `mov-e7ui-rpt-${EXEC_ID}`;
       const rMovRpt = await rest('/fondo_movimientos', {
         method: 'POST',
         headers: { 'Prefer': 'return=minimal' },
         body: JSON.stringify({
           cuenta_id:    cuentaId,
           curso_id:     cursoId,
+          id:           movRptId,
           tipo:         'actividad',
           nombre:       `RPT-${EXEC_ID}`,
           fecha:        '2026-08-25',
@@ -767,16 +804,12 @@ async function navegar(page, ruta, waitSelector) {
       }, jwt);
       if (rMovRpt.status !== 201 && rMovRpt.status !== 204)
         throw new Error(`Crear movimiento RPT: HTTP ${rMovRpt.status} ${JSON.stringify(rMovRpt.body)}`);
-      const movRptId = (Array.isArray(rMovRpt.body) ? rMovRpt.body[0] : rMovRpt.body)?.id;
       console.log(`  [rpt] movimiento actividad creado: ${movRptId}, monto=${MONTO_RPT}, mes=${MES_RPT}`);
 
-      // Recargar la app y navegar a reportes para que drawReporteCharts use datos frescos
-      await page.reload({ waitUntil: 'networkidle', timeout: TIMEOUT_LARGO });
-      await page.waitForFunction(
-        (id) => typeof S !== 'undefined' && S.cursoId === id,
-        cursoId,
-        { timeout: TIMEOUT_LARGO }
-      );
+      // Recargar la app (patrón E6: 'load' + _v9CuentaId + seleccionarCurso)
+      await page.reload({ waitUntil: 'load', timeout: TIMEOUT_LARGO });
+      await page.waitForFunction(() => !!window.S?._v9CuentaId, { timeout: TIMEOUT_LARGO });
+      await seleccionarCurso(page, cursoId);
       await navegar(page, 'reportes');
       await page.waitForSelector('canvas#chartRepBar', { timeout: TIMEOUT_CORTO });
       // Esperar a que Chart.js termine de dibujar (setTimeout 50ms interno + render)
@@ -843,13 +876,17 @@ async function navegar(page, ruta, waitSelector) {
           : 'membresía no creada en setup (ver advertencia)';
         console.log(`  [vis] ${memInfo}`);
 
+        // Buscar la fila RPT con ID conocido — HTTP 200 + al menos 1 fila demuestra acceso real
+        const movRptIdVis = `mov-e7ui-rpt-${EXEC_ID}`;
         const rSelect = await rest(
-          `/fondo_movimientos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&curso_id=eq.${encodeURIComponent(cursoId)}&select=id`,
+          `/fondo_movimientos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&curso_id=eq.${encodeURIComponent(cursoId)}&id=eq.${encodeURIComponent(movRptIdVis)}&select=id`,
           {}, jwtC
         );
         if (!rSelect.ok)
           throw new Error(`SELECT como visor falló HTTP ${rSelect.status}: ${JSON.stringify(rSelect.body)}`);
-        ok('UI-VIS.1', `Usuario C (visor) SELECT fondo_movimientos HTTP ${rSelect.status} ✓`);
+        if (!rSelect.body?.length)
+          throw new Error(`SELECT devolvió 0 filas para id=${movRptIdVis} — RLS negó acceso o RPT no creado`);
+        ok('UI-VIS.1', `Usuario C (visor) leyó fila fixture conocida id=${movRptIdVis} ✓`);
       } catch (e) { ko('UI-VIS.1', 'SELECT usuario C', e); }
     }
 
