@@ -375,8 +375,12 @@ async function seleccionarCurso(page, cursoId) {
   await page.evaluate(() => { if (typeof go === 'function') go('selector'); });
   await page.waitForSelector(`[onclick="selectCurso('${cursoId}')"]`, { timeout: TIMEOUT_CORTO });
   await page.locator(`[onclick="selectCurso('${cursoId}')"]`).click();
+  // Esperar que recargarCursoV9 haya resuelto y llamado go('dashboard').
+  // Verificar SOLO cursoId !== id resuelve en seguida si el ID ya estaba seteado
+  // (condición de carrera: recargarCursoV9 llama go('dashboard') más tarde y
+  // sobreescribe cualquier ruta que el test haya renderizado entretanto).
   await page.waitForFunction(
-    (id) => typeof S !== 'undefined' && S.cursoId === id,
+    (id) => typeof S !== 'undefined' && S.cursoId === id && S.route === 'dashboard',
     cursoId,
     { timeout: TIMEOUT_LARGO }
   );
