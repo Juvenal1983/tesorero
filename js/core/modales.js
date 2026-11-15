@@ -30,6 +30,8 @@ function buildModal(){
     case 'nuevoMovFondo': return modalNuevoMovFondo();
     case 'editMovFondo': return modalEditMovFondo(data);
     case 'detalleFondoAlumno': return modalDetalleFondoAlumno(data);
+    case 'addActividad': return modalActividad();
+    case 'editActividad': return modalActividad(data.id);
     case 'nuevoCodigoModal': return modalNuevoCodigo(data);
     case 'editApoderado': return modalEditApoderadoLector(data);
     case 'editApoderadoTesorero': return modalEditApoderadoTesorero(data);

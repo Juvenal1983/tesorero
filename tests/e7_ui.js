@@ -418,8 +418,8 @@ async function navegar(page, ruta, waitSelector) {
     cuentaId = rCta.body[0].id;
     console.log(`  [ok] cuenta: ${cuentaId}`);
 
-    // ── Verificar que cleanup de mwi25r2j terminó ─────────────────────────────
-    for (const exId of ['mwi25r2j', 'mwi1u7sa']) {
+    // ── Verificar que cleanup de ejecuciones anteriores terminó ──────────────
+    for (const exId of ['mwi25r2j', 'mwi1u7sa', 'mwi2lwri']) {
       const rChk = await rest(
         `/cursos?id=eq.crs-e7ui-${exId}&cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=id`,
         {}, jwt
@@ -641,6 +641,7 @@ async function navegar(page, ruta, waitSelector) {
     } catch (e) { ko('UI-FM.4', 'aislamiento de cursos', e); await screenshot(page, 'fm4'); }
 
     // FM.5 — eliminar movimiento
+    // eliminarMovFondo() tiene DOS confirm() — se necesita handler persistente
     if (!movId) {
       pend('UI-FM.5', 'eliminarMovFondo', 'FM.1 no creó el movimiento (bloqueado)');
     } else {
@@ -648,9 +649,18 @@ async function navegar(page, ruta, waitSelector) {
 
       await navegar(page, 'fondo-especial',
         `button[onclick*="eliminarMovFondo"][onclick*="${movId}"]`);
-      page.once('dialog', d => d.accept());
+
+      // Handler persistente para los 2 diálogos de confirmación
+      const dialogHandler = d => d.accept();
+      page.on('dialog', dialogHandler);
       await page.locator(`button[onclick*="eliminarMovFondo"][onclick*="${movId}"]`).click();
-      await page.waitForTimeout(2000);
+      // Esperar que el botón desaparezca del DOM (confirma que el DELETE se completó y la UI se actualizó)
+      await page.waitForFunction(
+        (id) => !document.querySelector(`button[onclick*="eliminarMovFondo"][onclick*="${id}"]`),
+        movId,
+        { timeout: TIMEOUT_LARGO }
+      );
+      page.off('dialog', dialogHandler);
 
       const rDel = await rest(`/fondo_movimientos?id=eq.${movId}&select=id`, {}, jwt);
       if (rDel.body?.length > 0)
@@ -736,20 +746,22 @@ async function navegar(page, ruta, waitSelector) {
     } catch (e) { ko('UI-ACT.2', 'saveActividad editar', e); await screenshot(page, 'act2'); }
     } // end if (actId) for ACT.2
 
-    // ACT.3 — recarga (patrón E6)
+    // ACT.3 — recarga (patrón E6) — bloqueado si actId no existe (evita falso positivo)
+    if (!actId) {
+      pend('UI-ACT.3', 'recarga actividad', 'ACT.1 no creó la actividad (bloqueado)');
+    } else {
     try {
       await page.reload({ waitUntil: 'load', timeout: TIMEOUT_LARGO });
       await page.waitForFunction(() => !!window.S?._v9CuentaId, { timeout: TIMEOUT_LARGO });
       await seleccionarCurso(page, cursoId);
       await navegar(page, 'actividades');
       await page.waitForTimeout(1500);
-
-      if (actId) {
-        await page.waitForSelector(`button[onclick*="editActividad"][onclick*="${actId}"]`,
-          { timeout: TIMEOUT_CORTO });
-      }
+      // Exige el registro exacto de la actividad editada (nunca pasa si actId es null)
+      await page.waitForSelector(`button[onclick*="editActividad"][onclick*="${actId}"]`,
+        { timeout: TIMEOUT_CORTO });
       ok('UI-ACT.3', 'recarga → actividad editada visible en DOM');
     } catch (e) { ko('UI-ACT.3', 'recarga actividad', e); await screenshot(page, 'act3'); }
+    } // end if (actId) for ACT.3
 
     // ACT.4 — eliminar actividad
     if (!actId) {
@@ -784,27 +796,29 @@ async function navegar(page, ruta, waitSelector) {
     const MES_RPT      = 8;       // agosto
     const IDX_RPT      = MES_RPT - 1;  // índice 0-based en Chart.js
 
+    // ID determinista para teardown
+    let actRptId = null;
     try {
-      // Crear movimiento tipo 'actividad' con id explícito y monto conocido en agosto
-      // ID determinista: return=minimal no devuelve body, necesitamos el ID de antemano
-      const movRptId = `mov-e7ui-rpt-${EXEC_ID}`;
-      const rMovRpt = await rest('/fondo_movimientos', {
+      // drawReporteCharts() lee DB.actividades (via getActividades()) — insertar en /actividades, no en /fondo_movimientos
+      // Schema: { cuenta_id, id, curso_id, nombre, monto_total, participantes, fecha, obs }
+      actRptId = `act-e7ui-rpt-${EXEC_ID}`;
+      const rActRpt = await rest('/actividades', {
         method: 'POST',
         headers: { 'Prefer': 'return=minimal' },
         body: JSON.stringify({
           cuenta_id:    cuentaId,
           curso_id:     cursoId,
-          id:           movRptId,
-          tipo:         'actividad',
+          id:           actRptId,
           nombre:       `RPT-${EXEC_ID}`,
           fecha:        '2026-08-25',
           monto_total:  MONTO_RPT,
           participantes: aluIds.slice(0, 2),
+          obs:          null,
         }),
       }, jwt);
-      if (rMovRpt.status !== 201 && rMovRpt.status !== 204)
-        throw new Error(`Crear movimiento RPT: HTTP ${rMovRpt.status} ${JSON.stringify(rMovRpt.body)}`);
-      console.log(`  [rpt] movimiento actividad creado: ${movRptId}, monto=${MONTO_RPT}, mes=${MES_RPT}`);
+      if (rActRpt.status !== 201 && rActRpt.status !== 204)
+        throw new Error(`Crear actividad RPT: HTTP ${rActRpt.status} ${JSON.stringify(rActRpt.body)}`);
+      console.log(`  [rpt] actividad RPT creada: ${actRptId}, monto=${MONTO_RPT}, mes=${MES_RPT}`);
 
       // Recargar la app (patrón E6: 'load' + _v9CuentaId + seleccionarCurso)
       await page.reload({ waitUntil: 'load', timeout: TIMEOUT_LARGO });
@@ -876,17 +890,19 @@ async function navegar(page, ruta, waitSelector) {
           : 'membresía no creada en setup (ver advertencia)';
         console.log(`  [vis] ${memInfo}`);
 
-        // Buscar la fila RPT con ID conocido — HTTP 200 + al menos 1 fila demuestra acceso real
-        const movRptIdVis = `mov-e7ui-rpt-${EXEC_ID}`;
+        // Buscar la actividad RPT con ID conocido — HTTP 200 + al menos 1 fila demuestra acceso real
+        // drawReporteCharts() usa DB.actividades, así que el fixture RPT está en esa tabla
+        if (!actRptId)
+          throw new Error('actRptId no disponible — el fixture RPT no se creó correctamente');
         const rSelect = await rest(
-          `/fondo_movimientos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&curso_id=eq.${encodeURIComponent(cursoId)}&id=eq.${encodeURIComponent(movRptIdVis)}&select=id`,
+          `/actividades?cuenta_id=eq.${encodeURIComponent(cuentaId)}&curso_id=eq.${encodeURIComponent(cursoId)}&id=eq.${encodeURIComponent(actRptId)}&select=id`,
           {}, jwtC
         );
         if (!rSelect.ok)
           throw new Error(`SELECT como visor falló HTTP ${rSelect.status}: ${JSON.stringify(rSelect.body)}`);
         if (!rSelect.body?.length)
-          throw new Error(`SELECT devolvió 0 filas para id=${movRptIdVis} — RLS negó acceso o RPT no creado`);
-        ok('UI-VIS.1', `Usuario C (visor) leyó fila fixture conocida id=${movRptIdVis} ✓`);
+          throw new Error(`SELECT devolvió 0 filas para id=${actRptId} — RLS negó acceso o RPT no creado`);
+        ok('UI-VIS.1', `Usuario C (visor) leyó actividad fixture conocida id=${actRptId} ✓`);
       } catch (e) { ko('UI-VIS.1', 'SELECT usuario C', e); }
     }
 
