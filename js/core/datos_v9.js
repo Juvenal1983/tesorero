@@ -1623,12 +1623,17 @@ async function crearPlanPagoV9(cuentaId, data, accessToken) {
   if (!Array.isArray(data.abonos) || data.abonos.length < 2)
     throw new Error('[datos_v9] crearPlanPagoV9: se requieren al menos 2 abonos.');
 
+  // p_plan_id: clave de idempotencia generada por el cliente antes del submit.
+  // Si el caller ya tiene un planId (reintento), lo reutiliza; si no, genera uno nuevo.
+  const planId = data.planId || `plan-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
   const result = await _v9Fetch(
     '/rpc/crear_plan_con_abonos',
     {
       method: 'POST',
       body: JSON.stringify({
         p_cuenta_id:   cuentaId,
+        p_plan_id:     planId,          // ← clave de idempotencia
         p_alumno_id:   data.alumnoId,
         p_cuota_id:    data.cuotaId,
         p_periodo:     data.periodo    || null,
