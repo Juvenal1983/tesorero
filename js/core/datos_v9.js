@@ -960,15 +960,19 @@ async function recargarCursoV9(cursoId, accessToken) {
   const cuentaId = (typeof S !== 'undefined' && S._v9CuentaId);
   if (!cuentaId) throw new Error('[v9] recargarCursoV9: S._v9CuentaId no disponible');
 
-  const [alumnosRaw, cuotasRaw, pagosRaw, apoderadosRaw, movimientosRaw, fondoMovsRaw, actividadesRaw, planesPago] = await Promise.all([
+  // Cargar cuotas primero (secuencial) para obtener sus IDs antes de cargar planes.
+  // Esto evita la race condition donde cargarPlanesPagoV9 leía DB.cuotas del curso anterior.
+  const cuotasRaw = await cargarCuotas(cuentaId, cursoId, accessToken);
+  const cuotaIds = cuotasRaw.map(c => c.id);
+
+  const [alumnosRaw, pagosRaw, apoderadosRaw, movimientosRaw, fondoMovsRaw, actividadesRaw, planesPago] = await Promise.all([
     cargarAlumnos(cuentaId, cursoId, accessToken),
-    cargarCuotas(cuentaId, cursoId, accessToken),
     cargarPagos(cuentaId, accessToken),
     cargarTodosApoderadosV9(cuentaId, accessToken),
     cargarMovimientosV9(cuentaId, cursoId, accessToken),
     cargarFondoMovimientosV9(cuentaId, cursoId, accessToken),
     cargarActividadesV9(cuentaId, cursoId, accessToken),
-    cargarPlanesPagoV9(cuentaId, cursoId, accessToken),
+    cargarPlanesPagoV9(cuentaId, cuotaIds, accessToken),
   ]);
 
   // Devolver los datos mapeados sin escribir en DB.
@@ -1563,127 +1567,112 @@ function _mapAbono(row) {
 }
 
 /**
- * Carga todos los planes de pago activos del curso (con sus abonos).
- * Se llama desde recargarCursoV9 y al abrir la vista de pagos.
+ * Carga los planes de pago del curso (con sus abonos), filtrado server-side.
+ *
+ * @param {string}   cuentaId   — UUID de la cuenta
+ * @param {string[]} cuotaIds   — IDs TEXT de las cuotas del curso (recién cargadas)
+ * @param {string}   accessToken
+ * @returns {Promise<object[]>}
+ *
+ * IMPORTANTE: si cuotaIds está vacío devuelve [] sin consultar el servidor.
+ * No hay fallback "devolver todos": un curso sin cuotas no tiene planes.
+ * Esto evita la race condition con DB.cuotas del curso anterior.
  */
-async function cargarPlanesPagoV9(cuentaId, cursoId, accessToken) {
-  // Planes: filtramos por cuota_id usando los ids de cuotas del curso.
-  // La RLS usa _curso_de_cuota() para autorizar, así que el filtro
-  // server-side por curso_id en cuotas es suficiente para aislar.
+async function cargarPlanesPagoV9(cuentaId, cuotaIds, accessToken) {
+  if (!Array.isArray(cuotaIds) || cuotaIds.length === 0) return [];
+
+  // Filtro server-side por cuota_id: solo los planes de este curso.
+  // PostgREST acepta in.(id1,id2,...) para TEXT sin comillas adicionales
+  // siempre que los IDs no contengan comas ni paréntesis (uid() genera UUID hex).
+  const cuotaFilter = cuotaIds.join(',');
   const planes = await _v9Fetch(
-    `/planes_pago?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*&order=creado_en.asc`,
+    `/planes_pago?cuenta_id=eq.${encodeURIComponent(cuentaId)}&cuota_id=in.(${cuotaFilter})&select=*&order=creado_en.asc`,
     {},
     accessToken
   );
   if (!Array.isArray(planes) || planes.length === 0) return [];
 
   // Cargar abonos de todos los planes en una sola petición
-  const planIds = planes.map(p => p.id);
+  const planIds = planes.map(p => p.id).join(',');
   const abonos = await _v9Fetch(
-    `/abonos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&plan_id=in.(${planIds.map(id => encodeURIComponent(id)).join(',')})&select=*&order=fecha.asc`,
+    `/abonos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&plan_id=in.(${planIds})&select=*&order=fecha.asc`,
     {},
     accessToken
   );
   const abonosArr = Array.isArray(abonos) ? abonos : [];
 
-  // Asociar abonos a su plan
-  const mapped = planes.map(p => {
+  return planes.map(p => {
     const plan = _mapPlanPago(p);
     plan.abonos = abonosArr
       .filter(a => a.plan_id === p.id)
       .map(_mapAbono);
     return plan;
   });
-
-  // Filtrar solo los que pertenecen a cuotas de este curso
-  const cuotasIds = new Set(
-    (typeof DB !== 'undefined' ? DB.cuotas || [] : [])
-      .filter(q => q.cursoId === cursoId)
-      .map(q => q.id)
-  );
-  return cuotasIds.size > 0
-    ? mapped.filter(p => cuotasIds.has(p.cuotaId))
-    : mapped; // si DB.cuotas aún no está, devolver todos y filtrar en UI
 }
 
 /**
- * Crea un plan de pago con sus abonos en una transacción:
- *   1. POST /planes_pago → obtiene plan.id
- *   2. POST batch /abonos para todos los abonos del plan
+ * Crea un plan de pago con sus abonos en una única transacción servidor.
+ * Usa la RPC `crear_plan_con_abonos` (SECURITY DEFINER, sql/11_rpc_b2_planes.sql).
  *
- * data = { alumnoId, cuotaId, periodo, montoTotal, abonos: [{monto, fecha}] }
+ * Idempotente: si ya existe un plan activo para (alumno, cuota, periodo),
+ * la RPC devuelve ese plan sin duplicar (campo `idempotente: true`).
+ *
+ * data = { alumnoId, cuotaId, periodo, montoTotal, abonos: [{monto, fecha}], obs? }
  */
 async function crearPlanPagoV9(cuentaId, data, accessToken) {
   if (!Array.isArray(data.abonos) || data.abonos.length < 2)
     throw new Error('[datos_v9] crearPlanPagoV9: se requieren al menos 2 abonos.');
 
-  const planId = data.id || uid();
-  const planPayload = {
-    cuenta_id:   cuentaId,
-    id:          planId,
-    alumno_id:   data.alumnoId,
-    cuota_id:    data.cuotaId,
-    periodo:     data.periodo    || null,
-    monto_total: Math.round(Number(data.montoTotal || 0)),
-    activo:      true,
-    creado_en:   new Date().toISOString().slice(0, 10),
-    obs:         data.obs || null,
-  };
-
-  const planRows = await _v9Fetch(
-    '/planes_pago?select=*',
-    { method: 'POST', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(planPayload) },
+  const result = await _v9Fetch(
+    '/rpc/crear_plan_con_abonos',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        p_cuenta_id:   cuentaId,
+        p_alumno_id:   data.alumnoId,
+        p_cuota_id:    data.cuotaId,
+        p_periodo:     data.periodo    || null,
+        p_monto_total: Math.round(Number(data.montoTotal || 0)),
+        p_abonos:      data.abonos.map(ab => ({
+          monto: Math.round(Number(ab.monto || 0)),
+          fecha: ab.fecha || new Date().toISOString().slice(0, 10),
+        })),
+        p_obs: data.obs || null,
+      }),
+    },
     accessToken
   );
-  if (!Array.isArray(planRows) || planRows.length === 0)
-    throw new Error('[datos_v9] crearPlanPagoV9: INSERT plan_pago sin respuesta — verifica RLS.');
 
-  // Crear todos los abonos del plan
-  const abonosPayload = data.abonos.map((ab, i) => ({
-    cuenta_id:  cuentaId,
-    id:         uid(),
-    alumno_id:  data.alumnoId,
-    cuota_id:   data.cuotaId,
-    plan_id:    planId,
-    monto:      Math.round(Number(ab.monto || 0)),
-    fecha:      ab.fecha || new Date().toISOString().slice(0, 10),
-    pagado:     false,
-    fecha_pago: null,
-    medio:      null,
-    estado:     'registrado',
-    obs:        null,
-    creado_por: data.creadoPor || null,
-  }));
+  if (!result || !result.plan)
+    throw new Error('[datos_v9] crearPlanPagoV9: RPC no devolvió plan.');
 
-  const abonosRows = await _v9Fetch(
-    '/abonos?select=*',
-    { method: 'POST', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(abonosPayload) },
-    accessToken
-  );
-  if (!Array.isArray(abonosRows) || abonosRows.length !== abonosPayload.length)
-    throw new Error(`[datos_v9] crearPlanPagoV9: se esperaban ${abonosPayload.length} abonos, el servidor devolvió ${(abonosRows||[]).length}.`);
-
-  const plan = _mapPlanPago(planRows[0]);
-  plan.abonos = abonosRows.map(_mapAbono);
+  const plan = _mapPlanPago(result.plan);
+  plan.abonos = Array.isArray(result.abonos) ? result.abonos.map(_mapAbono) : [];
   return plan;
 }
 
 /**
  * Actualiza un abono existente (monto y/o fecha de vencimiento).
- * Solo para abonos aún NO pagados.
+ * Solo para abonos aún NO pagados. Usa la RPC `editar_abono` que valida
+ * server-side que pagado=false (el PATCH directo no haría esa verificación).
  */
 async function actualizarAbonoV9(cuentaId, abonoId, data, accessToken) {
-  const patch = {};
-  if (data.monto !== undefined) patch.monto = Math.round(Number(data.monto));
-  if (data.fecha !== undefined) patch.fecha = data.fecha;
-  const rows = await _v9Fetch(
-    `/abonos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(abonoId)}&select=*`,
-    { method: 'PATCH', headers: { 'Prefer': 'return=representation' }, body: JSON.stringify(patch) },
+  const result = await _v9Fetch(
+    '/rpc/editar_abono',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        p_cuenta_id: cuentaId,
+        p_abono_id:  abonoId,
+        p_monto:     data.monto !== undefined ? Math.round(Number(data.monto)) : null,
+        p_fecha:     data.fecha !== undefined ? data.fecha : null,
+      }),
+    },
     accessToken
   );
-  if (!Array.isArray(rows) || rows.length === 0)
-    throw new Error(`[datos_v9] actualizarAbonoV9: abono ${abonoId} no encontrado o sin permiso.`);
-  return _mapAbono(rows[0]);
+  if (!result || !result.abono)
+    throw new Error(`[datos_v9] actualizarAbonoV9: abono ${abonoId} no encontrado o ya pagado.`);
+  return _mapAbono(result.abono);
 }
 
 /**
@@ -1696,33 +1685,33 @@ async function actualizarAbonoV9(cuentaId, abonoId, data, accessToken) {
  * Retorna { abono, planCerrado: boolean }
  */
 async function pagarAbonoV9(cuentaId, planId, abonoId, accessToken) {
-  const fechaPago = new Date().toISOString().slice(0, 10);
+  // RPC atómica: marca abono pagado + cierra plan si todos están pagados.
+  // Idempotente: si el abono ya estaba pagado devuelve estado actual sin error.
+  // G05: NO inserta en tabla `pagos` (los RPCs de saldos cuentan abonos directamente).
+  const result = await _v9Fetch(
+    '/rpc/pagar_abono',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        p_cuenta_id: cuentaId,
+        p_plan_id:   planId,
+        p_abono_id:  abonoId,
+      }),
+    },
+    accessToken
+  );
+  if (!result || result.abono_id === undefined)
+    throw new Error(`[datos_v9] pagarAbonoV9: RPC no devolvió resultado para abono ${abonoId}.`);
 
-  // 1. Marcar el abono como pagado
+  const planCerrado = result.plan_cerrado === true;
+  // Recargar el abono para tener el estado actualizado con fecha_pago
   const abonoRows = await _v9Fetch(
     `/abonos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(abonoId)}&select=*`,
-    {
-      method: 'PATCH',
-      headers: { 'Prefer': 'return=representation' },
-      body: JSON.stringify({ pagado: true, fecha_pago: fechaPago, estado: 'pagado' }),
-    },
+    {},
     accessToken
   );
   if (!Array.isArray(abonoRows) || abonoRows.length === 0)
-    throw new Error(`[datos_v9] pagarAbonoV9: abono ${abonoId} no encontrado o sin permiso.`);
-
-  // 2. Usar la RPC cerrar_plan_si_completo para verificar y cerrar si corresponde.
-  //    Se usa RPC porque planes_update (RLS) solo permite es_dueno, no tesorero.
-  //    La RPC es SECURITY DEFINER y valida acceso + conteo de abonos.
-  const rpcResult = await _v9Fetch(
-    '/rpc/cerrar_plan_si_completo',
-    {
-      method: 'POST',
-      body: JSON.stringify({ p_cuenta_id: cuentaId, p_plan_id: planId }),
-    },
-    accessToken
-  );
-  const planCerrado = rpcResult && rpcResult.cerrado === true;
+    throw new Error(`[datos_v9] pagarAbonoV9: no se pudo recargar abono ${abonoId}.`);
 
   return { abono: _mapAbono(abonoRows[0]), planCerrado };
 }
@@ -1732,53 +1721,54 @@ async function pagarAbonoV9(cuentaId, planId, abonoId, accessToken) {
  * Reactiva el plan si estaba cerrado.
  */
 async function revertirAbonoV9(cuentaId, planId, abonoId, accessToken) {
+  // RPC atómica: marca abono no-pagado + reabre plan si estaba cerrado.
+  // Idempotente: si el abono ya no estaba pagado devuelve estado actual sin error.
+  await _v9Fetch(
+    '/rpc/revertir_abono',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        p_cuenta_id: cuentaId,
+        p_plan_id:   planId,
+        p_abono_id:  abonoId,
+      }),
+    },
+    accessToken
+  );
+  // Recargar el abono para tener el estado actualizado
   const abonoRows = await _v9Fetch(
     `/abonos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(abonoId)}&select=*`,
-    {
-      method: 'PATCH',
-      headers: { 'Prefer': 'return=representation' },
-      body: JSON.stringify({ pagado: false, fecha_pago: null, estado: 'registrado' }),
-    },
+    {},
     accessToken
   );
   if (!Array.isArray(abonoRows) || abonoRows.length === 0)
-    throw new Error(`[datos_v9] revertirAbonoV9: abono ${abonoId} no encontrado.`);
-
-  // Reactivar plan via RPC (planes_update solo permite es_dueno por RLS)
-  await _v9Fetch(
-    '/rpc/reabrir_plan_pago',
-    {
-      method: 'POST',
-      body: JSON.stringify({ p_cuenta_id: cuentaId, p_plan_id: planId }),
-    },
-    accessToken
-  );
+    throw new Error(`[datos_v9] revertirAbonoV9: no se pudo recargar abono ${abonoId}.`);
   return _mapAbono(abonoRows[0]);
 }
 
 /**
- * Elimina un plan de pago y todos sus abonos.
- * Solo se permite si el plan no tiene abonos pagados
- * (el servidor aplica la restricción por FK ON DELETE RESTRICT desde abonos).
- * Para eliminar un plan con abonos pagados primero hay que revertirlos.
+ * Elimina un plan de pago y sus abonos no pagados.
+ * BLOQUEA la eliminación si el plan tiene abonos pagados (dinero recibido).
+ * Usa la RPC `eliminar_plan` (SECURITY DEFINER, sql/11_rpc_b2_planes.sql).
+ *
+ * Lanza error con code 'plan_con_abonos_pagados' si hay abonos pagados.
+ * El tesorero debe primero revertir los abonos pagados antes de eliminar.
  */
 async function eliminarPlanPagoV9(cuentaId, planId, accessToken) {
-  // 1. Eliminar todos los abonos del plan
-  await _v9Fetch(
-    `/abonos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&plan_id=eq.${encodeURIComponent(planId)}`,
-    { method: 'DELETE', headers: { 'Prefer': 'return=minimal' } },
+  const result = await _v9Fetch(
+    '/rpc/eliminar_plan',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        p_cuenta_id: cuentaId,
+        p_plan_id:   planId,
+      }),
+    },
     accessToken
   );
-
-  // 2. Eliminar el plan
-  const rows = await _v9Fetch(
-    `/planes_pago?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(planId)}&select=id`,
-    { method: 'DELETE', headers: { 'Prefer': 'return=representation' } },
-    accessToken
-  );
-  if (!Array.isArray(rows) || rows.length === 0)
+  if (!result || !result.eliminado)
     throw new Error(`[datos_v9] eliminarPlanPagoV9: plan ${planId} no encontrado o sin permiso.`);
-  return rows;
+  return result;
 }
 
 // ─── Config fondo especial (E7) ───────────────────────────────────────────────

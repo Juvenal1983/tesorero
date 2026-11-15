@@ -470,7 +470,8 @@ function pagarAbono(planId, abonoIdx){
 function eliminarPlanPago(planId){
   // B2: implementado en modo relacional v9.
   if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
-    if(!confirm('¿Eliminar este plan de pago? Los abonos ya pagados no se revertirán.')) return;
+    // Advertencia precisa: si hay abonos pagados el servidor rechazará la operación
+    if(!confirm('¿Eliminar este plan de pago?\n\nSolo se puede eliminar si NINGÚN abono ha sido pagado.\nSi hay abonos pagados, primero reviértelos.')) return;
     if(!confirm('Segunda confirmación: ¿Seguro que deseas eliminar el plan?')) return;
     const cuentaId = S._v9CuentaId;
     if(!cuentaId || !_authToken) return alert('Sesión no disponible.');
@@ -481,10 +482,17 @@ function eliminarPlanPago(planId){
         showToast('✅ Plan de pago eliminado');
         go('pagos', S.params);
       })
-      .catch(err => alert('Error al eliminar plan: ' + (err.message||err)));
+      .catch(err => {
+        const msg = err.message || String(err);
+        if (msg.includes('plan_con_abonos_pagados')) {
+          alert('No se puede eliminar: este plan tiene abonos pagados.\nRevierte los pagos antes de eliminar el plan.');
+        } else {
+          alert('Error al eliminar plan: ' + msg);
+        }
+      });
     return;
   }
-  if(!confirm('¿Eliminar este plan de pago? Los abonos ya pagados no se revertirán.')) return;
+  if(!confirm('¿Eliminar este plan de pago? Esta acción no se puede deshacer.')) return;
   if(!confirm('Segunda confirmación: ¿Seguro que deseas eliminar el plan?')) return;
   DB.planesPago = (DB.planesPago||[]).filter(p=>p.id!==planId);
   saveDB();
