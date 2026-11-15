@@ -28,18 +28,26 @@ function getFondoAlumno(alumnoId){
         monto = m.montoIndividual[alumnoId];
       }
     } else if(m.tipo==='rendimiento'){
-      // Solo alumnos con saldo > 0 al momento del rendimiento
+      // Solo alumnos con saldo > 0 al momento del rendimiento.
+      // Orden determinista por id para que el residuo siempre vaya al mismo alumno.
       const alumnos = getAlumnos();
-      const alumnosConSaldo = alumnos.filter(a=>{
-        const {total:s} = getFondoAlumnoHasta(a.id, m.fecha);
-        return s > 0;
-      });
-      if(alumnosConSaldo.find(a=>a.id===alumnoId)){
-        monto = Math.round((m.montoTotal||0) / (alumnosConSaldo.length||1));
+      const alumnosConSaldo = alumnos
+        .filter(a=>{ const {total:s}=getFondoAlumnoHasta(a.id,m.fecha); return s>0; })
+        .sort((a,b)=>a.id.localeCompare(b.id));
+      const idxR = alumnosConSaldo.findIndex(a=>a.id===alumnoId);
+      if(idxR !== -1){
+        const nR   = alumnosConSaldo.length;
+        const baseR = Math.floor((m.montoTotal||0) / nR);
+        monto = (idxR === nR-1) ? (m.montoTotal||0) - baseR*(nR-1) : baseR;
       }
     } else if(m.tipo==='actividad'){
-      if((m.participantes||[]).includes(alumnoId)){
-        monto = Math.round((m.montoTotal||0) / (m.participantes.length||1));
+      // Posición del alumno en m.participantes determina quién absorbe el residuo.
+      const parts = m.participantes || [];
+      const idxA  = parts.indexOf(alumnoId);
+      if(idxA !== -1){
+        const nA    = parts.length;
+        const baseA = Math.floor((m.montoTotal||0) / nA);
+        monto = (idxA === nA-1) ? (m.montoTotal||0) - baseA*(nA-1) : baseA;
       }
     }
     // multa no suma al fondo individual, va al común
@@ -58,8 +66,15 @@ function getFondoAlumnoHasta(alumnoId, fechaLimite){
   movs.forEach(m=>{
     if(m.tipo==='aporte' && m.montoIndividual && m.montoIndividual[alumnoId]){
       total += m.montoIndividual[alumnoId];
-    } else if(m.tipo==='actividad' && (m.participantes||[]).includes(alumnoId)){
-      total += Math.round((m.montoTotal||0)/(m.participantes.length||1));
+    } else if(m.tipo==='actividad'){
+      // Mismo orden determinista que getFondoAlumno para consistencia de residuo.
+      const partsH = m.participantes || [];
+      const idxH   = partsH.indexOf(alumnoId);
+      if(idxH !== -1){
+        const nH    = partsH.length;
+        const baseH = Math.floor((m.montoTotal||0) / nH);
+        total += (idxH === nH-1) ? (m.montoTotal||0) - baseH*(nH-1) : baseH;
+      }
     }
     // rendimientos pasados ya están incluidos
   });
