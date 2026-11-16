@@ -245,29 +245,20 @@ async function teardown() {
   if (errors.length > 0) throw new Error('Teardown incompleto:\n  ' + errors.join('\n  '));
 }
 
-// ─── checkNoPagos: verifica G05 con manejo explícito de errores ──────────────
-// La tabla pagos puede no estar expuesta en el schema REST (404) o tener RLS
-// que devuelva 403. Comportamiento por clase de error:
-//   - 200 []     → correcto: no hay filas (G05 satisfecho)
-//   - 404        → tabla no expuesta en PostgREST; G05 satisfecho por diseño
-//   - 403        → RLS deniega acceso al tesorero; prueba bloqueante (falla)
-//   - red/otro   → error real; falla el test
+// ─── checkNoPagos: verifica G05 ───────────────────────────────────────────────
+// Solo una consulta autorizada y exitosa con cero filas demuestra ausencia.
+// Cualquier otro resultado deja la prueba fallida o bloqueada:
+//   - 200 []     → G05 satisfecho
+//   - 200 [...]  → fallo: se crearon filas inesperadas
+//   - 403        → RLS deniega la consulta; no podemos afirmar ausencia (falla)
+//   - 404        → tabla no encontrada en PostgREST; no podemos afirmar ausencia (falla)
+//   - red/otro   → error de infraestructura; no podemos afirmar ausencia (falla)
+// Si la tabla no fuera accesible con el JWT del tesorero, sería un defecto de
+// configuración que debería corregirse, no silenciarse.
 async function checkNoPagos(alumnoId, cuotaId, label) {
   var url = '/rest/v1/pagos?alumno_id=eq.' + alumnoId + '&cuota_id=eq.' + cuotaId +
             '&cuenta_id=eq.' + CUENTA + '&select=id';
-  var rows;
-  try {
-    rows = await GET(url);
-  } catch (e) {
-    if (e.status === 404) {
-      // Tabla no expuesta en PostgREST → no puede tener filas de este endpoint
-      console.log('    (G05: tabla pagos no expuesta en REST — G05 satisfecho por diseño)');
-      return;
-    }
-    // 403, error de red u otro → el test debe fallar con contexto claro
-    throw new Error(label + ': no se pudo verificar ausencia en pagos (HTTP ' +
-      (e.status || 'red') + '): ' + e.message);
-  }
+  var rows = await GET(url);   // lanza en cualquier HTTP >= 400 o error de red
   assert.strictEqual(rows.length, 0,
     label + ': crear_plan_con_abonos no debe insertar en tabla pagos (G05)');
 }

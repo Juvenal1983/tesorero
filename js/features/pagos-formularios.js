@@ -265,7 +265,10 @@ function modalPlanPago(data){
             <div style="font-size:11px;color:var(--t3)">Vence: ${fmtDate(ab.fecha)}</div>
           </div>
           ${ab.pagado
-            ? `<span class="badge bgg" style="font-size:11px">✅ ${fmtDate(ab.fechaPago)}</span>`
+            ? `<div style="display:flex;gap:4px;align-items:center">
+                <span class="badge bgg" style="font-size:11px">✅ ${fmtDate(ab.fechaPago)}</span>
+                ${planExistente.activo!==false ? `<button class="btn bs" onclick="revertirAbono('${planExistente.id}',${i},'${ab.id}')" style="font-size:11px;padding:3px 7px" title="Revertir pago">↩</button>` : ''}
+              </div>`
             : `<div style="display:flex;gap:4px">
                 <button class="btn bs" onclick="showModal('editAbono',{planId:'${planExistente.id}',idx:${i}})" style="font-size:11px;padding:3px 7px">✏️</button>
                 <button class="btn bp bs" onclick="pagarAbono('${planExistente.id}',${i})" style="font-size:11px;padding:4px 10px">💰 Pagar</button>
@@ -547,6 +550,43 @@ function eliminarPlanPago(planId){
   saveDB();
   closeModal();
   go('pagos', S.params);
+}
+
+
+function revertirAbono(planId, abonoIdx, abonoId){
+  // B2: solo implementado en modo relacional v9.
+  // El botón ↩ solo aparece cuando plan.activo !== false (plan abierto o recién cerrado
+  // con este abono como último — no si ya fue cerrado manualmente).
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
+    const plan = (DB.planesPago||[]).find(p=>p.id===planId);
+    if(!plan) return;
+    const ab = plan.abonos[abonoIdx];
+    if(!ab) return;
+    if(!ab.pagado) return showToast('Este abono no está marcado como pagado.');
+    if(!confirm(`¿Revertir el pago del abono ${abonoIdx+1} (${clp(ab.monto)})?`)) return;
+    const cuentaId = S._v9CuentaId;
+    if(!cuentaId || !_authToken) return alert('Sesión no disponible.');
+    revertirAbonoV9(cuentaId, planId, abonoId, _authToken)
+      .then(abono => {
+        ab.pagado    = false;
+        ab.fechaPago = null;
+        // Si el plan estaba cerrado por completarse, reabrirlo en caché local
+        if (!plan.activo) plan.activo = true;
+        showToast('↩ Pago revertido');
+        showModal('planPago', {aluId:plan.alumnoId, cuotaId:plan.cuotaId, periodo:plan.periodo});
+      })
+      .catch(err => alert('Error al revertir abono: ' + (err.message||err)));
+    return;
+  }
+  // Modo legacy (sin v9): revertir en caché local
+  const plan = (DB.planesPago||[]).find(p=>p.id===planId);
+  if(!plan) return;
+  if(!confirm(`¿Revertir el pago del abono ${abonoIdx+1}?`)) return;
+  plan.abonos[abonoIdx].pagado    = false;
+  plan.abonos[abonoIdx].fechaPago = null;
+  plan.activo = true;
+  saveDB();
+  showModal('planPago', {aluId:plan.alumnoId, cuotaId:plan.cuotaId, periodo:plan.periodo});
 }
 
 
