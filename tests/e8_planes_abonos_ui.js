@@ -14,54 +14,77 @@
  *   - Lanza Chromium headless via Playwright
  *   - Fixtures exclusivos por EXEC_ID, eliminados en finally
  *
- * Variables de entorno requeridas:
- *   STAGING_SUPABASE_URL        — https://rucgmytyxpfowznowxwd.supabase.co
- *   STAGING_SUPABASE_ANON_KEY   — anon key de staging
- *   STAGING_USER_A_EMAIL        — email del tesorero
- *   STAGING_USER_A_PASSWORD     — contraseña del tesorero
+ * Variables de entorno — acepta los mismos nombres que E6/E7 y E8-API:
+ *   STAGING_SUPABASE_URL   o  STAGING_URL        — URL del proyecto de staging
+ *   STAGING_SUPABASE_ANON_KEY o STAGING_KEY       — anon key (solo apikey, sin JWT de usuario)
+ *   STAGING_USER_A_EMAIL   o  STAGING_EMAIL       — email del tesorero
+ *   STAGING_USER_A_PASSWORD o  STAGING_PASS       — contraseña
  *
  * Opcionales:
- *   STAGING_CUENTA_ID           — omitir → autodiscovery post-login
- *   ALU_PIN                     — PIN del alumno de test (default: "1234")
+ *   STAGING_CUENTA_ID  — omitir → autodiscovery post-login
+ *   ALU_PIN            — PIN del alumno de test (default: "1234")
  *
  * Ejecución:
- *   export $(grep -v '^#' .env | xargs) && node tests/e8_planes_abonos_ui.js
+ *   bash/zsh : export $(grep -v '^#' .env | xargs) && node tests/e8_planes_abonos_ui.js
+ *   Windows  : for /f "usebackq tokens=1,* delims==" %A in (`type .env ^| findstr /v "^#"`) do set %A=%B
+ *              node tests\e8_planes_abonos_ui.js
  *
  * NUNCA apuntar a producción (tmjqzaakzhecbldebyeg).
  */
 
 'use strict';
 
-const REQUIRED_ENV = [
-  'STAGING_SUPABASE_URL', 'STAGING_SUPABASE_ANON_KEY',
-  'STAGING_USER_A_EMAIL', 'STAGING_USER_A_PASSWORD',
-];
-const missing = REQUIRED_ENV.filter(k => !process.env[k]);
-if (missing.length) {
-  console.error('❌ Faltan variables de entorno:\n  ' + missing.join('\n  '));
+// ── 1. Cargar .env automáticamente (igual que E8-API) ────────────────────────
+const path  = require('path');
+try { require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') }); } catch(_){}
+
+// ── 2. Resolver variables aceptando todos los alias de E6/E7/E8 ──────────────
+//   Prioridad: nombre largo (STAGING_SUPABASE_*) > nombre corto (STAGING_*)
+const SUPA_URL_RAW =
+  process.env.STAGING_SUPABASE_URL ||
+  process.env.STAGING_URL          || '';
+const ANON_KEY =
+  process.env.STAGING_SUPABASE_ANON_KEY ||
+  process.env.STAGING_KEY               || '';
+const USER_EMAIL =
+  process.env.STAGING_USER_A_EMAIL ||
+  process.env.STAGING_EMAIL        || '';
+const USER_PASS =
+  process.env.STAGING_USER_A_PASSWORD ||
+  process.env.STAGING_PASS            || '';
+const ALU_PIN = process.env.ALU_PIN || '1234';
+
+if (!SUPA_URL_RAW || !ANON_KEY || !USER_EMAIL || !USER_PASS) {
+  console.error('❌ Faltan variables de entorno. Requeridas (cualquier alias):');
+  console.error('   STAGING_SUPABASE_URL / STAGING_URL');
+  console.error('   STAGING_SUPABASE_ANON_KEY / STAGING_KEY');
+  console.error('   STAGING_USER_A_EMAIL / STAGING_EMAIL');
+  console.error('   STAGING_USER_A_PASSWORD / STAGING_PASS');
   process.exit(1);
 }
 
-const SUPA_URL   = process.env.STAGING_SUPABASE_URL.replace(/\/$/, '');
-const ANON_KEY   = process.env.STAGING_SUPABASE_ANON_KEY;
-const USER_EMAIL = process.env.STAGING_USER_A_EMAIL;
-const USER_PASS  = process.env.STAGING_USER_A_PASSWORD;
-const ALU_PIN    = process.env.ALU_PIN || '1234';
+const SUPA_URL = SUPA_URL_RAW.replace(/\/$/, '');
 
-// ── Guard de producción ───────────────────────────────────────────────────────
+// ── 3. Guard de hostname: rechaza producción Y cualquier host no autorizado ───
 const PROD_HOST    = 'tmjqzaakzhecbldebyeg.supabase.co';
 const STAGING_HOST = 'rucgmytyxpfowznowxwd.supabase.co';
 let parsedHost;
 try { parsedHost = new URL(SUPA_URL).hostname; }
-catch (_) { console.error('❌ STAGING_SUPABASE_URL no es una URL válida.'); process.exit(2); }
+catch (_) { console.error('❌ URL de staging no es válida: ' + SUPA_URL_RAW); process.exit(2); }
 if (parsedHost === PROD_HOST) {
   console.error('❌ CRÍTICO: URL apunta a producción. Abortando.'); process.exit(2);
+}
+if (parsedHost !== STAGING_HOST) {
+  console.error(`❌ Hostname no autorizado: ${parsedHost}`);
+  console.error(`   Hostname esperado: ${STAGING_HOST}`);
+  console.error('   Si tu staging tiene otro hostname, edita STAGING_HOST en este script.');
+  process.exit(2);
 }
 
 const http  = require('http');
 const https = require('https');
 const fs    = require('fs');
-const path  = require('path');
+// path ya fue requerido arriba (para dotenv)
 const { chromium } = require('playwright');
 
 // ── EXEC_ID y fixtures exclusivos de este run ─────────────────────────────────
@@ -91,21 +114,31 @@ function ok(label, cond) {
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
+// _fetch base: construye la cabecera definitiva antes de llamar a https.request.
+// opts.authHeader = string  → se usa como Authorization
+// opts.authHeader = null    → cabecera Authorization omitida (llamadas anon)
+// opts.authHeader = undefined → no se sobreescribe el default (Bearer ANON_KEY)
 function _fetch(urlPath, opts = {}) {
   return new Promise((resolve, reject) => {
     const url  = new URL(SUPA_URL + urlPath);
     const body = opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
-    const req  = https.request({
+    // Cabeceras base
+    const hdrs = {
+      'apikey':       ANON_KEY,
+      'Content-Type': 'application/json',
+      'Accept':       'application/json',
+      'Prefer':       opts.prefer !== undefined ? opts.prefer : 'return=representation',
+      ...(opts.headers || {}),
+    };
+    // Authorization solo si se suministra explícitamente (null = omitir)
+    if (opts.authHeader !== null && opts.authHeader !== undefined) {
+      hdrs['Authorization'] = opts.authHeader;
+    }
+    if (body) hdrs['Content-Length'] = String(Buffer.byteLength(body));
+    const req = https.request({
       hostname: url.hostname, path: url.pathname + url.search,
       method: opts.method || 'GET',
-      headers: {
-        'apikey':        ANON_KEY,
-        'Authorization': opts.authHeader || ('Bearer ' + ANON_KEY),
-        'Content-Type':  'application/json',
-        'Accept':        'application/json',
-        'Prefer':        opts.prefer !== undefined ? opts.prefer : 'return=representation',
-        ...(opts.headers || {}),
-      },
+      headers: hdrs,
     }, res => {
       let data = '';
       res.on('data', c => data += c);
@@ -120,11 +153,13 @@ function _fetch(urlPath, opts = {}) {
   });
 }
 
+// Llamada autenticada con JWT del tesorero
 function supaAuth(url, jwt, opts = {}) {
   return _fetch(url, { ...opts, authHeader: 'Bearer ' + jwt });
 }
+// Llamada anon: solo apikey, sin Authorization (igual que rpcAnon en e8_planes_abonos.js)
 function supaAnon(url, opts = {}) {
-  return _fetch(url, { ...opts, authHeader: 'Bearer ' + ANON_KEY });
+  return _fetch(url, { ...opts, authHeader: null });
 }
 function rpcAnon(fn, params) {
   return supaAnon('/rest/v1/rpc/' + fn, {
