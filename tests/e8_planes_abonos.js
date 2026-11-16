@@ -245,6 +245,33 @@ async function teardown() {
   if (errors.length > 0) throw new Error('Teardown incompleto:\n  ' + errors.join('\n  '));
 }
 
+// ─── checkNoPagos: verifica G05 con manejo explícito de errores ──────────────
+// La tabla pagos puede no estar expuesta en el schema REST (404) o tener RLS
+// que devuelva 403. Comportamiento por clase de error:
+//   - 200 []     → correcto: no hay filas (G05 satisfecho)
+//   - 404        → tabla no expuesta en PostgREST; G05 satisfecho por diseño
+//   - 403        → RLS deniega acceso al tesorero; prueba bloqueante (falla)
+//   - red/otro   → error real; falla el test
+async function checkNoPagos(alumnoId, cuotaId, label) {
+  var url = '/rest/v1/pagos?alumno_id=eq.' + alumnoId + '&cuota_id=eq.' + cuotaId +
+            '&cuenta_id=eq.' + CUENTA + '&select=id';
+  var rows;
+  try {
+    rows = await GET(url);
+  } catch (e) {
+    if (e.status === 404) {
+      // Tabla no expuesta en PostgREST → no puede tener filas de este endpoint
+      console.log('    (G05: tabla pagos no expuesta en REST — G05 satisfecho por diseño)');
+      return;
+    }
+    // 403, error de red u otro → el test debe fallar con contexto claro
+    throw new Error(label + ': no se pudo verificar ausencia en pagos (HTTP ' +
+      (e.status || 'red') + '): ' + e.message);
+  }
+  assert.strictEqual(rows.length, 0,
+    label + ': crear_plan_con_abonos no debe insertar en tabla pagos (G05)');
+}
+
 // ─── Resultado ────────────────────────────────────────────────────────────────
 var passed = 0, failed = 0, skipped = 0;
 
@@ -393,8 +420,7 @@ async function testPlan7() {
   assert.strictEqual(r2.plan_cerrado, true);
   var rows = await GET('/rest/v1/planes_pago?id=eq.' + r.plan.id + '&cuenta_id=eq.' + CUENTA + '&select=activo');
   assert.strictEqual(rows[0].activo, false);
-  var pagos = await GET('/rest/v1/pagos?alumno_id=eq.' + ALUMNO_ID + '&cuota_id=eq.' + CUOTA_ID + '&cuenta_id=eq.' + CUENTA).catch(function() { return []; });
-  assert.strictEqual((pagos || []).length, 0, 'G05: no insertar en tabla pagos');
+  await checkNoPagos(ALUMNO_ID, CUOTA_ID, 'PLAN.7');
   // Plan cerrado con abonos pagados: no se puede eliminar_plan. Teardown lo borra directamente.
 }
 
@@ -583,61 +609,104 @@ async function testIso1() {
   assert.strictEqual(rows_b.length, 0, 'ISO.1b: no debe quedar plan huérfano');
 }
 
-// ─── ISO.2 — Rollback mid-write  [PENDIENTE — requiere PostgreSQL local] ──────
+// ─── ISO.2 — Rollback mid-write (PostgreSQL local desechable) ────────────────
+// Esta suite (API sobre staging) no puede inyectar una falla mid-write sin
+// modificar el esquema compartido. ISO.2 se ejecuta en PostgreSQL local
+// usando psql + un trigger de fallo que dispara en el segundo abono.
 //
-// Estado: NO ejecutada. Esta suite (API sobre staging) no puede inyectar una
-// falla controlada después de que crear_plan_con_abonos ya comenzó a insertar
-// filas sin modificar el esquema de producción.
-//
-// La atomicidad transaccional de la función se verifica en PostgreSQL local
-// desechable, usando un trigger de fallo que dispara en el segundo abono.
-// Pasos para reproducirla manualmente:
-//
-//   # 1. Instancia PG efímera
-//   initdb -D /tmp/pg_iso2
-//   pg_ctl start -D /tmp/pg_iso2 -l /tmp/pg_iso2.log
-//   psql -d postgres -c "CREATE DATABASE iso2_test;"
-//
-//   # 2. Aplicar esquema mínimo (tablas + función) en iso2_test
-//   psql -d iso2_test -f sql/00_schema_minimal.sql
-//   psql -d iso2_test -f sql/11_rpc_b2_planes.sql
-//
-//   # 3. Instalar trigger de fallo en el segundo abono
-//   psql -d iso2_test <<'SQL'
-//   CREATE FUNCTION _fault_inject_mid_write() RETURNS trigger LANGUAGE plpgsql AS $$
-//   BEGIN
-//     IF (SELECT count(*) FROM abonos WHERE plan_id = NEW.plan_id) >= 1 THEN
-//       RAISE EXCEPTION 'fault_inject_mid_write';
-//     END IF;
-//     RETURN NEW;
-//   END $$;
-//   CREATE TRIGGER t_fault_inject
-//     BEFORE INSERT ON abonos
-//     FOR EACH ROW EXECUTE FUNCTION _fault_inject_mid_write();
-//   SQL
-//
-//   # 4. Invocar la función con 3 abonos válidos y capturar el error
-//   planId=$(uuidgen)
-//   psql -d iso2_test -c "SELECT crear_plan_con_abonos(
-//     'acct-test', '$planId', 'alu-test', 'cuota-test', 'Marzo 2026', 10000,
-//     '[{\"monto\":3000,\"fecha\":\"2026-03-01\"},
-//       {\"monto\":3000,\"fecha\":\"2026-04-01\"},
-//       {\"monto\":4000,\"fecha\":\"2026-05-01\"}]'::jsonb
-//   );"
-//   # Se espera: ERROR:  fault_inject_mid_write
-//
-//   # 5. Verificar rollback completo
-//   psql -d iso2_test -c \
-//     "SELECT count(*) FROM planes_pago WHERE id = '$planId';"  -- debe ser 0
-//   psql -d iso2_test -c \
-//     "SELECT count(*) FROM abonos WHERE plan_id = '$planId';"  -- debe ser 0
-//
-//   # 6. Limpiar
-//   pg_ctl stop -D /tmp/pg_iso2
-//   rm -rf /tmp/pg_iso2
-//
+// Requiere: psql instalado localmente y la BD iso2_test preparada
+// (scripts: /tmp/iso2_schema.sql + /tmp/iso2_funcs.sql + /tmp/iso2_seed.sql).
+// Si psql no está disponible, la prueba se omite.
 async function testIso2() {
-  throw new SkipError('pendiente — requiere PostgreSQL local con trigger de fallo; ver comentario ISO.2');
+  var { execFile } = require('child_process');
+  var path = require('path');
+
+  // Verificar que psql esté disponible
+  var psqlAvailable = await new Promise(function(resolve) {
+    execFile('which', ['psql'], function(err) { resolve(!err); });
+  });
+  if (!psqlAvailable) {
+    throw new SkipError('psql no disponible en este entorno');
+  }
+
+  // Preparar SQL de prueba inline (no depende de archivos externos)
+  var testSql = [
+    '\\c iso2_test',
+    // Trigger de fallo
+    'CREATE OR REPLACE FUNCTION _fault_inject_mid_write()',
+    'RETURNS trigger LANGUAGE plpgsql AS $$',
+    'DECLARE v_count INT;',
+    'BEGIN',
+    '  SELECT count(*) INTO v_count FROM abonos',
+    '    WHERE plan_id = NEW.plan_id AND cuenta_id = NEW.cuenta_id;',
+    '  IF v_count >= 1 THEN',
+    "    RAISE EXCEPTION 'fault_inject_mid_write'",
+    "      USING HINT = 'fallo controlado en abono ' || (v_count+1)::TEXT;",
+    '  END IF;',
+    '  RETURN NEW;',
+    'END $$;',
+    'CREATE TRIGGER t_fault_inject BEFORE INSERT ON abonos',
+    '  FOR EACH ROW EXECUTE FUNCTION _fault_inject_mid_write();',
+    // Prueba
+    'DO $$',
+    'DECLARE',
+    "  v_cuenta  UUID := 'cccccccc-0000-0000-0000-000000000001';",
+    "  v_plan_id TEXT := 'plan-iso2-' || extract(epoch from now())::INT::TEXT;",
+    '  v_plan_cnt INT; v_abono_cnt INT; v_err TEXT;',
+    'BEGIN',
+    '  BEGIN',
+    '    PERFORM crear_plan_con_abonos(',
+    '      v_cuenta, v_plan_id, \'alu-iso2\', \'cuot-iso2\', \'Marzo 2026\', 9000,',
+    '      \'[{"monto":3000,"fecha":"2026-03-01"},{"monto":3000,"fecha":"2026-04-01"},{"monto":3000,"fecha":"2026-05-01"}]\'::JSONB',
+    '    );',
+    "    RAISE EXCEPTION 'iso2_no_error: trigger no disparo';",
+    '  EXCEPTION WHEN OTHERS THEN',
+    '    v_err := SQLERRM;',
+    "    IF v_err NOT LIKE 'fault_inject_mid_write%' THEN",
+    "      RAISE EXCEPTION 'iso2_wrong_error: %', v_err;",
+    '    END IF;',
+    '  END;',
+    '  SELECT count(*) INTO v_plan_cnt  FROM planes_pago WHERE id = v_plan_id AND cuenta_id = v_cuenta;',
+    '  SELECT count(*) INTO v_abono_cnt FROM abonos       WHERE plan_id = v_plan_id AND cuenta_id = v_cuenta;',
+    '  IF v_plan_cnt <> 0 OR v_abono_cnt <> 0 THEN',
+    "    RAISE EXCEPTION 'iso2_datos_parciales: planes=% abonos=%', v_plan_cnt, v_abono_cnt;",
+    '  END IF;',
+    "  RAISE NOTICE 'ISO.2 OK: rollback completo (planes=%, abonos=%)', v_plan_cnt, v_abono_cnt;",
+    'END $$;',
+    // Limpiar trigger
+    'DROP TRIGGER IF EXISTS t_fault_inject ON abonos;',
+    'DROP FUNCTION IF EXISTS _fault_inject_mid_write();',
+  ].join('\n');
+
+  var tmpFile = require('os').tmpdir() + '/iso2_inline_' + Date.now() + '.sql';
+  require('fs').writeFileSync(tmpFile, testSql);
+
+  var result = await new Promise(function(resolve, reject) {
+    execFile('sudo', ['-u', 'postgres', 'psql', '-v', 'ON_ERROR_STOP=1', '-f', tmpFile],
+      { timeout: 15000 },
+      function(err, stdout, stderr) {
+        require('fs').unlinkSync(tmpFile);
+        resolve({ err: err, stdout: stdout, stderr: stderr });
+      }
+    );
+  });
+
+  var output = (result.stdout || '') + (result.stderr || '');
+
+  if (result.err) {
+    // Extraer el mensaje de error de psql
+    var match = output.match(/ERROR:\s*(.+)/);
+    var msg   = match ? match[1] : (result.err.message || output);
+    if (/iso2_test.*does not exist|no existe|Connection refused/.test(msg)) {
+      throw new SkipError('BD iso2_test no preparada — ejecutar scripts de setup local primero');
+    }
+    throw new Error('ISO.2 falló en PostgreSQL local: ' + msg.trim());
+  }
+
+  assert.ok(
+    /ISO\.2 OK/.test(output),
+    'ISO.2: salida inesperada de psql:\n' + output
+  );
 }
 
 // ─── RLS.1 ────────────────────────────────────────────────────────────────────
@@ -759,11 +828,7 @@ async function testSaldo3() {
     await rpc('pagar_abono', { p_cuenta_id: CUENTA, p_plan_id: r.plan.id, p_abono_id: r.abonos[i].id });
   }
 
-  var pagos = await GET(
-    '/rest/v1/pagos?alumno_id=eq.' + ALUMNO_ID + '&cuota_id=eq.' + CUOTA_ID +
-    '&cuenta_id=eq.' + CUENTA + '&select=id'
-  ).catch(function() { return []; });
-  assert.strictEqual((pagos || []).length, 0, 'G05: completar plan no debe crear registros en pagos');
+  await checkNoPagos(ALUMNO_ID, CUOTA_ID, 'SALDO.3');
 
   var resumen = await rpcAnon('apoderado_cc_resumen_pagos', { p_codigo_cc: CC_CODE });
   var fila    = resumen.find(function(f) { return f.alumno_id === ALUMNO_ID; });
@@ -949,7 +1014,7 @@ async function testPlan17b() {
 
       console.log('\n  [ISO] Atomicidad');
       await run('ISO.1  rechazo pre-write → sin plan huerfano',              testIso1);
-      await run('ISO.2  rollback mid-write → sin datos parciales',           testIso2);
+      await run('ISO.2  rollback mid-write → sin datos parciales [PG local]', testIso2);
 
       console.log('\n  [RLS] Autorizacion');
       await run('RLS.1  cuenta ajena denegada en crear',        testRls1);
