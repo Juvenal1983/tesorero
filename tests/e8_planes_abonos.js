@@ -506,7 +506,7 @@ async function testPlan13b() {
     }
   }
 
-  var planRows = await GET('/rest/v1/planes_pago?id=eq.' + planId + '&cuenta_id=eq.' + CUENTA + '&select=id').catch(function() { return []; });
+  var planRows = await GET('/rest/v1/planes_pago?id=eq.' + planId + '&cuenta_id=eq.' + CUENTA + '&select=id');
   if (planRows && planRows.length > 0) {
     await rpc('revertir_abono', { p_cuenta_id: CUENTA, p_plan_id: planId, p_abono_id: abonoId }).catch(function(){});
     await rpc('eliminar_plan',  { p_cuenta_id: CUENTA, p_plan_id: planId }).catch(function(){});
@@ -537,88 +537,107 @@ async function testPlan14() {
   if (cleanupErrs.length) throw new Error('PLAN.14 cleanup: ' + cleanupErrs.join('; '));
 }
 
+
 // ─── ISO.1 — Rechazo pre-write: no queda plan huérfano ───────────────────────
-// La solicitud falla en Bloque 1 (validación) antes de cualquier INSERT.
-// El test verifica que ese rechazo temprano no deja filas en planes_pago.
+// Bloque 1 (rev 6) rechaza dos clases de fecha inválida antes del primer INSERT:
+//   a) fecha con formato no parseable como DATE
+//   b) fecha ausente del objeto JSON (NULL implícito — IS NULL explícito en rev 6)
+// En ambos casos la función lanza 'abono_fecha_invalida' antes de escribir nada.
 async function testIso1() {
-  var planId = uid('iso1');
+  // a) Fecha con formato inválido
+  var planId_a = uid('iso1a');
   await assert.rejects(
     function() {
       return rpc('crear_plan_con_abonos', planPayload({
-        p_plan_id: planId,
+        p_plan_id: planId_a,
         p_abonos:  [{ monto: 5000, fecha: '2026-03-01' }, { monto: 5000, fecha: 'INVALIDA' }],
       }));
     },
     /abono_fecha_invalida/,
-    'ISO.1: validación pre-write debe lanzar abono_fecha_invalida'
+    'ISO.1a: fecha no parseable debe lanzar abono_fecha_invalida'
   );
-  var rows = await GET('/rest/v1/planes_pago?id=eq.' + planId + '&cuenta_id=eq.' + CUENTA + '&select=id').catch(function() { return []; });
-  assert.strictEqual(rows.length, 0, 'ISO.1: no debe quedar plan huérfano');
+  var rows_a = await GET('/rest/v1/planes_pago?id=eq.' + planId_a + '&cuenta_id=eq.' + CUENTA + '&select=id');
+  assert.strictEqual(rows_a.length, 0, 'ISO.1a: no debe quedar plan huérfano');
+
+  // b) Fecha ausente (campo "fecha" no incluido en el objeto del abono)
+  var planId_b = uid('iso1b');
+  await assert.rejects(
+    function() {
+      return rpc('crear_plan_con_abonos', {
+        p_cuenta_id:   CUENTA,
+        p_plan_id:     planId_b,
+        p_alumno_id:   ALUMNO_ID,
+        p_cuota_id:    CUOTA_ID,
+        p_periodo:     'Marzo 2026',
+        p_monto_total: 10000,
+        p_abonos: [
+          { monto: 5000, fecha: '2026-03-01' },
+          { monto: 5000 },   // campo "fecha" ausente -> NULL
+        ],
+      });
+    },
+    /abono_fecha_invalida/,
+    'ISO.1b: fecha ausente debe lanzar abono_fecha_invalida (rev 6)'
+  );
+  var rows_b = await GET('/rest/v1/planes_pago?id=eq.' + planId_b + '&cuenta_id=eq.' + CUENTA + '&select=id');
+  assert.strictEqual(rows_b.length, 0, 'ISO.1b: no debe quedar plan huérfano');
 }
 
-// ─── ISO.2 — Rollback mid-write: falla tras comenzar las escrituras ───────────
-// El abono con fecha NULL supera PERFORM NULL::DATE (no-op en PL/pgSQL)
-// pero falla al INSERT si abonos.fecha tiene NOT NULL — ese es el camino real.
+// ─── ISO.2 — Rollback mid-write  [PENDIENTE — requiere PostgreSQL local] ──────
 //
-// Escrituras esperadas antes del fallo:
-//   W1: INSERT planes_pago   ← comienza las escrituras
-//   W2: INSERT abono 1       ← escritura parcial
-//   W3: INSERT abono 2       ← escritura parcial
-//   W4: INSERT abono 3 (fecha NULL) → falla → ROLLBACK de W1+W2+W3
+// Estado: NO ejecutada. Esta suite (API sobre staging) no puede inyectar una
+// falla controlada después de que crear_plan_con_abonos ya comenzó a insertar
+// filas sin modificar el esquema de producción.
 //
-// El test verifica que el rollback es completo: ni el plan ni los abonos persisten.
-// Si abonos.fecha acepta NULL (sin restricción), el INSERT tiene éxito y el test
-// pasa reportando que no pudo forzar la falla mid-write.
+// La atomicidad transaccional de la función se verifica en PostgreSQL local
+// desechable, usando un trigger de fallo que dispara en el segundo abono.
+// Pasos para reproducirla manualmente:
+//
+//   # 1. Instancia PG efímera
+//   initdb -D /tmp/pg_iso2
+//   pg_ctl start -D /tmp/pg_iso2 -l /tmp/pg_iso2.log
+//   psql -d postgres -c "CREATE DATABASE iso2_test;"
+//
+//   # 2. Aplicar esquema mínimo (tablas + función) en iso2_test
+//   psql -d iso2_test -f sql/00_schema_minimal.sql
+//   psql -d iso2_test -f sql/11_rpc_b2_planes.sql
+//
+//   # 3. Instalar trigger de fallo en el segundo abono
+//   psql -d iso2_test <<'SQL'
+//   CREATE FUNCTION _fault_inject_mid_write() RETURNS trigger LANGUAGE plpgsql AS $$
+//   BEGIN
+//     IF (SELECT count(*) FROM abonos WHERE plan_id = NEW.plan_id) >= 1 THEN
+//       RAISE EXCEPTION 'fault_inject_mid_write';
+//     END IF;
+//     RETURN NEW;
+//   END $$;
+//   CREATE TRIGGER t_fault_inject
+//     BEFORE INSERT ON abonos
+//     FOR EACH ROW EXECUTE FUNCTION _fault_inject_mid_write();
+//   SQL
+//
+//   # 4. Invocar la función con 3 abonos válidos y capturar el error
+//   planId=$(uuidgen)
+//   psql -d iso2_test -c "SELECT crear_plan_con_abonos(
+//     'acct-test', '$planId', 'alu-test', 'cuota-test', 'Marzo 2026', 10000,
+//     '[{\"monto\":3000,\"fecha\":\"2026-03-01\"},
+//       {\"monto\":3000,\"fecha\":\"2026-04-01\"},
+//       {\"monto\":4000,\"fecha\":\"2026-05-01\"}]'::jsonb
+//   );"
+//   # Se espera: ERROR:  fault_inject_mid_write
+//
+//   # 5. Verificar rollback completo
+//   psql -d iso2_test -c \
+//     "SELECT count(*) FROM planes_pago WHERE id = '$planId';"  -- debe ser 0
+//   psql -d iso2_test -c \
+//     "SELECT count(*) FROM abonos WHERE plan_id = '$planId';"  -- debe ser 0
+//
+//   # 6. Limpiar
+//   pg_ctl stop -D /tmp/pg_iso2
+//   rm -rf /tmp/pg_iso2
+//
 async function testIso2() {
-  var planId = uid('iso2');
-  // 3 abonos que superan TODAS las validaciones de Bloque 1:
-  //  - montos > 0
-  //  - suma = 10000 = p_monto_total
-  //  - fecha del abono 3: NULL → PERFORM NULL::DATE no lanza excepción
-  var payload = {
-    p_cuenta_id:   CUENTA,
-    p_plan_id:     planId,
-    p_alumno_id:   ALUMNO_ID,
-    p_cuota_id:    CUOTA_ID,
-    p_periodo:     'Marzo 2026',
-    p_monto_total: 10000,
-    p_abonos: [
-      { monto: 3000, fecha: '2026-03-01' },
-      { monto: 3000, fecha: '2026-04-01' },
-      { monto: 4000 },                      // sin campo "fecha" → NULL
-    ],
-  };
-
-  var createErr = null;
-  try {
-    await rpc('crear_plan_con_abonos', payload);
-  } catch(e) {
-    createErr = e;
-  }
-
-  if (createErr) {
-    var msg = createErr.message || '';
-    // Si el validador capturó el NULL (pre-write), la prueba sigue siendo válida
-    // para verificar que no hay huérfanos.
-    var planRows = await GET('/rest/v1/planes_pago?id=eq.' + planId + '&cuenta_id=eq.' + CUENTA + '&select=id').catch(function() { return []; });
-    assert.strictEqual(planRows.length, 0,
-      'ISO.2: rollback debe eliminar el plan parcialmente insertado; error original: ' + msg);
-
-    var abonoRows = await GET('/rest/v1/abonos?plan_id=eq.' + planId + '&cuenta_id=eq.' + CUENTA + '&select=id').catch(function() { return []; });
-    assert.strictEqual(abonoRows.length, 0,
-      'ISO.2: rollback debe eliminar abonos parcialmente insertados');
-
-    // Distinguir rollback mid-write de rechazo pre-write
-    if (/abono_fecha_invalida/.test(msg)) {
-      console.log('    (ISO.2: fecha NULL rechazada en validación pre-write — rollback mid-write no alcanzado)');
-    } else {
-      console.log('    (ISO.2: fallo mid-write confirmado — rollback completo)');
-    }
-  } else {
-    // abonos.fecha acepta NULL: plan creado con 3 abonos (dos con fecha, uno sin ella)
-    await rpc('eliminar_plan', { p_cuenta_id: CUENTA, p_plan_id: planId }).catch(function(){});
-    console.log('    (ISO.2: fecha NULL aceptada sin error — rollback mid-write no verificado)');
-  }
+  throw new SkipError('pendiente — requiere PostgreSQL local con trigger de fallo; ver comentario ISO.2');
 }
 
 // ─── RLS.1 ────────────────────────────────────────────────────────────────────

@@ -5,6 +5,9 @@
 -- ⚠️ Ejecutar solo en staging (rucgmytyxpfowznowxwd).
 --    NO ejecutar en producción (tmjqzaakzhecbldebyeg).
 --
+-- Rev 6: validación explícita de fecha NULL/ausente en Bloque 1
+--   • NULL::DATE no lanza excepción en PL/pgSQL; se agrega IF IS NULL
+--     antes del bloque BEGIN/EXCEPTION para rechazar abonos sin fecha.
 -- Rev 5: contrato de _sort_abonos corregido
 --   • _sort_abonos: sort por texto, NO por ::DATE.
 --     Contrato: ordenación pura; no valida fechas.  ISO 8601 (YYYY-MM-DD)
@@ -294,6 +297,11 @@ BEGIN
     IF COALESCE((v_ab->>'monto')::INT, 0) <= 0 THEN
       RAISE EXCEPTION 'abono_monto_invalido'
         USING HINT = format('cada abono debe tener monto > 0; recibido: %s', v_ab->>'monto');
+    END IF;
+    -- NULL::DATE no lanza excepción en PL/pgSQL; validar explícitamente.
+    IF (v_ab->>'fecha') IS NULL THEN
+      RAISE EXCEPTION 'abono_fecha_invalida'
+        USING HINT = 'cada abono debe incluir el campo "fecha"';
     END IF;
     BEGIN
       PERFORM (v_ab->>'fecha')::DATE;
