@@ -1,16 +1,25 @@
 -- ============================================================
 -- El Tesorero — B2: Planes de pago y abonos
--- Archivo: sql/11_rpc_b2_planes.sql  (revisión 3)
+-- Archivo: sql/11_rpc_b2_planes.sql  (revisión 4)
 --
 -- ⚠️ Ejecutar solo en staging (rucgmytyxpfowznowxwd).
 --    NO ejecutar en producción (tmjqzaakzhecbldebyeg).
+--
+-- Rev 4: snapshot inmutable (solicitud_json) + helpers compartidos
+--   • _sort_abonos(JSONB): ordena el arreglo de abonos de forma canónica
+--   • _cmp_solicitud_plan(...): compara parámetros contra el snapshot usando
+--     IS DISTINCT FROM en todos los campos (NULL-safe)
+--   • crear_plan_con_abonos: almacena solicitud_json en el INSERT; los bloques
+--     0 y 6 (re-chequeo post-lock) llaman a _cmp_solicitud_plan en lugar de
+--     comparar contra el estado mutable actual.  Tras un editar_abono, el
+--     snapshot original permanece inalterado y el reintento lo reconoce.
 -- ============================================================
 
 BEGIN;
 
 SET search_path = public;
 
--- Eliminar versiones anteriores
+-- ─── Eliminar versiones anteriores ──────────────────────────────────────────
 DROP FUNCTION IF EXISTS cerrar_plan_si_completo(UUID, UUID);
 DROP FUNCTION IF EXISTS cerrar_plan_si_completo(UUID, TEXT);
 DROP FUNCTION IF EXISTS reabrir_plan_pago(UUID, UUID);
@@ -21,28 +30,141 @@ DROP FUNCTION IF EXISTS pagar_abono(UUID, TEXT, TEXT);
 DROP FUNCTION IF EXISTS revertir_abono(UUID, TEXT, TEXT);
 DROP FUNCTION IF EXISTS editar_abono(UUID, TEXT, INT, TEXT);
 DROP FUNCTION IF EXISTS eliminar_plan(UUID, TEXT);
+DROP FUNCTION IF EXISTS _sort_abonos(JSONB);
+DROP FUNCTION IF EXISTS _cmp_solicitud_plan(JSONB, TEXT, TEXT, TEXT, INT, JSONB);
+
+-- ─── Columna inmutable para el snapshot de creación ─────────────────────────
+-- Idempotente: solo añade la columna si no existe.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name   = 'planes_pago'
+       AND column_name  = 'solicitud_json'
+  ) THEN
+    ALTER TABLE planes_pago ADD COLUMN solicitud_json JSONB;
+  END IF;
+END;
+$$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Helper privado 1: _sort_abonos
+-- Devuelve el arreglo ordenado por (fecha ASC, monto ASC) para comparación
+-- canónica.  IMMUTABLE porque no lee tablas.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION _sort_abonos(p_abonos JSONB)
+RETURNS JSONB
+LANGUAGE sql
+IMMUTABLE STRICT
+SET search_path = public
+AS $$
+  SELECT COALESCE(
+    jsonb_agg(val ORDER BY (val->>'fecha')::DATE, (val->>'monto')::INT),
+    '[]'::JSONB
+  )
+  FROM jsonb_array_elements(p_abonos) val
+$$;
+
+REVOKE ALL ON FUNCTION _sort_abonos(JSONB) FROM PUBLIC;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Helper privado 2: _cmp_solicitud_plan
+-- Compara los parámetros del reintento contra el snapshot inmutable almacenado
+-- en planes_pago.solicitud_json.  Lanza idempotency_conflict si difieren.
+-- Usa IS DISTINCT FROM en todos los campos (NULL-safe).
+-- Recibe p_abonos_sent ya ordenado con _sort_abonos.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION _cmp_solicitud_plan(
+  p_snap        JSONB,
+  p_alumno_id   TEXT,
+  p_cuota_id    TEXT,
+  p_periodo     TEXT,
+  p_monto_total INT,
+  p_abonos_sent JSONB   -- ya ordenado por _sort_abonos
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+DECLARE
+  v_n INT;
+  v_i INT;
+BEGIN
+  IF (p_snap->>'alumno_id') IS DISTINCT FROM p_alumno_id THEN
+    RAISE EXCEPTION 'idempotency_conflict'
+      USING HINT = format('alumno_id almacenado=%s enviado=%s',
+                           p_snap->>'alumno_id', p_alumno_id);
+  END IF;
+
+  IF (p_snap->>'cuota_id') IS DISTINCT FROM p_cuota_id THEN
+    RAISE EXCEPTION 'idempotency_conflict'
+      USING HINT = format('cuota_id almacenado=%s enviado=%s',
+                           p_snap->>'cuota_id', p_cuota_id);
+  END IF;
+
+  IF (p_snap->>'periodo') IS DISTINCT FROM p_periodo THEN
+    RAISE EXCEPTION 'idempotency_conflict'
+      USING HINT = format('periodo almacenado=%s enviado=%s',
+                           p_snap->>'periodo', p_periodo);
+  END IF;
+
+  IF (p_snap->>'monto_total')::INT IS DISTINCT FROM p_monto_total THEN
+    RAISE EXCEPTION 'idempotency_conflict'
+      USING HINT = format('monto_total almacenado=%s enviado=%s',
+                           p_snap->>'monto_total', p_monto_total);
+  END IF;
+
+  v_n := jsonb_array_length(p_snap->'abonos');
+  IF v_n IS DISTINCT FROM jsonb_array_length(p_abonos_sent) THEN
+    RAISE EXCEPTION 'idempotency_conflict'
+      USING HINT = format('n_abonos almacenados=%s enviados=%s',
+                           v_n, jsonb_array_length(p_abonos_sent));
+  END IF;
+
+  FOR v_i IN 0 .. v_n - 1 LOOP
+    IF ((p_snap->'abonos'->v_i->>'monto')::INT)
+         IS DISTINCT FROM ((p_abonos_sent->v_i->>'monto')::INT) THEN
+      RAISE EXCEPTION 'idempotency_conflict'
+        USING HINT = format('abono %s monto almacenado=%s enviado=%s',
+                             v_i + 1,
+                             p_snap->'abonos'->v_i->>'monto',
+                             p_abonos_sent->v_i->>'monto');
+    END IF;
+
+    IF ((p_snap->'abonos'->v_i->>'fecha')::DATE)
+         IS DISTINCT FROM ((p_abonos_sent->v_i->>'fecha')::DATE) THEN
+      RAISE EXCEPTION 'idempotency_conflict'
+        USING HINT = format('abono %s fecha almacenada=%s enviada=%s',
+                             v_i + 1,
+                             p_snap->'abonos'->v_i->>'fecha',
+                             p_abonos_sent->v_i->>'fecha');
+    END IF;
+  END LOOP;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION _cmp_solicitud_plan(JSONB, TEXT, TEXT, TEXT, INT, JSONB) FROM PUBLIC;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 1. crear_plan_con_abonos
 --
 -- Clave de idempotencia explícita: p_plan_id
--- ─── El cliente genera p_plan_id antes de enviar la petición y lo persiste
---     localmente antes de llamar al servidor. En un reintento envía el mismo
---     p_plan_id; la función lo reconoce y devuelve el plan ya creado.
+--   El cliente genera p_plan_id antes de enviar la petición y lo persiste
+--   localmente antes de llamar al servidor.  En un reintento envía el mismo
+--   p_plan_id; la función lo reconoce y devuelve el plan ya creado.
+--
+-- Snapshot inmutable (rev 4):
+--   Al crear el plan se almacena solicitud_json con la identidad original de
+--   la petición (alumno, cuota, periodo, monto_total, abonos ordenados).
+--   Ese snapshot NUNCA se modifica, ni siquiera tras editar_abono.  Los
+--   bloques de idempotencia (0 y post-lock) comparan contra él usando
+--   _cmp_solicitud_plan, no contra el estado mutable actual.
 --
 -- Seguridad (SECURITY DEFINER):
 --   La autorización se comprueba ANTES de devolver cualquier dato,
 --   incluso en la ruta de idempotencia temprana (bloque 0) y en el
---   re-chequeo posterior al advisory lock (bloque 6).
---   Flujo: idenfificar plan existente → autorizar → devolver / crear.
---
--- Verificación de identidad completa en reintentos:
---   Compara alumno_id, cuota_id, periodo, monto_total y el calendario de
---   abonos (N abonos con sus montos y fechas) contra lo almacenado. Una
---   discrepancia en cualquiera de esos campos lanza idempotency_conflict.
---   Los abonos almacenados se leen desde la DB (no desde lo que envió el
---   cliente), así que ediciones posteriores a los abonos no alteran la
---   verificación.
+--   re-chequeo posterior al advisory lock (bloque 3).
 --
 -- Serialización concurrente: pg_advisory_xact_lock sobre el hash del
 -- natural key (cuenta+alumno+cuota+periodo).
@@ -71,21 +193,21 @@ DECLARE
   v_curso_id      TEXT;
   v_plan_json     JSONB;
   v_abonos_json   JSONB;
+  v_abonos_sorted JSONB;        -- p_abonos ordenados canónicamente
+  v_snap          JSONB;        -- snapshot inmutable a usar en comparación
   v_existing_id   TEXT;
   v_ab            JSONB;
-  v_ab_stored     JSONB;
   v_abono_id      TEXT;
   v_suma_abonos   INT := 0;
   v_n_abonos      INT;
-  v_n_stored      INT;
-  v_i             INT;
-  v_stored_montos INT[];
-  v_stored_fechas TEXT[];
 BEGIN
+
+  -- Ordenar abonos entrantes (canónico: fecha ASC, monto ASC)
+  v_abonos_sorted := _sort_abonos(p_abonos);
 
   -- ════════════════════════════════════════════════════════════════════════════
   -- BLOQUE 0 — Idempotencia temprana (antes del advisory lock)
-  -- Si p_plan_id ya existe, autorizar PRIMERO y luego devolver.
+  -- Si p_plan_id ya existe: autorizar PRIMERO, luego comparar snapshot.
   -- ════════════════════════════════════════════════════════════════════════════
   SELECT row_to_json(pp.*)::JSONB
     INTO v_plan_json
@@ -95,7 +217,7 @@ BEGIN
 
   IF FOUND THEN
 
-    -- ── 0a. Obtener curso_id del plan para autorizar ───────────────────────
+    -- ── 0a. Obtener curso_id para autorizar ───────────────────────────────
     SELECT cu.curso_id INTO v_curso_id
       FROM cuotas cu
      WHERE cu.id = (v_plan_json->>'cuota_id') AND cu.cuenta_id = p_cuenta_id;
@@ -108,79 +230,41 @@ BEGIN
       RAISE EXCEPTION 'permission_denied';
     END IF;
 
-    -- ── 0c. Verificar identidad completa del reintento ─────────────────────
-    --    Compara contra lo ALMACENADO en la DB (snapshot inmutable).
-    --    Un reintento legítimo envía exactamente los mismos valores.
+    -- ── 0c. Comparar contra snapshot inmutable ────────────────────────────
+    --    solicitud_json se almacenó al crear el plan y no se toca después.
+    --    Si es NULL (plan creado antes de la migración rev 4), reconstruir
+    --    desde el estado actual como mejor esfuerzo.
+    v_snap := v_plan_json->'solicitud_json';
+    IF v_snap IS NULL THEN
+      SELECT jsonb_agg(
+               jsonb_build_object('monto', ab.monto, 'fecha', ab.fecha::TEXT)
+               ORDER BY ab.fecha, ab.monto
+             )
+        INTO v_abonos_json
+        FROM abonos ab
+       WHERE ab.plan_id = p_plan_id AND ab.cuenta_id = p_cuenta_id;
 
-    IF (v_plan_json->>'alumno_id') <> p_alumno_id THEN
-      RAISE EXCEPTION 'idempotency_conflict'
-        USING HINT = format('alumno_id almacenado=%s, enviado=%s',
-                             v_plan_json->>'alumno_id', p_alumno_id);
+      v_snap := jsonb_build_object(
+        'alumno_id',   v_plan_json->>'alumno_id',
+        'cuota_id',    v_plan_json->>'cuota_id',
+        'periodo',     v_plan_json->>'periodo',
+        'monto_total', (v_plan_json->>'monto_total')::INT,
+        'abonos',      COALESCE(v_abonos_json, '[]'::JSONB)
+      );
     END IF;
 
-    IF (v_plan_json->>'cuota_id') <> p_cuota_id THEN
-      RAISE EXCEPTION 'idempotency_conflict'
-        USING HINT = format('cuota_id almacenada=%s, enviada=%s',
-                             v_plan_json->>'cuota_id', p_cuota_id);
-    END IF;
+    PERFORM _cmp_solicitud_plan(
+      v_snap, p_alumno_id, p_cuota_id, p_periodo, p_monto_total, v_abonos_sorted
+    );
 
-    IF (v_plan_json->>'periodo') IS DISTINCT FROM p_periodo THEN
-      RAISE EXCEPTION 'idempotency_conflict'
-        USING HINT = format('periodo almacenado=%s, enviado=%s',
-                             v_plan_json->>'periodo', p_periodo);
-    END IF;
-
-    IF (v_plan_json->>'monto_total')::INT <> p_monto_total THEN
-      RAISE EXCEPTION 'idempotency_conflict'
-        USING HINT = format('monto_total almacenado=%s, enviado=%s',
-                             v_plan_json->>'monto_total', p_monto_total);
-    END IF;
-
-    -- Verificar calendario de abonos: N, montos y fechas (orden ascendente)
-    SELECT jsonb_agg(row_to_json(ab.*)::JSONB ORDER BY ab.fecha, ab.monto)
+    SELECT jsonb_agg(row_to_json(ab.*)::JSONB ORDER BY ab.fecha)
       INTO v_abonos_json
       FROM abonos ab
      WHERE ab.plan_id = p_plan_id AND ab.cuenta_id = p_cuenta_id;
 
-    v_n_stored := COALESCE(jsonb_array_length(v_abonos_json), 0);
-    v_n_abonos := COALESCE(jsonb_array_length(p_abonos), 0);
-
-    IF v_n_stored <> v_n_abonos THEN
-      RAISE EXCEPTION 'idempotency_conflict'
-        USING HINT = format('numero de abonos almacenados=%s, enviados=%s',
-                             v_n_stored, v_n_abonos);
-    END IF;
-
-    -- Comparar cada abono en orden (almacenados ordenados por fecha,monto)
-    -- Reordenar también los enviados para comparación consistente.
-    -- Usamos arrays temporales para iterar sin cursor adicional.
-    SELECT  array_agg((val->>'monto')::INT  ORDER BY (val->>'fecha')::DATE, (val->>'monto')::INT),
-            array_agg((val->>'fecha')       ORDER BY (val->>'fecha')::DATE, (val->>'monto')::INT)
-      INTO v_stored_montos, v_stored_fechas
-      FROM jsonb_array_elements(v_abonos_json) AS val;
-
-    -- Reordenar p_abonos de entrada
-    FOR v_i IN 1 .. v_n_abonos LOOP
-      v_ab := (
-        SELECT val FROM jsonb_array_elements(p_abonos) AS val
-         ORDER BY (val->>'fecha')::DATE, (val->>'monto')::INT
-         LIMIT 1 OFFSET v_i - 1
-      );
-      IF (v_ab->>'monto')::INT <> v_stored_montos[v_i] THEN
-        RAISE EXCEPTION 'idempotency_conflict'
-          USING HINT = format('abono %s: monto almacenado=%s, enviado=%s',
-                               v_i, v_stored_montos[v_i], v_ab->>'monto');
-      END IF;
-      IF (v_ab->>'fecha')::DATE <> v_stored_fechas[v_i]::DATE THEN
-        RAISE EXCEPTION 'idempotency_conflict'
-          USING HINT = format('abono %s: fecha almacenada=%s, enviada=%s',
-                               v_i, v_stored_fechas[v_i], v_ab->>'fecha');
-      END IF;
-    END LOOP;
-
     RETURN jsonb_build_object(
-      'plan',       v_plan_json,
-      'abonos',     COALESCE(v_abonos_json, '[]'::JSONB),
+      'plan',        v_plan_json,
+      'abonos',      COALESCE(v_abonos_json, '[]'::JSONB),
       'idempotente', TRUE
     );
   END IF;
@@ -246,14 +330,13 @@ BEGIN
   END IF;
 
   -- ════════════════════════════════════════════════════════════════════════════
-  -- BLOQUE 3 — Advisory lock + re-chequeo completo
+  -- BLOQUE 3 — Advisory lock + re-chequeo completo con snapshot
   -- ════════════════════════════════════════════════════════════════════════════
   PERFORM pg_advisory_xact_lock(
     hashtext(p_cuenta_id::TEXT || '|' || p_alumno_id || '|' || p_cuota_id || '|'
              || COALESCE(p_periodo, ''))
   );
 
-  -- Re-chequeo tras el lock: mismo plan_id (autorizado como en bloque 0)
   SELECT row_to_json(pp.*)::JSONB
     INTO v_plan_json
     FROM planes_pago pp
@@ -269,30 +352,38 @@ BEGIN
       RAISE EXCEPTION 'permission_denied';
     END IF;
 
-    -- Verificar identidad completa (misma lógica que bloque 0)
-    IF (v_plan_json->>'alumno_id') <> p_alumno_id OR
-       (v_plan_json->>'cuota_id')  <> p_cuota_id  OR
-       (v_plan_json->>'periodo')   IS DISTINCT FROM p_periodo OR
-       (v_plan_json->>'monto_total')::INT <> p_monto_total THEN
-      RAISE EXCEPTION 'idempotency_conflict'
-        USING HINT = 'El plan existente no coincide con los parámetros enviados';
+    -- Misma función compartida que bloque 0: snapshot + calendario completo
+    v_snap := v_plan_json->'solicitud_json';
+    IF v_snap IS NULL THEN
+      SELECT jsonb_agg(
+               jsonb_build_object('monto', ab.monto, 'fecha', ab.fecha::TEXT)
+               ORDER BY ab.fecha, ab.monto
+             )
+        INTO v_abonos_json
+        FROM abonos ab
+       WHERE ab.plan_id = p_plan_id AND ab.cuenta_id = p_cuenta_id;
+
+      v_snap := jsonb_build_object(
+        'alumno_id',   v_plan_json->>'alumno_id',
+        'cuota_id',    v_plan_json->>'cuota_id',
+        'periodo',     v_plan_json->>'periodo',
+        'monto_total', (v_plan_json->>'monto_total')::INT,
+        'abonos',      COALESCE(v_abonos_json, '[]'::JSONB)
+      );
     END IF;
 
-    SELECT jsonb_agg(row_to_json(ab.*)::JSONB ORDER BY ab.fecha, ab.monto)
+    PERFORM _cmp_solicitud_plan(
+      v_snap, p_alumno_id, p_cuota_id, p_periodo, p_monto_total, v_abonos_sorted
+    );
+
+    SELECT jsonb_agg(row_to_json(ab.*)::JSONB ORDER BY ab.fecha)
       INTO v_abonos_json
       FROM abonos ab
      WHERE ab.plan_id = p_plan_id AND ab.cuenta_id = p_cuenta_id;
 
-    v_n_stored := COALESCE(jsonb_array_length(v_abonos_json), 0);
-    IF v_n_stored <> jsonb_array_length(p_abonos) THEN
-      RAISE EXCEPTION 'idempotency_conflict'
-        USING HINT = format('numero de abonos: almacenados=%s, enviados=%s',
-                             v_n_stored, jsonb_array_length(p_abonos));
-    END IF;
-
     RETURN jsonb_build_object(
-      'plan',       v_plan_json,
-      'abonos',     COALESCE(v_abonos_json, '[]'::JSONB),
+      'plan',        v_plan_json,
+      'abonos',      COALESCE(v_abonos_json, '[]'::JSONB),
       'idempotente', TRUE
     );
   END IF;
@@ -315,11 +406,24 @@ BEGIN
   END IF;
 
   -- ════════════════════════════════════════════════════════════════════════════
-  -- BLOQUE 5 — Crear plan y abonos
+  -- BLOQUE 5 — Crear plan con snapshot inmutable y sus abonos
   -- ════════════════════════════════════════════════════════════════════════════
-  INSERT INTO planes_pago(id, cuenta_id, alumno_id, cuota_id, periodo, monto_total, activo, creado_en, obs)
-  VALUES (p_plan_id, p_cuenta_id, p_alumno_id, p_cuota_id, p_periodo, p_monto_total,
-          TRUE, CURRENT_DATE, p_obs);
+  v_snap := jsonb_build_object(
+    'alumno_id',   p_alumno_id,
+    'cuota_id',    p_cuota_id,
+    'periodo',     p_periodo,
+    'monto_total', p_monto_total,
+    'abonos',      v_abonos_sorted
+  );
+
+  INSERT INTO planes_pago(
+    id, cuenta_id, alumno_id, cuota_id, periodo, monto_total,
+    activo, creado_en, obs, solicitud_json
+  )
+  VALUES (
+    p_plan_id, p_cuenta_id, p_alumno_id, p_cuota_id, p_periodo, p_monto_total,
+    TRUE, CURRENT_DATE, p_obs, v_snap
+  );
 
   FOR v_ab IN SELECT value FROM jsonb_array_elements(p_abonos) LOOP
     v_abono_id := gen_random_uuid()::TEXT;
@@ -340,8 +444,8 @@ BEGIN
    WHERE ab.plan_id = p_plan_id AND ab.cuenta_id = p_cuenta_id;
 
   RETURN jsonb_build_object(
-    'plan',       v_plan_json,
-    'abonos',     COALESCE(v_abonos_json, '[]'::JSONB),
+    'plan',        v_plan_json,
+    'abonos',      COALESCE(v_abonos_json, '[]'::JSONB),
     'idempotente', FALSE
   );
 END;
@@ -738,8 +842,17 @@ COMMIT;
 --   FROM information_schema.routines
 --  WHERE routine_schema = 'public'
 --    AND routine_name IN (
+--      '_sort_abonos','_cmp_solicitud_plan',
 --      'crear_plan_con_abonos','pagar_abono','revertir_abono',
 --      'editar_abono','eliminar_plan'
 --    )
 --  ORDER BY routine_name;
--- -- Resultado esperado: 5 filas.
+-- -- Resultado esperado: 7 filas.
+--
+-- -- Verificar que columna solicitud_json existe en planes_pago:
+-- SELECT column_name, data_type
+--   FROM information_schema.columns
+--  WHERE table_schema = 'public'
+--    AND table_name   = 'planes_pago'
+--    AND column_name  = 'solicitud_json';
+-- -- Resultado esperado: 1 fila, data_type = 'jsonb'.

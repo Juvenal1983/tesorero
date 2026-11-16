@@ -391,13 +391,33 @@ function guardarPlanPago(alumnoId, cuotaId, periodo, montoTotal){
     let pendingEntry = null;
     try { pendingEntry = JSON.parse(sessionStorage.getItem(pendingKey) || 'null'); } catch(_){}
 
-    // Si hay una entrada pendiente con el mismo payload, reutilizar su planId.
-    // Si el payload cambió (el usuario ajustó montos), generar uno nuevo.
+    // Reglas de persistencia del planId:
+    //  1. Mismo payload → reutilizar planId (reintento legítimo).
+    //  2. Payload distinto + entrada pendiente → pedir confirmación explícita
+    //     antes de descartar.  El plan anterior puede haber llegado al servidor;
+    //     descartarlo sin confirmar podría orphan-arlo.
+    //  3. Sin entrada pendiente → generar ID nuevo directamente.
     const payloadHash = JSON.stringify({ totalAbonos, abonos });
     let planId;
-    if(pendingEntry && pendingEntry.payloadHash === payloadHash){
-      planId = pendingEntry.planId;  // reintento: mismo planId
+    if (pendingEntry && pendingEntry.payloadHash === payloadHash) {
+      // Reintento legítimo: mismo payload → reutilizar planId
+      planId = pendingEntry.planId;
+    } else if (pendingEntry) {
+      // Payload cambió (montos o fechas distintos) y hay una operación incierta.
+      // Pedir confirmación antes de descartar; NO sobrescribir silenciosamente.
+      const descartar = confirm(
+        '⚠️ Hay un envío anterior pendiente de confirmación.\n' +
+        'Los montos o fechas han cambiado respecto al intento anterior.\n\n' +
+        '• Aceptar — Descartar el intento anterior y crear un plan nuevo.\n' +
+        '• Cancelar — Conservar el intento anterior (por si llegó al servidor).'
+      );
+      if (!descartar) return; // Mantener entrada original; no avanzar
+      planId = `plan-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,8)}`;
+      try {
+        sessionStorage.setItem(pendingKey, JSON.stringify({ planId, payloadHash }));
+      } catch(_){}
     } else {
+      // Sin entrada pendiente: generar ID nuevo
       planId = `plan-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,8)}`;
       try {
         sessionStorage.setItem(pendingKey, JSON.stringify({ planId, payloadHash }));
