@@ -267,7 +267,7 @@ function modalPlanPago(data){
           ${ab.pagado
             ? `<div style="display:flex;gap:4px;align-items:center">
                 <span class="badge bgg" style="font-size:11px">✅ ${fmtDate(ab.fechaPago)}</span>
-                ${planExistente.activo!==false ? `<button class="btn bs" onclick="revertirAbono('${planExistente.id}',${i},'${ab.id}')" style="font-size:11px;padding:3px 7px" title="Revertir pago">↩</button>` : ''}
+                <button class="btn bs revertir-abono-btn" data-plan="${planExistente.id}" data-idx="${i}" data-abono="${ab.id}" onclick="revertirAbono('${planExistente.id}',${i},'${ab.id}')" style="font-size:11px;padding:3px 7px" title="Revertir pago">↩</button>
               </div>`
             : `<div style="display:flex;gap:4px">
                 <button class="btn bs" onclick="showModal('editAbono',{planId:'${planExistente.id}',idx:${i}})" style="font-size:11px;padding:3px 7px">✏️</button>
@@ -555,8 +555,8 @@ function eliminarPlanPago(planId){
 
 function revertirAbono(planId, abonoIdx, abonoId){
   // B2: solo implementado en modo relacional v9.
-  // El botón ↩ solo aparece cuando plan.activo !== false (plan abierto o recién cerrado
-  // con este abono como último — no si ya fue cerrado manualmente).
+  // El botón ↩ aparece para cualquier abono pagado, incluso en planes completados
+  // (activo=false). Revertir reabre el plan en la DB vía RPC revertir_abono.
   if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) {
     const plan = (DB.planesPago||[]).find(p=>p.id===planId);
     if(!plan) return;
