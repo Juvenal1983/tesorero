@@ -5,8 +5,13 @@
 -- ⚠️ Ejecutar solo en staging (rucgmytyxpfowznowxwd).
 --    NO ejecutar en producción (tmjqzaakzhecbldebyeg).
 --
+-- Rev 5: contrato de _sort_abonos corregido
+--   • _sort_abonos: sort por texto, NO por ::DATE.
+--     Contrato: ordenación pura; no valida fechas.  ISO 8601 (YYYY-MM-DD)
+--     ordena igual como texto.  La validación de fechas permanece solo en
+--     Bloque 1 (lanza 'abono_fecha_invalida').  El ::DATE anterior lanzaba
+--     SQLSTATE 22007 antes del validador, con mensaje incorrecto.
 -- Rev 4: snapshot inmutable (solicitud_json) + helpers compartidos
---   • _sort_abonos(JSONB): ordena el arreglo de abonos de forma canónica
 --   • _cmp_solicitud_plan(...): compara parámetros contra el snapshot usando
 --     IS DISTINCT FROM en todos los campos (NULL-safe)
 --   • crear_plan_con_abonos: almacena solicitud_json en el INSERT; los bloques
@@ -59,8 +64,10 @@ LANGUAGE sql
 IMMUTABLE STRICT
 SET search_path = public
 AS $$
+  -- Ordena por texto: ISO 8601 (YYYY-MM-DD) produce el mismo orden que ::DATE
+  -- y no lanza 22007 con fechas inválidas (la validación corresponde a Bloque 1).
   SELECT COALESCE(
-    jsonb_agg(val ORDER BY (val->>'fecha')::DATE, (val->>'monto')::INT),
+    jsonb_agg(val ORDER BY val->>'fecha', (val->>'monto')::INT),
     '[]'::JSONB
   )
   FROM jsonb_array_elements(p_abonos) val
