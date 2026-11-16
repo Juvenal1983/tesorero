@@ -228,9 +228,11 @@ async function setup() {
     p_cuenta_id: CUENTA,
     p_curso_id:  CURSO_ID,
   });
-  CC_CODE = typeof codigo === 'string' ? codigo : (codigo && codigo.codigo_compartido);
+  // apoderado_cc_generar devuelve { codigo_cc: '...' }
+  CC_CODE = (codigo && codigo.codigo_cc) ||
+            (typeof codigo === 'string' ? codigo : null);
   if (!CC_CODE) {
-    throw new Error('apoderado_cc_generar no devolvió código CC: ' + JSON.stringify(codigo));
+    throw new Error('apoderado_cc_generar no devolvió codigo_cc: ' + JSON.stringify(codigo));
   }
 
   console.log('  setup: CURSO=' + CURSO_ID + ' ALUMNO=' + ALUMNO_ID + ' CUOTA=' + CUOTA_ID + ' CC=' + CC_CODE);
