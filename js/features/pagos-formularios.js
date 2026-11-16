@@ -156,8 +156,11 @@ function getPlanesPago(){
 }
 
 function getPlanPago(alumnoId, cuotaId, periodo){
+  // B2-fix: incluye planes completados (activo=false) para permitir consultar
+  // y revertir abonos desde la UI aunque el plan ya esté cerrado.
+  // La vista de pagos muestra "📅 N/M" también para planes cerrados.
   return (DB.planesPago||[]).find(p=>
-    p.alumnoId===alumnoId && p.cuotaId===cuotaId && p.periodo===periodo && p.activo
+    p.alumnoId===alumnoId && p.cuotaId===cuotaId && p.periodo===periodo
   );
 }
 
@@ -288,7 +291,7 @@ function modalPlanPago(data){
     </div>
 
     ${planExistente ? `
-      <div class="alert ag" style="margin-bottom:14px">Plan de pago activo — ${planExistente.abonos.filter(a=>a.pagado).length} de ${planExistente.abonos.length} abonos pagados</div>
+      <div class="alert ${planExistente.activo===false?'aw':'ag'}" style="margin-bottom:14px">${planExistente.activo===false?'Plan completado ✅':'Plan de pago activo'} — ${planExistente.abonos.filter(a=>a.pagado).length} de ${planExistente.abonos.length} abonos pagados</div>
       ${abonosHtml}
       <div style="display:flex;gap:8px;margin-top:14px;justify-content:space-between;flex-wrap:wrap">
         <button class="btn bd bs" onclick="eliminarPlanPago('${planExistente.id}')">🗑 Eliminar plan</button>
