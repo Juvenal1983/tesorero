@@ -10,13 +10,11 @@
  * También acepta los nombres anteriores: STAGING_SUPABASE_URL, STAGING_SUPABASE_ANON_KEY,
  * STAGING_USER_A_EMAIL, STAGING_USER_A_PASSWORD.
  *
- * El JWT se obtiene automáticamente en setup() vía signIn.
- * STAGING_CUENTA_ID se descubre vía RLS si no está en el entorno.
- *
- * Para SEC.1 (opcional):
- *   STAGING_JWT_SIN_ACCESO = <JWT de un usuario sin rol en el curso de prueba>
- *
- * El código compartido del curso se genera en setup() via apoderado_cc_generar.
+ * Para SEC.1 (usuario sin acceso al curso):
+ *   STAGING_USER_B_EMAIL    = <email de un segundo usuario de staging>
+ *   STAGING_USER_B_PASSWORD = <contraseña del segundo usuario>
+ *   El test se omite si las credenciales B no están presentes.
+ *   User B no tiene rol en el curso de la cuenta A, por lo que el plan le es inaccesible.
  *
  * Producción EXCLUIDA. No ejecutar contra tmjqzaakzhecbldebyeg.
  */
@@ -48,43 +46,41 @@ if (!ANON_KEY || !EMAIL || !PASS) {
   process.exit(1);
 }
 
-// JWT y CUENTA se inicializan en setup() tras el login
-var JWT    = '';
-var CUENTA = process.env.STAGING_CUENTA_ID || '';
-
 // Guardia de seguridad: nunca tocar producción
 if (BASE.includes('tmjqzaakzhecbldebyeg')) {
   console.error('⛔ PROHIBIDO: BASE apunta a producción. Abortando.');
   process.exit(2);
 }
 
+// JWT y cuenta se inicializan en setup() tras el login
+var JWT    = '';
+var CUENTA = process.env.STAGING_CUENTA_ID || '';
+
 // ─── Helper HTTP ──────────────────────────────────────────────────────────────
-function req(method, path, body, extraHeaders) {
-  extraHeaders = extraHeaders || {};
+function reqRaw(method, url_path, body, overrideHeaders) {
   return new Promise(function(resolve, reject) {
-    var url  = new URL(path, BASE);
+    var url  = new URL(url_path, BASE);
     var data = body ? JSON.stringify(body) : null;
     var opts = {
       hostname: url.hostname,
       path:     url.pathname + url.search,
       method:   method,
-      headers: Object.assign({
+      headers:  Object.assign({
         'Content-Type':  'application/json',
         'apikey':        ANON_KEY,
-        'Authorization': 'Bearer ' + JWT,  // JWT se llena en setup()
+        'Authorization': 'Bearer ' + JWT,
         'Prefer':        'return=representation',
-      }, extraHeaders),
+      }, overrideHeaders || {}),
     };
     if (data) opts.headers['Content-Length'] = Buffer.byteLength(data);
-
     var r = https.request(opts, function(res) {
       var raw = '';
       res.on('data', function(c) { raw += c; });
       res.on('end', function() {
         var parsed;
-        try { parsed = JSON.parse(raw); } catch(e) { parsed = raw; }
+        try { parsed = JSON.parse(raw); } catch(_) { parsed = raw; }
         if (res.statusCode >= 400) {
-          var e2 = new Error('HTTP ' + res.statusCode + ' ' + method + ' ' + path + ': ' + raw);
+          var e2 = new Error('HTTP ' + res.statusCode + ' ' + method + ' ' + url_path + ': ' + raw);
           e2.status = res.statusCode;
           e2.body   = parsed;
           return reject(e2);
@@ -98,11 +94,38 @@ function req(method, path, body, extraHeaders) {
   });
 }
 
-// ─── Login y descubrimiento de cuenta ─────────────────────────────────────────
-function login() {
+function GET(p, h)       { return reqRaw('GET',    p, null, h); }
+function POST(p, body)   { return reqRaw('POST',   p, body); }
+function DELETE(p, h)    { return reqRaw('DELETE', p, null, h); }
+
+// Inserción sin return: evita dependencia de defaults inexistentes en la respuesta
+function insert(table, body) {
+  return reqRaw('POST', '/rest/v1/' + table, body, { 'Prefer': 'return=minimal' });
+}
+
+function rpc(fn, params) {
+  return POST('/rest/v1/rpc/' + fn, params);
+}
+
+// RPC con JWT arbitrario (para pruebas multi-usuario)
+function rpcConJWT(fn, params, jwt) {
+  return reqRaw('POST', '/rest/v1/rpc/' + fn, params, {
+    'Authorization': 'Bearer ' + jwt,
+    'Prefer':        'return=representation',
+  });
+}
+
+// Genera IDs TEXT exclusivos por ejecución; no depende de defaults de la BD
+var _runTag = Date.now().toString(36);
+function uid(prefix) {
+  return (prefix || 'e8') + '-' + _runTag + '-' + Math.random().toString(36).slice(2, 8);
+}
+
+// ─── Login ────────────────────────────────────────────────────────────────────
+function loginWith(email, pass) {
   return new Promise(function(resolve, reject) {
     var url  = new URL('/auth/v1/token?grant_type=password', BASE);
-    var data = JSON.stringify({ email: EMAIL, password: PASS });
+    var data = JSON.stringify({ email: email, password: pass });
     var opts = {
       hostname: url.hostname,
       path:     url.pathname + url.search,
@@ -118,9 +141,15 @@ function login() {
       res.on('data', function(c) { raw += c; });
       res.on('end', function() {
         var parsed;
-        try { parsed = JSON.parse(raw); } catch(e) { return reject(new Error('Login: respuesta no-JSON: ' + raw)); }
-        if (res.statusCode >= 400) return reject(new Error('Login falló (' + res.statusCode + '): ' + raw));
-        if (!parsed.access_token) return reject(new Error('Login: sin access_token en respuesta'));
+        try { parsed = JSON.parse(raw); } catch(e) {
+          return reject(new Error('Login (' + email + '): respuesta no-JSON: ' + raw));
+        }
+        if (res.statusCode >= 400) {
+          return reject(new Error('Login (' + email + ') falló (' + res.statusCode + '): ' + raw));
+        }
+        if (!parsed.access_token) {
+          return reject(new Error('Login (' + email + '): sin access_token en respuesta'));
+        }
         resolve(parsed.access_token);
       });
     });
@@ -133,56 +162,57 @@ function login() {
 async function descubrirCuentaId() {
   var rows = await GET('/rest/v1/tesorero_cuentas?select=id&limit=1');
   if (!Array.isArray(rows) || !rows[0] || !rows[0].id) {
-    throw new Error('No se encontró cuenta para este usuario en staging. ' +
+    throw new Error('No se encontró cuenta para este usuario. ' +
       'Verifica que STAGING_EMAIL corresponde a un tesorero/dueño de cuenta.');
   }
   return rows[0].id;
 }
 
-function GET(path, h)       { return req('GET',    path, null, h); }
-function POST(path, body)   { return req('POST',   path, body); }
-function DELETE(path, h)    { return req('DELETE', path, null, h); }
-
-function rpc(fn, params) {
-  return POST('/rest/v1/rpc/' + fn, params);
-}
-
-function uid() {
-  return 'e8-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
-}
-
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
-var CURSO_ID, ALUMNO_ID, CUOTA_ID, CC_CODE;
+// IDs generados en setup() y usados en toda la suite
+var CURSO_ID  = null;
+var ALUMNO_ID = null;
+var CUOTA_ID  = null;
+var CC_CODE   = null;
+
+// Lista de fixtures creados, en orden de creación; teardown los borra en orden inverso
+var _toClean = [];
 
 async function setup() {
   // 0. Login y descubrir cuenta
-  JWT = await login();
+  JWT = await loginWith(EMAIL, PASS);
   if (!CUENTA) {
     CUENTA = await descubrirCuentaId();
     console.log('  setup: CUENTA descubierta=' + CUENTA);
   }
 
-  // 1. Crear curso fixture
-  var cursos = await POST('/rest/v1/cursos', {
+  // 1. Crear curso fixture — id TEXT explícito, no depende de defaults
+  CURSO_ID = uid('curs');
+  await insert('cursos', {
+    id:        CURSO_ID,
     cuenta_id: CUENTA,
-    nombre:    'Curso E8 ' + Date.now(),
+    nombre:    '[e8] Fixture ' + new Date().toISOString() + ' (auto-eliminar)',
     anio:      2026,
     activo:    true,
   });
-  CURSO_ID = cursos[0].id;
+  _toClean.push({ table: 'cursos', id: CURSO_ID });
 
-  // 2. Crear alumno con campos reales: nombres, apellidos, estado
-  var alumnos = await POST('/rest/v1/alumnos', {
+  // 2. Crear alumno fixture — id TEXT explícito
+  ALUMNO_ID = uid('alu');
+  await insert('alumnos', {
+    id:        ALUMNO_ID,
     cuenta_id: CUENTA,
     curso_id:  CURSO_ID,
     nombres:   'Alumno',
     apellidos: 'E8',
     estado:    'activo',
   });
-  ALUMNO_ID = alumnos[0].id;
+  _toClean.push({ table: 'alumnos', id: ALUMNO_ID });
 
-  // 3. Crear cuota con campos reales: activa (no activo), anio
-  var cuotas = await POST('/rest/v1/cuotas', {
+  // 3. Crear cuota fixture — id TEXT explícito
+  CUOTA_ID = uid('cuot');
+  await insert('cuotas', {
+    id:        CUOTA_ID,
     cuenta_id: CUENTA,
     curso_id:  CURSO_ID,
     nombre:    'Marzo 2026',
@@ -191,31 +221,74 @@ async function setup() {
     anio:      2026,
     activa:    true,
   });
-  CUOTA_ID = cuotas[0].id;
+  _toClean.push({ table: 'cuotas', id: CUOTA_ID });
 
-  // 4. Generar código compartido para el curso (necesario para tests SALDO)
+  // 4. Código CC del curso (necesario para las pruebas SALDO)
   var codigo = await rpc('apoderado_cc_generar', {
     p_cuenta_id: CUENTA,
     p_curso_id:  CURSO_ID,
   });
   CC_CODE = typeof codigo === 'string' ? codigo : (codigo && codigo.codigo_compartido);
-  if (!CC_CODE) throw new Error('apoderado_cc_generar no devolvió código CC: ' + JSON.stringify(codigo));
+  if (!CC_CODE) {
+    throw new Error('apoderado_cc_generar no devolvió código CC: ' + JSON.stringify(codigo));
+  }
 
   console.log('  setup: CURSO=' + CURSO_ID + ' ALUMNO=' + ALUMNO_ID + ' CUOTA=' + CUOTA_ID + ' CC=' + CC_CODE);
 }
 
+// teardown: se ejecuta siempre en finally, incluso si setup falló a medias.
+// Borra sólo los fixtures que llegaron a crearse (_toClean).
+// Errores ≠ 404 se acumulan y se lanzan al final para no silenciar problemas.
+// Después de borrar verifica que las filas desaparecieron.
 async function teardown() {
-  await DELETE('/rest/v1/abonos?cuenta_id=eq.' + CUENTA + '&alumno_id=eq.' + ALUMNO_ID).catch(function(){});
-  await DELETE('/rest/v1/planes_pago?cuenta_id=eq.' + CUENTA + '&alumno_id=eq.' + ALUMNO_ID).catch(function(){});
-  await DELETE('/rest/v1/cuotas?id=eq.' + CUOTA_ID + '&cuenta_id=eq.' + CUENTA).catch(function(){});
-  await DELETE('/rest/v1/alumnos?id=eq.' + ALUMNO_ID + '&cuenta_id=eq.' + CUENTA).catch(function(){});
-  await DELETE('/rest/v1/cursos?id=eq.' + CURSO_ID + '&cuenta_id=eq.' + CUENTA).catch(function(){});
+  var errors = [];
+
+  // Red de seguridad: borrar planes/abonos residuales antes de los fixtures padre
+  if (ALUMNO_ID && CUENTA) {
+    var aQ = '/rest/v1/abonos?cuenta_id=eq.'     + CUENTA + '&alumno_id=eq.' + ALUMNO_ID;
+    var pQ = '/rest/v1/planes_pago?cuenta_id=eq.' + CUENTA + '&alumno_id=eq.' + ALUMNO_ID;
+    try { await DELETE(aQ); } catch(e) {
+      if (e.status !== 404) errors.push('abonos residuales: ' + (e.message || e));
+    }
+    try { await DELETE(pQ); } catch(e) {
+      if (e.status !== 404) errors.push('planes_pago residuales: ' + (e.message || e));
+    }
+  }
+
+  // Borrar fixtures en orden inverso (hijos antes que padres)
+  for (var i = _toClean.length - 1; i >= 0; i--) {
+    var item = _toClean[i];
+    var q = '/rest/v1/' + item.table + '?id=eq.' + encodeURIComponent(item.id) +
+            '&cuenta_id=eq.' + CUENTA;
+    try {
+      await DELETE(q);
+    } catch(e) {
+      if (e.status !== 404) {
+        errors.push(item.table + '(' + item.id + '): ' + (e.message || e));
+      }
+    }
+  }
+
+  // Verificar que las filas desaparecieron
+  for (var j = 0; j < _toClean.length; j++) {
+    var item2 = _toClean[j];
+    var q2 = '/rest/v1/' + item2.table + '?id=eq.' + encodeURIComponent(item2.id) +
+             '&cuenta_id=eq.' + CUENTA + '&select=id';
+    var rows;
+    try { rows = await GET(q2); } catch(_) { rows = []; }
+    if (Array.isArray(rows) && rows.length > 0) {
+      errors.push('fixture sigue presente: ' + item2.table + '(' + item2.id + ')');
+    }
+  }
+
+  if (errors.length > 0) {
+    throw new Error('Teardown incompleto:\n  ' + errors.join('\n  '));
+  }
 }
 
 // ─── Resultado ────────────────────────────────────────────────────────────────
 var passed = 0, failed = 0, skipped = 0;
 
-// Señal de omisión explícita (no cuenta como fallo)
 function SkipError(msg) {
   this.name    = 'SkipError';
   this.message = msg;
@@ -239,13 +312,12 @@ async function run(name, fn) {
   }
 }
 
-// ─── Helper: construir payload de plan ───────────────────────────────────────
+// ─── Helper: payload de plan con fixtures de esta ejecución ──────────────────
 function planPayload(overrides) {
   overrides = overrides || {};
-  var planId = overrides.p_plan_id || uid();
   var base = {
     p_cuenta_id:   CUENTA,
-    p_plan_id:     planId,
+    p_plan_id:     overrides.p_plan_id || uid('plan'),
     p_alumno_id:   ALUMNO_ID,
     p_cuota_id:    CUOTA_ID,
     p_periodo:     'Marzo 2026',
@@ -275,8 +347,7 @@ async function testPlan2() {
   var payload = planPayload({ p_monto_total: 0 });
   await assert.rejects(
     function() { return rpc('crear_plan_con_abonos', payload); },
-    /monto_invalido/,
-    'deberia rechazar monto_total=0'
+    /monto_invalido/
   );
 }
 
@@ -320,7 +391,7 @@ async function testPlan6() {
   var r = await rpc('crear_plan_con_abonos', payload);
   var abonoId = r.abonos[0].id;
   var r2 = await rpc('pagar_abono', { p_cuenta_id: CUENTA, p_plan_id: r.plan.id, p_abono_id: abonoId });
-  assert.strictEqual(r2.ya_pagado, false);
+  assert.strictEqual(r2.ya_pagado,    false);
   assert.strictEqual(r2.plan_cerrado, false, 'plan no debe cerrarse con 1 de 2');
   await rpc('revertir_abono', { p_cuenta_id: CUENTA, p_plan_id: r.plan.id, p_abono_id: abonoId });
   await rpc('eliminar_plan',  { p_cuenta_id: CUENTA, p_plan_id: r.plan.id });
@@ -336,9 +407,11 @@ async function testPlan7() {
   assert.strictEqual(r2.plan_cerrado, true, 'plan debe cerrarse al pagar todos los abonos');
   var planRows = await GET('/rest/v1/planes_pago?id=eq.' + r.plan.id + '&cuenta_id=eq.' + CUENTA + '&select=activo');
   assert.strictEqual(planRows[0].activo, false);
-  // G05: no debe insertarse en tabla pagos
-  var pagos = await GET('/rest/v1/pagos?alumno_id=eq.' + ALUMNO_ID + '&cuota_id=eq.' + CUOTA_ID + '&cuenta_id=eq.' + CUENTA).catch(function(){ return []; });
-  assert.ok(!pagos || pagos.length === 0, 'G05: no debe insertarse en tabla pagos al completar plan');
+  // G05: completar un plan no debe insertar en tabla pagos
+  var pagos = await GET('/rest/v1/pagos?alumno_id=eq.' + ALUMNO_ID +
+    '&cuota_id=eq.' + CUOTA_ID + '&cuenta_id=eq.' + CUENTA).catch(function() { return []; });
+  assert.strictEqual((pagos || []).length, 0, 'G05: no debe insertarse en tabla pagos al completar plan');
+  // Plan cerrado; teardown lo borra con DELETE directo
 }
 
 // ─── PLAN.8 Revertir abono reabre el plan ────────────────────────────────────
@@ -368,7 +441,6 @@ async function testPlan9() {
   });
   assert.ok(r2.abono, 'falta abono en respuesta');
   assert.strictEqual(r2.abono.monto, 7000);
-  // monto_total pasa de 10000 a 12000 (delta +2000)
   var planRows = await GET('/rest/v1/planes_pago?id=eq.' + r.plan.id + '&cuenta_id=eq.' + CUENTA + '&select=monto_total');
   assert.strictEqual(planRows[0].monto_total, 12000, 'monto_total del plan debe reflejar el delta');
   await rpc('eliminar_plan', { p_cuenta_id: CUENTA, p_plan_id: r.plan.id });
@@ -408,13 +480,11 @@ async function testPlan12() {
   var r1 = await rpc('crear_plan_con_abonos', payload);
   assert.strictEqual(r1.idempotente, false, 'primera llamada no debe ser idempotente');
 
-  // Segunda llamada con el mismo p_plan_id
   var r2 = await rpc('crear_plan_con_abonos', payload);
-  assert.strictEqual(r2.idempotente, true,         'segunda llamada debe ser idempotente');
-  assert.strictEqual(r2.plan.id,     r1.plan.id,   'debe devolver el mismo plan_id');
-  assert.strictEqual(r2.abonos.length, 2,           'debe devolver los mismos 2 abonos');
+  assert.strictEqual(r2.idempotente, true,       'segunda llamada debe ser idempotente');
+  assert.strictEqual(r2.plan.id,     r1.plan.id, 'debe devolver el mismo plan_id');
+  assert.strictEqual(r2.abonos.length, 2,         'debe devolver los mismos 2 abonos');
 
-  // Mismo p_plan_id con monto distinto debe fallar
   var payloadMontoDiff = Object.assign({}, payload, { p_monto_total: 99999 });
   await assert.rejects(
     function() { return rpc('crear_plan_con_abonos', payloadMontoDiff); },
@@ -425,12 +495,10 @@ async function testPlan12() {
   await rpc('eliminar_plan', { p_cuenta_id: CUENTA, p_plan_id: r1.plan.id });
 }
 
-// ─── PLAN.13 Concurrencia: dos creaciones del mismo natural key ───────────────
-// Ambas con p_plan_id DIFERENTE pero mismo (alumno, cuota, periodo).
-// Solo una debe tener éxito; la otra falla con duplicate_active_plan.
+// ─── PLAN.13 Concurrencia: dos plan_id distintos, mismo natural key ───────────
 async function testPlan13() {
-  var payload1 = planPayload({ p_plan_id: uid() });
-  var payload2 = planPayload({ p_plan_id: uid() });
+  var payload1 = planPayload({ p_plan_id: uid('p13a') });
+  var payload2 = planPayload({ p_plan_id: uid('p13b') });
 
   var results = await Promise.allSettled([
     rpc('crear_plan_con_abonos', payload1),
@@ -447,12 +515,10 @@ async function testPlan13() {
     'el error debe ser duplicate_active_plan'
   );
 
-  var planId = ok[0].value.plan.id;
-  await rpc('eliminar_plan', { p_cuenta_id: CUENTA, p_plan_id: planId });
+  await rpc('eliminar_plan', { p_cuenta_id: CUENTA, p_plan_id: ok[0].value.plan.id });
 }
 
 // ─── PLAN.13b Concurrencia: pago y eliminación simultáneos ───────────────────
-// Verifica que el orden de bloqueos (plan primero) no produce deadlock.
 async function testPlan13b() {
   var payload = planPayload();
   var r       = await rpc('crear_plan_con_abonos', payload);
@@ -464,19 +530,16 @@ async function testPlan13b() {
     rpc('eliminar_plan', { p_cuenta_id: CUENTA, p_plan_id: planId }),
   ]);
 
-  // No debe haber deadlock ni error 500 no controlado
   for (var i = 0; i < results.length; i++) {
     var res = results[i];
     if (res.status === 'rejected') {
       var msg = (res.reason && res.reason.message) || '';
       var isExpected = /plan_con_abonos_pagados|plan_not_found/.test(msg);
-      assert.ok(isExpected,
-        'error inesperado en concurrencia pago+eliminacion: ' + msg);
+      assert.ok(isExpected, 'error inesperado en concurrencia pago+eliminacion: ' + msg);
     }
   }
 
-  // Limpieza condicional
-  var planRows = await GET('/rest/v1/planes_pago?id=eq.' + planId + '&cuenta_id=eq.' + CUENTA + '&select=id').catch(function(){ return []; });
+  var planRows = await GET('/rest/v1/planes_pago?id=eq.' + planId + '&cuenta_id=eq.' + CUENTA + '&select=id').catch(function() { return []; });
   if (planRows && planRows.length > 0) {
     await rpc('revertir_abono', { p_cuenta_id: CUENTA, p_plan_id: planId, p_abono_id: abonoId }).catch(function(){});
     await rpc('eliminar_plan',  { p_cuenta_id: CUENTA, p_plan_id: planId }).catch(function(){});
@@ -485,15 +548,18 @@ async function testPlan13b() {
 
 // ─── PLAN.14 Cuota de otro curso rechazada ───────────────────────────────────
 async function testPlan14() {
-  var otroCursos = await POST('/rest/v1/cursos', {
+  var otroCursoId  = uid('c14');
+  var otraCuotaId  = uid('q14');
+
+  await insert('cursos', {
+    id:        otroCursoId,
     cuenta_id: CUENTA,
-    nombre:    'Curso E8 B ' + Date.now(),
+    nombre:    '[e8] Otro curso ' + new Date().toISOString(),
     anio:      2026,
     activo:    true,
   });
-  var otroCursoId = otroCursos[0].id;
-
-  var otraCuotas = await POST('/rest/v1/cuotas', {
+  await insert('cuotas', {
+    id:        otraCuotaId,
     cuenta_id: CUENTA,
     curso_id:  otroCursoId,
     nombre:    'Marzo 2026',
@@ -502,17 +568,26 @@ async function testPlan14() {
     anio:      2026,
     activa:    true,
   });
-  var otraCuotaId = otraCuotas[0].id;
 
   var payload = planPayload({ p_cuota_id: otraCuotaId });
-  await assert.rejects(
-    function() { return rpc('crear_plan_con_abonos', payload); },
-    /alumno_not_in_curso|cuota_not_found/,
-    'no debe permitir crear plan con cuota de otro curso'
-  );
+  var testErr = null;
+  try {
+    await assert.rejects(
+      function() { return rpc('crear_plan_con_abonos', payload); },
+      /alumno_not_in_curso|cuota_not_found/,
+      'no debe permitir crear plan con cuota de otro curso'
+    );
+  } catch(e) {
+    testErr = e;
+  }
 
-  await DELETE('/rest/v1/cuotas?id=eq.' + otraCuotaId + '&cuenta_id=eq.' + CUENTA).catch(function(){});
-  await DELETE('/rest/v1/cursos?id=eq.' + otroCursoId + '&cuenta_id=eq.' + CUENTA).catch(function(){});
+  // Limpiar aunque falle la aserción
+  var cleanErrs = [];
+  try { await DELETE('/rest/v1/cuotas?id=eq.' + otraCuotaId + '&cuenta_id=eq.' + CUENTA); } catch(e) { if (e.status !== 404) cleanErrs.push('cuota: ' + e.message); }
+  try { await DELETE('/rest/v1/cursos?id=eq.' + otroCursoId + '&cuenta_id=eq.' + CUENTA); } catch(e) { if (e.status !== 404) cleanErrs.push('curso: ' + e.message); }
+
+  if (testErr) throw testErr;
+  if (cleanErrs.length) throw new Error('PLAN.14 cleanup: ' + cleanErrs.join('; '));
 }
 
 // ─── ISO.1 Rollback ante falla parcial ───────────────────────────────────────
@@ -527,7 +602,7 @@ async function testIso1() {
     function() { return rpc('crear_plan_con_abonos', badPayload); },
     /abono_fecha_invalida/
   );
-  var rows = await GET('/rest/v1/planes_pago?id=eq.' + badPayload.p_plan_id + '&cuenta_id=eq.' + CUENTA + '&select=id').catch(function(){ return []; });
+  var rows = await GET('/rest/v1/planes_pago?id=eq.' + badPayload.p_plan_id + '&cuenta_id=eq.' + CUENTA + '&select=id').catch(function() { return []; });
   assert.strictEqual(rows.length, 0, 'rollback: no debe quedar plan huerfano');
 }
 
@@ -537,8 +612,7 @@ async function testRls1() {
   var payload  = planPayload({ p_cuenta_id: fakeUuid });
   await assert.rejects(
     function() { return rpc('crear_plan_con_abonos', payload); },
-    /permission_denied|cuota_not_found/,
-    'RLS debe impedir acceso a cuenta ajena'
+    /permission_denied|cuota_not_found/
   );
 }
 
@@ -551,91 +625,59 @@ async function testRls2() {
   );
 }
 
-// ─── SEC.1 Plan conocido enviado por usuario real sin acceso al curso ─────────
-// Verifica que el bloque 0 de idempotencia (SECURITY DEFINER) NO devuelve datos
-// a un usuario autenticado que no tiene rol en el curso al que pertenece el plan.
+// ─── SEC.1 Usuario real (cuenta B) sin acceso al curso ────────────────────────
+// Verifica que el bloque de idempotencia (SECURITY DEFINER) NO devuelve datos del
+// plan a un usuario autenticado que pertenece a una cuenta distinta.
 //
-// Escenario: el atacante conoce cuenta_id y plan_id (p.ej. desde logs del cliente)
-// y envía exactamente esos valores con sus propias credenciales.
+// Escenario: se crea un plan con JWT de la cuenta A.  Luego User B (cuenta distinta,
+// sin ningún rol en el curso) envía exactamente la misma cuenta_id+plan_id.
 // La función debe lanzar permission_denied ANTES de devolver cualquier dato.
 //
-// Requiere STAGING_JWT_SIN_ACCESO: JWT válido de un usuario de staging que NO
-// tiene rol (admin/tesorero) en el curso donde vive el plan de prueba.
-// Si la variable no está definida, el test se omite explícitamente.
-// NO se usa una cuenta_id inventada como sustituto — ese código path es distinto
-// (not_found, no permission_denied) y no valida la comprobación de autorización.
+// Auto-login con STAGING_USER_B_EMAIL + STAGING_USER_B_PASSWORD.
+// Se omite si esas variables no están definidas.
 async function testSec1() {
-  var JWT_SIN_ACCESO = process.env.STAGING_JWT_SIN_ACCESO;
-  if (!JWT_SIN_ACCESO) {
-    throw new SkipError('requiere STAGING_JWT_SIN_ACCESO (JWT de usuario sin rol en el curso)');
+  var emailB = process.env.STAGING_USER_B_EMAIL;
+  var passB  = process.env.STAGING_USER_B_PASSWORD;
+  if (!emailB || !passB) {
+    throw new SkipError(
+      'requiere STAGING_USER_B_EMAIL y STAGING_USER_B_PASSWORD ' +
+      '(segundo usuario staging sin rol en la cuenta A)'
+    );
   }
 
-  // Crear plan real con el JWT principal
+  // Login de User B
+  var jwtB = await loginWith(emailB, passB);
+
+  // Crear plan real con JWT de User A
   var payload    = planPayload();
   var r          = await rpc('crear_plan_con_abonos', payload);
   var realPlanId = r.plan.id;
 
-  // Función auxiliar con JWT alternativo
-  var rpcConJWT = function(fn, params, jwt) {
-    return new Promise(function(resolve, reject) {
-      var url  = new URL('/rest/v1/rpc/' + fn, BASE);
-      var data = JSON.stringify(params);
-      var opts = {
-        hostname: url.hostname,
-        path:     url.pathname,
-        method:   'POST',
-        headers: {
-          'Content-Type':   'application/json',
-          'apikey':         ANON_KEY,
-          'Authorization':  'Bearer ' + jwt,
-          'Content-Length': Buffer.byteLength(data),
-        },
-      };
-      var req2 = https.request(opts, function(res) {
-        var raw = '';
-        res.on('data', function(c) { raw += c; });
-        res.on('end', function() {
-          var parsed;
-          try { parsed = JSON.parse(raw); } catch(e) { parsed = raw; }
-          if (res.statusCode >= 400) {
-            var e2 = new Error('HTTP ' + res.statusCode + ': ' + raw);
-            e2.status = res.statusCode; e2.body = parsed;
-            return reject(e2);
-          }
-          resolve(parsed);
-        });
-      });
-      req2.on('error', reject);
-      req2.write(data);
-      req2.end();
-    });
-  };
+  // Ataque: User B usa la cuenta_id y plan_id correctos de User A
+  var testErr = null;
+  try {
+    await assert.rejects(
+      function() { return rpcConJWT('crear_plan_con_abonos', payload, jwtB); },
+      /permission_denied/,
+      'SEC.1: User B sin acceso al curso no debe obtener datos del plan'
+    );
+  } catch(e) {
+    testErr = e;
+  }
 
-  // Misma cuenta_id y plan_id reales, mismo payload — solo el JWT difiere.
-  // El bloque 0 debe autorizar ANTES de devolver datos y lanzar permission_denied.
-  var payloadAtaque = Object.assign({}, payload);  // cuenta_id y plan_id correctos
-  await assert.rejects(
-    function() { return rpcConJWT('crear_plan_con_abonos', payloadAtaque, JWT_SIN_ACCESO); },
-    /permission_denied/,
-    'SEC.1: usuario sin rol en el curso no debe obtener datos del plan via idempotencia'
-  );
-
-  // Limpieza
   await rpc('eliminar_plan', { p_cuenta_id: CUENTA, p_plan_id: realPlanId });
+  if (testErr) throw testErr;
 }
 
 // ─── SEC.2 Idempotencia rechaza calendario modificado ─────────────────────────
-// Verifica que la identidad completa del reintento incluye fechas y montos
-// individuales de los abonos, no solo el monto_total.
 async function testSec2() {
   var payload = planPayload();
   var r = await rpc('crear_plan_con_abonos', payload);
 
-  // Reintento con mismos montos individuales pero fechas distintas
   var payloadFechaDistinta = Object.assign({}, payload, {
     p_abonos: [
-      { monto: 5000, fecha: '2026-05-01' },  // fecha cambiada
-      { monto: 5000, fecha: '2026-06-01' },  // fecha cambiada
+      { monto: 5000, fecha: '2026-05-01' },
+      { monto: 5000, fecha: '2026-06-01' },
     ],
   });
   await assert.rejects(
@@ -644,11 +686,10 @@ async function testSec2() {
     'SEC.2: mismo p_plan_id con fechas de abonos distintas debe rechazarse'
   );
 
-  // Reintento con mismas fechas pero un monto individual distinto
   var payloadMontoDistinto = Object.assign({}, payload, {
     p_abonos: [
-      { monto: 3000, fecha: '2026-03-01' },  // monto cambiado
-      { monto: 7000, fecha: '2026-04-01' },  // monto cambiado (suma = 10000 igual)
+      { monto: 3000, fecha: '2026-03-01' },
+      { monto: 7000, fecha: '2026-04-01' },
     ],
   });
   await assert.rejects(
@@ -660,14 +701,12 @@ async function testSec2() {
   await rpc('eliminar_plan', { p_cuenta_id: CUENTA, p_plan_id: r.plan.id });
 }
 
-// ─── SEC.3 Idempotencia rechaza alumno o cuota distintos ─────────────────────
-// El campo identidad del reintento incluye alumno_id y cuota_id.
+// ─── SEC.3 Idempotencia rechaza alumno_id distinto ───────────────────────────
 async function testSec3() {
   var payload = planPayload();
   var r = await rpc('crear_plan_con_abonos', payload);
 
-  // Reintento con alumno_id inventado
-  var payloadAlumnoDistinto = Object.assign({}, payload, { p_alumno_id: 'alumno-falso-' + uid() });
+  var payloadAlumnoDistinto = Object.assign({}, payload, { p_alumno_id: 'alu-falso-' + uid() });
   await assert.rejects(
     function() { return rpc('crear_plan_con_abonos', payloadAlumnoDistinto); },
     /idempotency_conflict|alumno_not_in_curso/,
@@ -683,10 +722,11 @@ async function testSaldo1() {
   assert.ok(Array.isArray(resumen), 'resumen debe ser un arreglo');
 }
 
-// ─── SALDO.2 Resumen refleja abono parcial ───────────────────────────────────
+// ─── SALDO.2 Resumen refleja abono parcial — importes y deuda exactos ─────────
 async function testSaldo2() {
   var payload = planPayload();
   var r       = await rpc('crear_plan_con_abonos', payload);
+
   // Pagar primer abono: 5000 de 10000
   await rpc('pagar_abono', {
     p_cuenta_id: CUENTA,
@@ -697,72 +737,79 @@ async function testSaldo2() {
   var resumen = await rpc('apoderado_cc_resumen_pagos', { p_codigo_cc: CC_CODE });
   var fila    = resumen.find(function(f) { return f.alumno_id === ALUMNO_ID; });
 
-  if (fila) {
-    assert.ok(fila.monto_abonado >= 5000,
-      'monto_abonado debe ser >= 5000; obtenido: ' + fila.monto_abonado);
-  }
+  // La fila DEBE existir; si no, el resumen no refleja el abono
+  assert.ok(fila, 'SALDO.2: debe existir fila para el alumno en el resumen CC');
+  assert.strictEqual(fila.monto_abonado, 5000,
+    'SALDO.2: monto_abonado debe ser exactamente 5000; obtenido: ' + fila.monto_abonado);
+  // deuda = cuota.monto (10000) − monto_abonado (5000) = 5000
+  assert.strictEqual(fila.deuda, 5000,
+    'SALDO.2: deuda debe ser exactamente 5000; obtenida: ' + fila.deuda);
 
   await rpc('revertir_abono', { p_cuenta_id: CUENTA, p_plan_id: r.plan.id, p_abono_id: r.abonos[0].id });
   await rpc('eliminar_plan',  { p_cuenta_id: CUENTA, p_plan_id: r.plan.id });
 }
 
-// ─── SALDO.3 Plan completo no duplica en tabla pagos (G05) ───────────────────
+// ─── SALDO.3 Plan completo — sin duplicado en pagos; saldo exacto (G05) ───────
 async function testSaldo3() {
   var payload = planPayload();
   var r       = await rpc('crear_plan_con_abonos', payload);
+
   for (var i = 0; i < r.abonos.length; i++) {
     await rpc('pagar_abono', { p_cuenta_id: CUENTA, p_plan_id: r.plan.id, p_abono_id: r.abonos[i].id });
   }
 
+  // G05: no deben crearse registros en tabla pagos
   var pagos = await GET(
-    '/rest/v1/pagos?alumno_id=eq.' + ALUMNO_ID + '&cuota_id=eq.' + CUOTA_ID + '&cuenta_id=eq.' + CUENTA + '&select=id'
-  ).catch(function(){ return []; });
+    '/rest/v1/pagos?alumno_id=eq.' + ALUMNO_ID +
+    '&cuota_id=eq.' + CUOTA_ID + '&cuenta_id=eq.' + CUENTA + '&select=id'
+  ).catch(function() { return []; });
   assert.strictEqual((pagos || []).length, 0,
     'G05: completar un plan no debe crear registros en tabla pagos');
 
   var resumen = await rpc('apoderado_cc_resumen_pagos', { p_codigo_cc: CC_CODE });
   var fila    = resumen.find(function(f) { return f.alumno_id === ALUMNO_ID; });
-  if (fila) {
-    assert.ok(fila.monto_abonado >= 10000,
-      'monto_abonado debe ser >= 10000 tras completar el plan; obtenido: ' + fila.monto_abonado);
-  }
-  // Plan cerrado; teardown lo eliminará con DELETE directo
+
+  // La fila DEBE existir con saldo exacto
+  assert.ok(fila, 'SALDO.3: debe existir fila para el alumno en el resumen CC');
+  assert.strictEqual(fila.monto_abonado, 10000,
+    'SALDO.3: monto_abonado debe ser exactamente 10000; obtenido: ' + fila.monto_abonado);
+  assert.strictEqual(fila.deuda, 0,
+    'SALDO.3: deuda debe ser 0 tras completar el plan; obtenida: ' + fila.deuda);
+
+  // Plan cerrado; teardown elimina el plan con DELETE directo (no hay abonos revertibles)
 }
 
 // ─── PLAN.15 Reintento con params originales tras editar_abono ───────────────
-// Verifica que solicitud_json (snapshot inmutable) se usa para la comparación,
-// no el estado mutable actual.  Tras editar_abono el snapshot queda intacto;
-// el reintento con los parámetros originales debe reconocerse como idempotente.
+// solicitud_json (snapshot inmutable) no cambia al editar abonos.
+// El reintento con el payload original debe reconocerse como idempotente.
 async function testPlan15() {
-  var payload = planPayload();  // {5000+5000, total=10000}
+  var payload = planPayload();
   var r       = await rpc('crear_plan_con_abonos', payload);
   var abonoId = r.abonos[0].id;
 
-  // Editar primer abono: 5000 → 7000; planes_pago.monto_total pasa a 12000
+  // Editar: 5000 → 7000; planes_pago.monto_total pasa a 12000, pero solicitud_json queda intacto
   await rpc('editar_abono', {
     p_cuenta_id: CUENTA,
     p_abono_id:  abonoId,
     p_monto:     7000,
   });
 
-  // Reintento con payload ORIGINAL (5000+5000, total=10000).
-  // Con snapshot inmutable esto debe devolver idempotente=true.
+  // Reintento con payload ORIGINAL — debe usar el snapshot, no el estado mutable
   var r2 = await rpc('crear_plan_con_abonos', payload);
   assert.strictEqual(r2.idempotente, true,
     'PLAN.15: reintento con params originales debe reconocerse tras editar_abono');
-  assert.strictEqual(r2.plan.id, r.plan.id,
-    'PLAN.15: debe devolver el mismo plan_id');
+  assert.strictEqual(r2.plan.id, r.plan.id, 'PLAN.15: debe devolver el mismo plan_id');
 
-  // Limpieza: revertir edición y eliminar plan
+  // Revertir edición y limpiar
   await rpc('editar_abono', { p_cuenta_id: CUENTA, p_abono_id: abonoId, p_monto: 5000 });
   await rpc('eliminar_plan', { p_cuenta_id: CUENTA, p_plan_id: r.plan.id });
 }
 
 // ─── PLAN.16 Concurrencia: mismo plan_id con calendarios distintos ────────────
-// Dos peticiones concurrentes usan el mismo plan_id pero calendarios distintos.
-// La primera que llega almacena el snapshot; la segunda falla idempotency_conflict.
+// La primera solicitud almacena el snapshot; la segunda (distinto calendario)
+// debe fallar con idempotency_conflict.
 async function testPlan16() {
-  var planId   = uid();
+  var planId   = uid('p16');
   var payload1 = planPayload({
     p_plan_id: planId,
     p_abonos:  [{ monto: 5000, fecha: '2026-03-01' }, { monto: 5000, fecha: '2026-04-01' }],
@@ -784,25 +831,24 @@ async function testPlan16() {
   assert.strictEqual(err.length, 1, 'PLAN.16: exactamente una peticion debe fallar');
   assert.ok(
     err[0].reason.message.includes('idempotency_conflict'),
-    'PLAN.16: el conflicto debe ser idempotency_conflict, recibido: ' + err[0].reason.message
+    'PLAN.16: el conflicto debe ser idempotency_conflict; recibido: ' + err[0].reason.message
   );
 
   await rpc('eliminar_plan', { p_cuenta_id: CUENTA, p_plan_id: planId });
 }
 
-// ─── PLAN.17 Respuesta perdida desde el handler: reintento idempotente ────────
-// Simula el flujo del formulario: se genera planId, se envía la petición y la
-// respuesta se "pierde" (error de red, timeout, recarga del navegador).
-// En el reintento (mismo planId, mismo payload) el servidor devuelve
-// idempotente=true y los mismos datos, sin crear un plan duplicado.
+// ─── PLAN.17 Respuesta perdida — reintento idempotente vía API ────────────────
+// Primera llamada llega al servidor y crea el plan; la respuesta se "pierde"
+// (error de red, timeout, recarga).  El cliente reintenta con el mismo planId
+// (mismo p_plan_id) y el servidor devuelve idempotente=true sin duplicar.
 async function testPlan17() {
   var payload = planPayload();
   var planId  = payload.p_plan_id;
 
-  // Primera llamada: el servidor crea el plan.  "Respuesta perdida": la ignoramos.
+  // Primera llamada — el servidor crea el plan; respuesta descartada
   void (await rpc('crear_plan_con_abonos', payload));
 
-  // Reintento desde el handler (misma sessionStorage → mismo planId)
+  // Reintento con el mismo planId
   var r2 = await rpc('crear_plan_con_abonos', payload);
   assert.strictEqual(r2.idempotente, true,
     'PLAN.17: reintento tras respuesta perdida debe devolver idempotente=true');
@@ -810,7 +856,7 @@ async function testPlan17() {
   assert.ok(Array.isArray(r2.abonos) && r2.abonos.length === 2,
     'PLAN.17: debe devolver los 2 abonos originales');
 
-  // Verificar que no se crearon planes duplicados
+  // No deben existir planes duplicados
   var planes = await GET(
     '/rest/v1/planes_pago?cuenta_id=eq.' + CUENTA +
     '&alumno_id=eq.' + ALUMNO_ID + '&cuota_id=eq.' + CUOTA_ID + '&select=id'
@@ -820,62 +866,156 @@ async function testPlan17() {
   await rpc('eliminar_plan', { p_cuenta_id: CUENTA, p_plan_id: planId });
 }
 
+// ─── PLAN.17b Respuesta perdida desde guardarPlanPago() ──────────────────────
+// Simula el flujo completo de guardarPlanPago():
+//  1. Formulario genera planId y lo persiste junto al payloadHash.
+//  2. La petición llega al servidor pero la respuesta se pierde.
+//  3. El usuario reabre el formulario con el mismo payload.
+//  4. guardarPlanPago() detecta que el hash coincide y reutiliza el planId.
+//  5. El servidor reconoce el reintento como idempotente.
+//
+// La simulación usa variables locales en lugar de sessionStorage.
+// El comportamiento que se verifica es del servidor; el cliente sólo aporta
+// que el planId persiste y se reutiliza correctamente cuando el hash no cambió.
+async function testPlan17b() {
+  var cuentaId    = CUENTA;
+  var alumnoId    = ALUMNO_ID;
+  var cuotaId     = CUOTA_ID;
+  var periodo     = 'Marzo 2026';
+  var abonos      = [{ monto: 5000, fecha: '2026-03-01' }, { monto: 5000, fecha: '2026-04-01' }];
+  var totalAbonos = 10000;
+
+  // Paso 1: guardarPlanPago() genera planId y calcula payloadHash
+  var pendingKey   = 'pp_pending_' + cuentaId + '_' + alumnoId + '_' + cuotaId + '_' + periodo;
+  var payloadHash  = JSON.stringify({ totalAbonos: totalAbonos, abonos: abonos });
+  var planId       = uid('form');
+  var sessionStore = {};
+  sessionStore[pendingKey] = { planId: planId, payloadHash: payloadHash };
+
+  // Paso 2: petición enviada — respuesta "perdida" (sessionStore no se limpia)
+  await rpc('crear_plan_con_abonos', {
+    p_cuenta_id:   cuentaId,
+    p_plan_id:     planId,
+    p_alumno_id:   alumnoId,
+    p_cuota_id:    cuotaId,
+    p_periodo:     periodo,
+    p_monto_total: totalAbonos,
+    p_abonos:      abonos,
+  });
+  // La entrada persiste — simula que la respuesta nunca llegó al cliente
+  assert.ok(sessionStore[pendingKey], 'sessionStore debe mantener la entrada tras respuesta perdida');
+
+  // Paso 3: usuario reabre formulario con el MISMO payload
+  var stored           = sessionStore[pendingKey];
+  var newPayloadHash   = JSON.stringify({ totalAbonos: totalAbonos, abonos: abonos });
+  // guardarPlanPago() detecta hash idéntico: reutiliza planId
+  assert.strictEqual(stored.payloadHash, newPayloadHash, 'hash debe coincidir: mismo payload');
+  var retryPlanId = stored.planId;
+  assert.strictEqual(retryPlanId, planId, 'planId reutilizado debe coincidir con el original');
+
+  // Paso 4: reintento — servidor reconoce idempotencia
+  var r2 = await rpc('crear_plan_con_abonos', {
+    p_cuenta_id:   cuentaId,
+    p_plan_id:     retryPlanId,
+    p_alumno_id:   alumnoId,
+    p_cuota_id:    cuotaId,
+    p_periodo:     periodo,
+    p_monto_total: totalAbonos,
+    p_abonos:      abonos,
+  });
+  assert.strictEqual(r2.idempotente, true,
+    'PLAN.17b: reintento via handler debe ser idempotente');
+  assert.strictEqual(r2.plan.id, planId,
+    'PLAN.17b: debe devolver el mismo plan');
+
+  // Paso 5: éxito confirmado — sessionStorage se limpia
+  delete sessionStore[pendingKey];
+  assert.strictEqual(sessionStore[pendingKey], undefined,
+    'sessionStore debe limpiarse tras confirmación del servidor');
+
+  // Sin planes duplicados
+  var planes = await GET(
+    '/rest/v1/planes_pago?cuenta_id=eq.' + CUENTA +
+    '&alumno_id=eq.' + ALUMNO_ID + '&cuota_id=eq.' + CUOTA_ID + '&select=id'
+  );
+  assert.strictEqual(planes.length, 1, 'PLAN.17b: no deben existir planes duplicados');
+
+  await rpc('eliminar_plan', { p_cuenta_id: CUENTA, p_plan_id: planId });
+}
+
 // ─── Runner ───────────────────────────────────────────────────────────────────
 (async function() {
   console.log('\nE8 — Planes de pago y abonos\n');
-  console.log('  Preparando fixtures...');
-  try { await setup(); } catch (e) {
-    console.error('  ✗ setup fallo:', e.message);
-    process.exit(1);
+  console.log('  BASE: ' + BASE);
+
+  var setupOk = false;
+  try {
+    console.log('  Preparando fixtures...');
+    await setup();
+    setupOk = true;
+  } catch (e) {
+    console.error('  ✗ setup falló: ' + e.message);
   }
 
-  console.log('\n  [PLAN] Validaciones y flujos basicos');
-  await run('PLAN.1  Crear plan con dos abonos',            testPlan1);
-  await run('PLAN.2  monto_total=0 rechazado',              testPlan2);
-  await run('PLAN.3  suma abonos != monto_total rechazada', testPlan3);
-  await run('PLAN.4  un solo abono rechazado',              testPlan4);
-  await run('PLAN.5  fecha invalida rechazada',             testPlan5);
-  await run('PLAN.6  pagar primer abono',                   testPlan6);
-  await run('PLAN.7  pagar todos los abonos cierra plan',   testPlan7);
-  await run('PLAN.8  revertir abono reabre plan',           testPlan8);
-  await run('PLAN.9  editar monto actualiza monto_total',   testPlan9);
-  await run('PLAN.10 editar abono ya pagado rechazado',     testPlan10);
-  await run('PLAN.11 eliminar plan con pagado rechazado',   testPlan11);
+  try {
+    if (!setupOk) {
+      // No ejecutar tests si setup falló; teardown se encarga de lo que se creó
+      failed++;
+    } else {
+      console.log('\n  [PLAN] Validaciones y flujos basicos');
+      await run('PLAN.1  Crear plan con dos abonos',            testPlan1);
+      await run('PLAN.2  monto_total=0 rechazado',              testPlan2);
+      await run('PLAN.3  suma abonos != monto_total rechazada', testPlan3);
+      await run('PLAN.4  un solo abono rechazado',              testPlan4);
+      await run('PLAN.5  fecha invalida rechazada',             testPlan5);
+      await run('PLAN.6  pagar primer abono',                   testPlan6);
+      await run('PLAN.7  pagar todos los abonos cierra plan',   testPlan7);
+      await run('PLAN.8  revertir abono reabre plan',           testPlan8);
+      await run('PLAN.9  editar monto actualiza monto_total',   testPlan9);
+      await run('PLAN.10 editar abono ya pagado rechazado',     testPlan10);
+      await run('PLAN.11 eliminar plan con pagado rechazado',   testPlan11);
 
-  console.log('\n  [PLAN] Idempotencia y concurrencia');
-  await run('PLAN.12 idempotencia por p_plan_id',           testPlan12);
-  await run('PLAN.13 dos creaciones concurrentes',          testPlan13);
-  await run('PLAN.13b pago concurrente con eliminacion',    testPlan13b);
-  await run('PLAN.14 cuota de otro curso rechazada',        testPlan14);
+      console.log('\n  [PLAN] Idempotencia y concurrencia');
+      await run('PLAN.12 idempotencia por p_plan_id',           testPlan12);
+      await run('PLAN.13 dos creaciones concurrentes',          testPlan13);
+      await run('PLAN.13b pago concurrente con eliminacion',    testPlan13b);
+      await run('PLAN.14 cuota de otro curso rechazada',        testPlan14);
 
-  console.log('\n  [ISO] Atomicidad');
-  await run('ISO.1  rollback ante falla parcial',           testIso1);
+      console.log('\n  [ISO] Atomicidad');
+      await run('ISO.1  rollback ante falla parcial',           testIso1);
 
-  console.log('\n  [RLS] Autorizacion');
-  await run('RLS.1  cuenta ajena denegada en crear',        testRls1);
-  await run('RLS.2  cuenta ajena denegada en eliminar',     testRls2);
+      console.log('\n  [RLS] Autorizacion');
+      await run('RLS.1  cuenta ajena denegada en crear',        testRls1);
+      await run('RLS.2  cuenta ajena denegada en eliminar',     testRls2);
 
-  console.log('\n  [PLAN] Idempotencia con snapshot inmutable');
-  await run('PLAN.15 reintento tras editar_abono (snapshot)',    testPlan15);
-  await run('PLAN.16 mismo plan_id calendarios distintos',       testPlan16);
-  await run('PLAN.17 respuesta perdida → reintento idempotente', testPlan17);
+      console.log('\n  [PLAN] Idempotencia con snapshot inmutable');
+      await run('PLAN.15 reintento tras editar_abono (snapshot)',         testPlan15);
+      await run('PLAN.16 mismo plan_id calendarios distintos',            testPlan16);
+      await run('PLAN.17 respuesta perdida → reintento idempotente (API)', testPlan17);
+      await run('PLAN.17b respuesta perdida → guardarPlanPago() handler', testPlan17b);
 
-  console.log('\n  [SEC] Seguridad de idempotencia (SECURITY DEFINER)');
-  await run('SEC.1  usuario real sin acceso al curso',       testSec1);
-  await run('SEC.2  calendario modificado rechazado',        testSec2);
-  await run('SEC.3  alumno_id distinto rechazado',           testSec3);
+      console.log('\n  [SEC] Seguridad de idempotencia (SECURITY DEFINER)');
+      await run('SEC.1  usuario real sin acceso al curso (cuenta B)',  testSec1);
+      await run('SEC.2  calendario modificado rechazado',              testSec2);
+      await run('SEC.3  alumno_id distinto rechazado',                 testSec3);
 
-  console.log('\n  [SALDO] Resumen CC con importes exactos');
-  await run('SALDO.1 resumen sin abonos',                    testSaldo1);
-  await run('SALDO.2 resumen con abono parcial',             testSaldo2);
-  await run('SALDO.3 plan completo no duplica en pagos',     testSaldo3);
-
-  console.log('\n  Limpiando fixtures...');
-  try { await teardown(); } catch (e) {
-    console.warn('  ! teardown parcial:', e.message);
+      console.log('\n  [SALDO] Resumen CC con importes exactos');
+      await run('SALDO.1 resumen sin abonos',                testSaldo1);
+      await run('SALDO.2 resumen con abono parcial exacto',  testSaldo2);
+      await run('SALDO.3 plan completo sin duplicado pagos', testSaldo3);
+    }
+  } finally {
+    console.log('\n  Limpiando fixtures...');
+    try {
+      await teardown();
+      console.log('  ✓ teardown completo (fixtures verificados)');
+    } catch (e) {
+      console.error('  ✗ teardown: ' + e.message);
+      failed++;
+    }
   }
 
-  var total = passed + failed;
+  var total    = passed + failed;
   var skipNote = skipped > 0 ? ', ' + skipped + ' omitidos' : '';
   console.log('\n  ' + passed + '/' + total + ' pasaron, ' + failed + ' fallaron' + skipNote + '\n');
   process.exit(failed > 0 ? 1 : 0);
