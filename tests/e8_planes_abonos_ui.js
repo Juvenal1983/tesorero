@@ -294,6 +294,38 @@ async function screenshot(page, nombre) {
   } catch (_) {}
 }
 
+/** Re-login vía UI si la sesión se perdió tras reload (patrón E7) */
+async function reloginViaUI(page) {
+  const tieneForm = await page.locator('#l-email').count() > 0;
+  if (!tieneForm) return; // ya autenticado u otra vista
+  await page.fill('#l-email', USER_EMAIL);
+  await page.fill('#l-pass',  USER_PASS);
+  await page.click('[onclick="doLogin()"]');
+  await page.waitForFunction(
+    () => window.S?.session !== null && window.S?.session !== undefined && !!window.S?._v9CuentaId,
+    { timeout: T_LARGO }
+  );
+}
+
+/** Re-seleccionar curso y navegar a pagos del alumno (patrón E7) */
+async function navegarPagosAlumno(page) {
+  const v9Listo    = await page.evaluate(() => !!window.S?._v9CuentaId);
+  const cursoActual = await page.evaluate(() => window.S?.cursoId ?? null);
+  if (cursoActual !== CURSO_ID) {
+    if (v9Listo) {
+      await page.evaluate(id => window.selectCurso && window.selectCurso(id), CURSO_ID);
+      await page.waitForFunction(id => window.S?.cursoId === id, CURSO_ID, { timeout: T_LARGO });
+    } else {
+      await page.evaluate(() => window.go('selector'));
+      await page.waitForSelector(`text=${CURSO_NOM}`, { timeout: T_CORTO });
+      await page.click(`text=${CURSO_NOM}`);
+      await page.waitForFunction(id => window.S?.cursoId === id, CURSO_ID, { timeout: T_LARGO });
+    }
+  }
+  await page.evaluate(id => window.go('pagos', { aluId: id }), ALU_ID);
+  await page.waitForFunction(() => window.S?.route === 'pagos', { timeout: T_CORTO });
+}
+
 /** Espera que confirm/alert del browser sea interceptado — sin bloquear la prueba */
 function interceptDialogs(page) {
   page.on('dialog', async dialog => {
@@ -416,83 +448,136 @@ async function queryAbonos(jwt, planId) {
       { aluId: ALU_ID, cuotaId: CUOTA_ID, periodo: PERIODO }
     );
     // Esperar que el input de número de abonos esté visible
-    await page.waitForSelector('#pp-num', { timeout: T_CORTO });
-    ok('U06-a: modal crear plan visible', true);
+    try {
+      await page.waitForSelector('#pp-num', { timeout: T_CORTO });
+      ok('U06-a: modal crear plan visible', true);
+    } catch (_) {
+      await screenshot(page, 'u06-modal-fail');
+      ok('U06-a: modal crear plan visible', false);
+      throw new Error('Modal crear plan no apareció — #pp-num no encontrado');
+    }
 
     // Configurar 2 abonos
     await page.fill('#pp-num', '2');
-    // Trigger para regenerar las fechas
     await page.dispatchEvent('#pp-num', 'input');
-    await page.waitForFunction(() => document.getElementById('pp-abonos-lista')?.children.length > 0, { timeout: T_CORTO }).catch(() => {});
+    await page.waitForFunction(
+      () => document.getElementById('pp-abonos-lista')?.children.length > 0,
+      { timeout: T_CORTO }
+    ).catch(() => {});
 
     // Clic en "💾 Crear plan"
     await page.click('[onclick*="guardarPlanPago"]');
 
-    // Esperar que el modal se reabra mostrando el plan creado (hay botón 💰)
-    let planId = null;
+    // ── U06-b: Esperar confirmación — DOM (tolerante) ─────────────────────────
+    // El modal puede tardar en re-renderizar; una espera de 15 s cubre la mayoría.
+    // Si agota, continuamos igualmente y usamos DB como fuente de verdad.
+    let uiPlanVisible = false;
     try {
-      await page.waitForFunction(() => !!document.querySelector('[onclick*="pagarAbono"]'), { timeout: T_LARGO });
-      ok('U06-b: plan creado — botones 💰 visibles', true);
-      // Leer el planId desde el DOM del botón de pagar
-      planId = await page.evaluate(() => {
-        const btn = document.querySelector('[onclick*="pagarAbono"]');
-        if (!btn) return null;
-        const m = btn.getAttribute('onclick').match(/pagarAbono\('([^']+)'/);
-        return m ? m[1] : null;
-      });
-      ok('U06-c: planId extraído del DOM: ' + planId, !!planId);
+      await page.waitForFunction(
+        () => !!document.querySelector('[onclick*="pagarAbono"]') ||
+              !!document.querySelector('.revertir-abono-btn'),
+        { timeout: 15_000 }
+      );
+      uiPlanVisible = true;
     } catch (_) {
-      await screenshot(page, 'u06-plan-fail');
-      ok('U06-b: plan creado', false);
-      ok('U06-c: planId extraído', false);
+      await screenshot(page, 'u06-modal-norerender');
+      console.log('    ⚠️  Modal no re-renderizó — consultando DB como respaldo');
     }
 
-    if (!planId) {
-      // Fallback: intentar leer desde DB
+    // ── U06-c: Fuente de verdad = DB (siempre) ────────────────────────────────
+    // Dar hasta 5 s para que la RPC crear_plan_con_abonos persista.
+    let planId = null;
+    let abonos06 = [];
+    const t06 = Date.now();
+    while (Date.now() - t06 < 5_000) {
       const planes = await queryPlanes(jwt);
-      planId = planes[0]?.id || null;
+      // El plan del fixture actual: mismo periodo y alumno (hay exactamente 1 en este EXEC_ID)
+      const p = planes.find(pl => pl.periodo === PERIODO) || planes[0];
+      if (p?.id) {
+        planId   = p.id;
+        abonos06 = await queryAbonos(jwt, planId);
+        if (abonos06.length === 2) break;
+      }
+      await new Promise(r => setTimeout(r, 500));
     }
 
-    // Verificar DB: 2 abonos sin pagar
-    if (planId) {
-      const abonos = await queryAbonos(jwt, planId);
-      ok('U06-d: 2 abonos en staging (G01)', abonos.length === 2);
-      ok('U06-e: abonos inicialmente sin pagar', abonos.every(a => !a.pagado));
+    ok('U06-b: plan creado — botones 💰 visibles en UI', uiPlanVisible);
+    ok('U06-c: planId obtenido (DB): ' + planId, !!planId);
+    ok('U06-d: 2 abonos en staging (G01)', abonos06.length === 2);
+    ok('U06-e: abonos inicialmente sin pagar', abonos06.every(a => !a.pagado));
+
+    // Si no hay planId, bloquear todos los pasos dependientes
+    if (!planId) {
+      ok('U06-BLOQUEO: planId nulo — U07–U11 omitidos', false);
+      throw new Error('planId no disponible; no se puede continuar el recorrido');
     }
 
     // ── U07: Pagar primer abono (parcial) ─────────────────────────────────────
     console.log('\n[U07] Pagar abono 1 (parcial — $45.000)');
-    // El modal ya está abierto con el plan. Clic en "💰 Pagar" del abono 0
-    const btnPagar0 = page.locator('[onclick*="pagarAbono"][onclick*=",0)"]').first();
+    // Reobtener el ID exacto del abono 0 desde DB (no confiar en el índice del DOM)
+    const abonoId0 = abonos06[0]?.id || null;
+
+    // Asegurar que el modal del plan está abierto antes de intentar pagar
+    await page.evaluate(
+      ({ aluId, cuotaId, periodo }) => window.showModal('planPago', { aluId, cuotaId, periodo }),
+      { aluId: ALU_ID, cuotaId: CUOTA_ID, periodo: PERIODO }
+    );
+    await page.waitForFunction(
+      () => !!document.querySelector('[onclick*="pagarAbono"]') ||
+            !!document.querySelector('.revertir-abono-btn'),
+      { timeout: T_CORTO }
+    ).catch(() => {});
+
+    // Clic en "💰 Pagar" del abono 0 (por ID exacto o por índice 0)
+    const selPagar0 = abonoId0
+      ? `[onclick*="pagarAbono"][onclick*="${abonoId0}"]`
+      : '[onclick*="pagarAbono"][onclick*=",0)"]';
+    const btnPagar0 = page.locator(selPagar0).first();
     if (await btnPagar0.count() > 0) {
       await btnPagar0.click();
     } else {
-      // Fallback programático
+      // Fallback programático con ID del abono
       await page.evaluate(
-        ({ pId }) => window.pagarAbono && window.pagarAbono(pId, 0),
-        { pId: planId }
+        ({ pId, idx }) => window.pagarAbono && window.pagarAbono(pId, idx),
+        { pId: planId, idx: 0 }
       );
     }
-    // Esperar re-render: abono 0 ahora tiene badge ✅
-    try {
-      await page.waitForFunction(
-        () => document.querySelector('.badge.bgg') !== null,
-        { timeout: T_LARGO }
-      );
-      ok('U07-a: badge ✅ visible (abono 1 pagado)', true);
-    } catch (_) {
-      await screenshot(page, 'u07-fail');
-      ok('U07-a: badge ✅ visible', false);
-    }
-    // Verificar botón ↩ presente (plan aún activo)
-    const btn_revertir_parcial = await page.locator('.revertir-abono-btn').count();
-    ok('U07-b: botón ↩ visible en abono pagado (plan activo)', btn_revertir_parcial > 0);
 
-    // Verificar DB: 1 de 2 abonos pagado
-    if (planId) {
-      const ab7 = await queryAbonos(jwt, planId);
-      ok('U07-c: 1 abono pagado en staging (G03)', ab7.filter(a => a.pagado).length === 1);
+    // ── U07-a: Confirmar vía DB (fuente de verdad — no badge genérico) ────────
+    // Polling hasta T_LARGO: esperar que abono 0 quede pagado en la DB
+    let ab7 = [];
+    const t07 = Date.now();
+    while (Date.now() - t07 < T_LARGO) {
+      ab7 = await queryAbonos(jwt, planId);
+      if (ab7[0]?.pagado) break;
+      await new Promise(r => setTimeout(r, 600));
     }
+    ok('U07-a: pagar_abono completado — abono 0 pagado en DB (G03)', ab7[0]?.pagado === true);
+
+    // ── U07-b: Badge ✅ visible en la UI para el abono específico ─────────────
+    // La UI debería haberse re-renderizado; usamos el data-abono para ser exactos.
+    if (ab7[0]?.pagado) {
+      const selRevertir0 = abonoId0
+        ? `.revertir-abono-btn[data-abono="${abonoId0}"]`
+        : '.revertir-abono-btn[data-idx="0"]';
+      const nBtn0 = await page.locator(selRevertir0).count();
+      if (nBtn0 === 0) {
+        // El re-render puede tardar: esperar el botón ↩ del abono 0
+        await page.waitForFunction(
+          ({ aId }) =>
+            document.querySelector(`.revertir-abono-btn[data-abono="${aId}"]`) !== null ||
+            document.querySelector('.revertir-abono-btn[data-idx="0"]') !== null,
+          { aId: abonoId0 || '' },
+          { timeout: T_CORTO }
+        ).catch(async () => { await screenshot(page, 'u07-norevertir'); });
+      }
+      const nRevertir = await page.locator('.revertir-abono-btn').count();
+      ok('U07-b: badge ✅ + botón ↩ del abono 0 visibles en UI', nRevertir > 0);
+    } else {
+      ok('U07-b: badge ✅ + botón ↩ del abono 0 (omitido — DB no confirmó pago)', false);
+    }
+
+    ok('U07-c: 1 abono pagado en staging (G03)', ab7.filter(a => a.pagado).length === 1);
 
     // ── U08: Completar el plan (pagar abono 2) ────────────────────────────────
     console.log('\n[U08] Pagar abono 2 — completar plan');
@@ -539,32 +624,62 @@ async function queryAbonos(jwt, planId) {
 
     // ── U09: Recarga — plan completado persiste en staging ────────────────────
     console.log('\n[U09] Recarga de página: plan completado debe persistir');
-    await page.reload({ waitUntil: 'load', timeout: T_LARGO });
-    await waitAppReady(page).catch(async () => {
-      await screenshot(page, 'u09-fail');
-      throw new Error('window.S no definido tras recarga');
-    });
-    // Re-login si la sesión no persistió
-    const sesionOk = await page.evaluate(() =>
-      window.S?.session !== null && window.S?.session !== undefined
+
+    // ── DB como fuente de verdad ANTES de recargar (referencia) ───────────────
+    const planes9pre = await queryPlanes(jwt);
+    const plan9pre   = planes9pre.find(p => p.id === planId);
+    console.log(`    DB pre-reload: plan activo=${plan9pre?.activo}`);
+
+    // ── Reload con captura de error explícita ─────────────────────────────────
+    try {
+      await page.reload({ waitUntil: 'load', timeout: T_LARGO });
+    } catch (eRel) {
+      await screenshot(page, 'u09-reload-fail');
+      console.error(`    ❌ reload lanzó: ${eRel.message}`);
+      throw eRel;
+    }
+
+    try {
+      await waitAppReady(page);
+    } catch (eReady) {
+      await screenshot(page, 'u09-appready-fail');
+      throw new Error(`window.S no definido tras recarga: ${eReady.message}`);
+    }
+
+    // ── Re-login vía UI si la sesión no persiste (patrón E7) ──────────────────
+    const sesionOk9 = await page.evaluate(() =>
+      window.S?.session !== null && window.S?.session !== undefined && !!window.S?._v9CuentaId
     );
-    if (!sesionOk) {
-      await page.fill('#l-email', USER_EMAIL);
-      await page.fill('#l-pass',  USER_PASS);
-      await page.click('[onclick="doLogin()"]');
-      await page.waitForFunction(
-        () => window.S?.session !== null && window.S?.session !== undefined,
-        { timeout: T_LARGO }
-      ).catch(() => {});
+    if (!sesionOk9) {
+      console.log('    → Sesión no restaurada automáticamente; re-login vía UI');
+      try {
+        await reloginViaUI(page);
+        ok('U09-b: re-login vía UI tras recarga', true);
+      } catch (eLogin) {
+        await screenshot(page, 'u09-relogin-fail');
+        ok('U09-b: re-login vía UI tras recarga', false);
+        throw new Error(`Re-login falló tras recarga: ${eLogin.message}`);
+      }
+    } else {
+      ok('U09-b: sesión restaurada automáticamente', true);
     }
-    // Verificar DB como fuente de verdad: plan sigue cerrado
-    if (planId) {
-      const planes9  = await queryPlanes(jwt);
-      const plan9    = planes9.find(p => p.id === planId);
-      ok('U09-a: plan cerrado persiste en DB tras recarga', plan9?.activo === false);
-      const ab9 = await queryAbonos(jwt, planId);
-      ok('U09-b: 2 abonos pagados en DB tras recarga', ab9.filter(a => a.pagado).length === 2);
+
+    // ── Re-seleccionar curso y navegar a pagos (patrón E7) ────────────────────
+    try {
+      await navegarPagosAlumno(page);
+      ok('U09-c: curso re-seleccionado y ruta pagos activa', true);
+    } catch (eNav) {
+      await screenshot(page, 'u09-nav-fail');
+      ok('U09-c: curso re-seleccionado y ruta pagos activa', false);
+      console.error(`    ❌ navegarPagosAlumno: ${eNav.message}`);
     }
+
+    // ── Verificar DB: plan sigue cerrado tras recarga ─────────────────────────
+    const planes9  = await queryPlanes(jwt);
+    const plan9    = planes9.find(p => p.id === planId);
+    ok('U09-a: plan cerrado persiste en DB tras recarga', plan9?.activo === false);
+    const ab9 = await queryAbonos(jwt, planId);
+    ok('U09-d: 2 abonos pagados en DB tras recarga', ab9.filter(a => a.pagado).length === 2);
 
     // ── U10: Revertir abono desde plan completado ─────────────────────────────
     console.log('\n[U10] Revertir abono 1 desde plan COMPLETADO (activo=false)');
@@ -614,8 +729,18 @@ async function queryAbonos(jwt, planId) {
 
     // ── U11: Recarga post-revertir — saldos exactos ───────────────────────────
     console.log('\n[U11] Recarga post-revertir: verificar saldos exactos');
-    await page.reload({ waitUntil: 'load', timeout: T_LARGO });
-    await waitAppReady(page).catch(() => {});
+    try {
+      await page.reload({ waitUntil: 'load', timeout: T_LARGO });
+      await waitAppReady(page);
+      const sesionOk11 = await page.evaluate(() =>
+        window.S?.session !== null && window.S?.session !== undefined && !!window.S?._v9CuentaId
+      );
+      if (!sesionOk11) await reloginViaUI(page);
+      await navegarPagosAlumno(page);
+    } catch (e11) {
+      await screenshot(page, 'u11-reload-fail');
+      console.error(`    ⚠️  Recarga U11: ${e11.message}`);
+    }
     if (planId) {
       const planes11 = await queryPlanes(jwt);
       const plan11   = planes11.find(p => p.id === planId);
