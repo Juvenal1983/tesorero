@@ -235,7 +235,8 @@ async function crearFixtures(jwt) {
               nombres: 'Demo', apellidos: `B2 ${EXEC_ID}`, estado: 'activo' } },
     { nombre: 'cuota',  url: '/rest/v1/cuotas',
       body: { id: CUOTA_ID, cuenta_id: CUENTA_ID, curso_id: CURSO_ID, nombre: CUOTA_NOM,
-              tipo: 'mensual', monto: MONTO_TOTAL, anio, activa: true } },
+              tipo: 'mensual', monto: MONTO_TOTAL, anio, activa: true,
+              mes_inicio: 11, mes_termino: 11 } },  // B2-fix: solo Diciembre (mes 11) → un único período
   ];
   for (const s of steps) {
     const r = await supaAuth(s.url, jwt, { method: 'POST', body: s.body });
@@ -657,6 +658,40 @@ async function queryAbonos(jwt, planId) {
         rPagos.status === 200);
     }
 
+    // ── U12-pre: CC resumen al COMPLETAR — importes exactos ($90k abonados, $0 deuda) ──
+    // Verificar antes de recargar, cuando plan.activo===false y los 2 abonos están pagados.
+    // Requisito (mwjy16r7): exigir monto_abonado=90000, monto_pendiente=0 en este punto.
+    console.log('\n[U12-pre] CC resumen — plan COMPLETADO ($90k abonados, $0 deuda)');
+    if (CC_CODE && plan8?.activo === false) {
+      const rCC8 = await rpcAnon('apoderado_cc_resumen_pagos', { p_codigo_cc: CC_CODE });
+      console.log(`    HTTP ${rCC8.status}: ${JSON.stringify(rCC8.body).slice(0, 300)}`);
+      ok('U12-pre-a: CC resumen responde 200 (plan completado)', rCC8.status === 200);
+      if (rCC8.status === 200) {
+        const alumnos8 = Array.isArray(rCC8.body)         ? rCC8.body
+          : Array.isArray(rCC8.body?.alumnos) ? rCC8.body.alumnos
+          : [];
+        const alu8 = alumnos8.find(a => a.alumno_id === ALU_ID || a.id === ALU_ID);
+        if (alu8) {
+          const ab8cc = Number(alu8.monto_abonado  ?? alu8.montoAbonado   ?? -1);
+          const pd8cc = Number(alu8.monto_pendiente ?? alu8.montoPendiente ?? -1);
+          console.log(`    alumno (completado): monto_abonado=${ab8cc} monto_pendiente=${pd8cc}`);
+          ok(`U12-pre-b: CC monto_abonado=$${ab8cc}===$${MONTO_TOTAL} (plan completado)`,  ab8cc === MONTO_TOTAL);
+          ok(`U12-pre-c: CC monto_pendiente=$${pd8cc}===0 (plan completado)`,              pd8cc === 0);
+        } else {
+          console.log(`    Alumnos en respuesta: ${alumnos8.length} — IDs: ${alumnos8.map(a=>a.alumno_id??a.id).join(',')}`);
+          ok('U12-pre-b: alumno de test en CC resumen (completado)', false);
+          ok('U12-pre-c: (BLOQUEADO — alumno no encontrado en CC resumen)', false);
+        }
+      } else {
+        ok('U12-pre-b: (BLOQUEADO — CC resumen no devolvió 200)', false);
+        ok('U12-pre-c: (BLOQUEADO)', false);
+      }
+    } else if (!CC_CODE) {
+      console.log('  ⚠️  U12-pre: omitido — CC_CODE no disponible');
+    } else {
+      console.log(`  ⚠️  U12-pre: omitido — plan aún activo (plan8.activo=${plan8?.activo})`);
+    }
+
     // ── U09: Recarga — plan completado persiste en staging ────────────────────
     console.log('\n[U09] Recarga de página: plan completado debe persistir');
 
@@ -723,13 +758,18 @@ async function queryAbonos(jwt, planId) {
     // Verificar también que el botón 📅 N/M está disponible en la vista pagos.
     await navegarPagosAlumno(page);
 
-    // Buscar el botón 📅 N/M para la cuota del fixture (indica que getPlanPago encuentra el plan)
-    const nBtnPlan10 = await page.locator(`[onclick*="showModal('planPago'"][onclick*="${CUOTA_ID}"]`).count();
-    ok('U10-a: botón 📅 visible para plan cerrado en vista pagos', nBtnPlan10 > 0);
+    // Buscar el botón 📅 N/M para la cuota del fixture en el período correcto.
+    // B2-fix: incluir CUOTA_ID + PERIODO en el selector para evitar que [onclick*=CUOTA_ID]
+    // coincida con el primer botón del calendario (mes Enero/Marzo) cuando la cuota no
+    // tenía mes_inicio/mes_termino. Ahora la cuota tiene mes_inicio:11, mes_termino:11
+    // → solo se genera "Diciembre YYYY", por lo que hay exactamente un botón.
+    const selBtn10 = `[onclick*="showModal('planPago'"][onclick*="${CUOTA_ID}"][onclick*="${PERIODO}"]`;
+    const nBtnPlan10 = await page.locator(selBtn10).count();
+    ok('U10-a: botón 📅 visible para plan cerrado en vista pagos (selector alumno+cuota+período)', nBtnPlan10 > 0);
 
-    // Abrir modal vía ese botón (o programáticamente si no encontró)
+    // Abrir modal vía ese botón (o programáticamente con período correcto si no encontró)
     if (nBtnPlan10 > 0) {
-      await page.locator(`[onclick*="showModal('planPago'"][onclick*="${CUOTA_ID}"]`).first().click();
+      await page.locator(selBtn10).first().click();
     } else {
       await page.evaluate(
         ({ aluId, cuotaId, periodo }) => window.showModal('planPago', { aluId, cuotaId, periodo }),
@@ -862,6 +902,21 @@ async function queryAbonos(jwt, planId) {
         const bodyStr = JSON.stringify(rCC.body || {});
         ok('U12-c: respuesta CC no contiene campos privados (pin, clave)',
           !bodyStr.includes('"pin"') && !bodyStr.includes('"clave"'));
+        // U12-d/e: importes exactos post-revertir (mwjy16r7)
+        // Después de revertir: monto_abonado=$45.000 pagados, monto_pendiente=$45.000 pendiente.
+        // Sin revert ejecutado: bloqueado — no comparar contra datos financieramente incorrectos.
+        if (alumno) {
+          const ab12 = Number(alumno.monto_abonado  ?? alumno.montoAbonado   ?? -1);
+          const pd12 = Number(alumno.monto_pendiente ?? alumno.montoPendiente ?? -1);
+          console.log(`    alumno (post-revert): monto_abonado=${ab12} monto_pendiente=${pd12}`);
+          ok(`U12-d: CC monto_abonado=$${ab12}===$${MONTO_AB2} (post-revert)`,
+            revertEjecutado ? ab12 === MONTO_AB2 : false);
+          ok(`U12-e: CC monto_pendiente=$${pd12}===$${MONTO_AB1} (post-revert)`,
+            revertEjecutado ? pd12 === MONTO_AB1 : false);
+        } else {
+          ok('U12-d: (BLOQUEADO — alumno no hallado en CC resumen post-revert)', false);
+          ok('U12-e: (BLOQUEADO)', false);
+        }
       } else {
         // Registrar error sin secretos para diagnóstico de permisos
         const errMsg = typeof rCC.body === 'object'
