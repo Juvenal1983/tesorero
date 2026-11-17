@@ -265,17 +265,40 @@ async function limpiarFixtures(jwt) {
   const a = encodeURIComponent(ALU_ID);
   const q = encodeURIComponent(CUOTA_ID);
   const cr= encodeURIComponent(CURSO_ID);
+  // Orden: primero hijos (abonos, planes, alumno, cuota), luego padre (curso)
   const pasos = [
-    `/rest/v1/abonos?cuenta_id=eq.${c}&alumno_id=eq.${a}`,
-    `/rest/v1/planes_pago?cuenta_id=eq.${c}&alumno_id=eq.${a}`,
-    `/rest/v1/alumnos?cuenta_id=eq.${c}&id=eq.${a}`,
-    `/rest/v1/cuotas?cuenta_id=eq.${c}&id=eq.${q}`,
-    `/rest/v1/cursos?cuenta_id=eq.${c}&id=eq.${cr}`,
+    { nombre: 'abonos',      url: `/rest/v1/abonos?cuenta_id=eq.${c}&alumno_id=eq.${a}` },
+    { nombre: 'planes_pago', url: `/rest/v1/planes_pago?cuenta_id=eq.${c}&alumno_id=eq.${a}` },
+    { nombre: 'alumnos',     url: `/rest/v1/alumnos?cuenta_id=eq.${c}&id=eq.${a}` },
+    { nombre: 'cuotas',      url: `/rest/v1/cuotas?cuenta_id=eq.${c}&id=eq.${q}` },
+    { nombre: 'cursos',      url: `/rest/v1/cursos?cuenta_id=eq.${c}&id=eq.${cr}` },
   ];
-  for (const url of pasos) {
-    await supaAuth(url, jwt, { method: 'DELETE', prefer: 'return=minimal' }).catch(() => {});
+  const errores = [];
+  for (const paso of pasos) {
+    const r = await supaAuth(paso.url, jwt, { method: 'DELETE', prefer: 'return=minimal' })
+      .catch(e => ({ status: 0, body: e.message }));
+    // 200 (con body) o 204 (sin body) son éxito; 404 también (ya inexistente)
+    const ok204 = r.status === 200 || r.status === 204 || r.status === 404;
+    console.log(`  ${ok204 ? '✅' : '⚠️ '} DELETE ${paso.nombre}: HTTP ${r.status}`);
+    if (!ok204) errores.push(`${paso.nombre} HTTP ${r.status}: ${JSON.stringify(r.body).slice(0,80)}`);
   }
-  console.log('  ✅ Fixtures eliminados');
+  // Verificar ausencia real de los tres IDs principales en DB
+  const rAlu   = await supaAuth(`/rest/v1/alumnos?cuenta_id=eq.${c}&id=eq.${a}&select=id`,   jwt).catch(() => ({ status: 0 }));
+  const rCuota = await supaAuth(`/rest/v1/cuotas?cuenta_id=eq.${c}&id=eq.${q}&select=id`,    jwt).catch(() => ({ status: 0 }));
+  const rCurso = await supaAuth(`/rest/v1/cursos?cuenta_id=eq.${c}&id=eq.${cr}&select=id`,   jwt).catch(() => ({ status: 0 }));
+  const aluGone   = rAlu.status   === 200 && Array.isArray(rAlu.body)   && rAlu.body.length   === 0;
+  const cuotaGone = rCuota.status === 200 && Array.isArray(rCuota.body) && rCuota.body.length === 0;
+  const cursoGone = rCurso.status === 200 && Array.isArray(rCurso.body) && rCurso.body.length === 0;
+  console.log(`  Ausencia verificada: alumno=${aluGone?'✅':'❌PRESENTE'} cuota=${cuotaGone?'✅':'❌PRESENTE'} curso=${cursoGone?'✅':'❌PRESENTE'}`);
+  if (!aluGone || !cuotaGone || !cursoGone) {
+    errores.push('IDs todavía presentes en DB tras DELETE');
+  }
+  if (errores.length) {
+    console.error('  ⚠️  Errores en limpieza: ' + errores.join(' | '));
+    console.error(`  Limpiar manualmente: alumno=${ALU_ID} cuota=${CUOTA_ID} curso=${CURSO_ID}`);
+  } else {
+    console.log('  ✅ Fixtures eliminados y ausencia verificada');
+  }
 }
 
 // ── Helpers Playwright ────────────────────────────────────────────────────────
@@ -561,26 +584,24 @@ async function queryAbonos(jwt, planId) {
     console.log(`    Abono pagado: id=${paidAbonoId7} | abonoId0 (ID-ASC): ${abonoId0} | coinciden: ${paidAbonoId7 === abonoId0}`);
     ok('U07-a: pagar_abono completado — abono índice-0 pagado en DB (G03)', !!paidAbono7);
 
-    // ── U07-b: Badge ✅ visible en la UI para el abono específico ─────────────
-    // Usar el ID real del abono pagado (no el ID más bajo por orden) para buscar ↩.
-    if (paidAbono7) {
-      const selRevertirPaid = paidAbonoId7
-        ? `.revertir-abono-btn[data-abono="${paidAbonoId7}"]`
-        : '.revertir-abono-btn';
-      const nBtnPaid = await page.locator(selRevertirPaid).count();
-      if (nBtnPaid === 0) {
+    // ── U07-b: Botón ↩ exacto del abono pagado ───────────────────────────────
+    // Requiere data-abono="${paidAbonoId7}" — NO acepta cualquier .revertir-abono-btn.
+    // Sin paidAbonoId7 no hay forma de confirmar la identidad del abono: falla.
+    if (paidAbono7 && paidAbonoId7) {
+      const selExacto = `.revertir-abono-btn[data-abono="${paidAbonoId7}"]`;
+      let nExacto = await page.locator(selExacto).count();
+      if (nExacto === 0) {
+        // Re-render puede tardar: esperar sólo el selector exacto
         await page.waitForFunction(
-          ({ aId }) =>
-            (aId && document.querySelector(`.revertir-abono-btn[data-abono="${aId}"]`) !== null) ||
-            document.querySelector('.revertir-abono-btn') !== null,
-          { aId: paidAbonoId7 || '' },
+          ({ aId }) => document.querySelector(`.revertir-abono-btn[data-abono="${aId}"]`) !== null,
+          { aId: paidAbonoId7 },
           { timeout: T_CORTO }
         ).catch(async () => { await screenshot(page, 'u07-norevertir'); });
+        nExacto = await page.locator(selExacto).count();
       }
-      const nRevertir = await page.locator('.revertir-abono-btn').count();
-      ok('U07-b: badge ✅ + botón ↩ del abono pagado visibles en UI', nRevertir > 0);
+      ok(`U07-b: botón ↩ exacto data-abono="${paidAbonoId7}" visible en UI`, nExacto > 0);
     } else {
-      ok('U07-b: badge ✅ + botón ↩ del abono pagado (omitido — DB no confirmó pago)', false);
+      ok('U07-b: botón ↩ exacto (BLOQUEADO — sin paidAbonoId7 o pago no confirmado)', false);
     }
 
     ok('U07-c: 1 abono pagado en staging (G03)', ab7.filter(a => a.pagado).length === 1);
@@ -721,26 +742,27 @@ async function queryAbonos(jwt, planId) {
       await screenshot(page, 'u10-norevertir');
     });
 
-    // ── Diagnóstico U10: capturar HTML del modal y estado del plan en S.DB ────
-    // Verifica que getPlanPago encontró el plan cerrado y no está mostrando el form CREAR.
-    const modalHtml10 = await page.evaluate(() => {
-      const m = document.getElementById('modal-ov');
-      return m ? m.innerHTML.replace(/\s+/g, ' ').slice(0, 600) : '(modal no encontrado)';
-    });
-    console.log(`    Modal HTML (600): ${modalHtml10}`);
-    const planDb10 = await page.evaluate(({ aluId, cuotaId, periodo }) => {
-      const db = window.DB || window.S?.DB || {};
-      const planes = db.planesPago || [];
-      const p = planes.find(pl =>
-        (pl.alumnoId === aluId || pl.alumno_id === aluId) &&
-        (pl.cuotaId  === cuotaId || pl.cuota_id === cuotaId) &&
-        pl.periodo   === periodo
-      );
-      return p
-        ? { id: p.id, activo: p.activo, abonosCount: p.abonos?.length ?? 0 }
+    // ── Diagnóstico U10: estado real del plan vía getPlanPago() + tipo de modal ─
+    // window.DB || window.S?.DB no funciona con variables `let` de módulo (E6).
+    // Usamos window.getPlanPago() si está expuesta; si no, inspeccionamos el DOM
+    // para distinguir form CREAR (#pp-num visible) de modal plan existente (↩).
+    const diag10 = await page.evaluate(({ aluId, cuotaId, periodo, pid }) => {
+      // 1. Intentar obtener el plan vía función expuesta
+      const planFn = typeof window.getPlanPago === 'function'
+        ? window.getPlanPago(aluId, cuotaId, periodo)
         : null;
-    }, { aluId: ALU_ID, cuotaId: CUOTA_ID, periodo: PERIODO });
-    console.log(`    Plan en S.DB: ${JSON.stringify(planDb10)}`);
+      // 2. Tipo de modal: form crear vs plan existente
+      const hasCreate    = !!document.getElementById('pp-num');
+      const hasRevertir  = !!document.querySelector('.revertir-abono-btn');
+      const hasPlanIdRef = !!document.querySelector(`[onclick*="${pid}"]`);
+      // 3. Texto del modal (diagnóstico)
+      const m = document.getElementById('modal-ov');
+      const modalText = m ? m.innerText.replace(/\s+/g, ' ').slice(0, 300) : '(sin modal)';
+      return { planFn, hasCreate, hasRevertir, hasPlanIdRef, modalText };
+    }, { aluId: ALU_ID, cuotaId: CUOTA_ID, periodo: PERIODO, pid: planId });
+    console.log(`    getPlanPago(): ${JSON.stringify(diag10.planFn)}`);
+    console.log(`    Modal tipo: hasCreate=${diag10.hasCreate} hasRevertir=${diag10.hasRevertir} hasPlanIdRef=${diag10.hasPlanIdRef}`);
+    console.log(`    Modal texto: ${diag10.modalText}`);
     // ── Fin diagnóstico U10 ───────────────────────────────────────────────────
 
     const nRevertir10 = await page.locator('.revertir-abono-btn').count();
@@ -908,10 +930,10 @@ async function queryAbonos(jwt, planId) {
             ok(`U13-e: plan CUOTA_ID monto_pagado=$${mp13}===$${MONTO_AB2}, monto_pendiente=$${mpend13}===$${MONTO_AB1}, activo=true`,
               mp13 === MONTO_AB2 && mpend13 === MONTO_AB1 && act13 === true);
           } else {
+            // Sin plan exacto no hay forma de verificar importes: fallo duro.
+            // Revisar la estructura real del RPC con los logs anteriores.
             console.log('    U13-e: plan no hallado en planes/planes_pago — claves top: ' + Object.keys(bodyObj13).join(', '));
-            // Fallback parcial: al menos un importe ≠ 90000 debe aparecer
-            const tieneMontoAbono = bodyStr.includes(String(MONTO_AB2));
-            ok('U13-e: respuesta contiene $45.000 — estructura desconocida (verificación parcial)', tieneMontoAbono);
+            ok('U13-e: plan CUOTA_ID no encontrado en respuesta — verificar estructura RPC', false);
           }
         }
 
