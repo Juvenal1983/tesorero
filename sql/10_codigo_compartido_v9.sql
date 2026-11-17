@@ -323,17 +323,19 @@ BEGIN
   -- Se mantienen separados para permitir que con_abono aplique la identidad:
   --   monto_pendiente = pendiente_bruto − abonado (consistent con otros_por_cuota).
   mensual_por_cuota AS (
+    -- B12-alias: alias mpp para evitar 42702 tras inlining de mensual_por_periodo
+    -- (obligaciones_mensual + pagos_mensual + abonos_por_periodo tienen alumno_id)
     SELECT
-      alumno_id,
-      cuota_id,
-      COUNT(*)::INT            AS total_periodos,
-      SUM(periodo_pagado)::INT AS periodos_pagados,
-      SUM(obligado)            AS obligado,
-      SUM(pagado)              AS pagado,
-      SUM(abonado_efectivo)    AS abonado_total,
-      SUM(pendiente)           AS pendiente_bruto  -- gross (sin descontar abono)
-    FROM mensual_por_periodo
-    GROUP BY alumno_id, cuota_id
+      mpp.alumno_id,
+      mpp.cuota_id,
+      COUNT(*)::INT                AS total_periodos,
+      SUM(mpp.periodo_pagado)::INT AS periodos_pagados,
+      SUM(mpp.obligado)            AS obligado,
+      SUM(mpp.pagado)              AS pagado,
+      SUM(mpp.abonado_efectivo)    AS abonado_total,
+      SUM(mpp.pendiente)           AS pendiente_bruto  -- gross (sin descontar abono)
+    FROM mensual_por_periodo mpp
+    GROUP BY mpp.alumno_id, mpp.cuota_id
   ),
 
   -- ── Resumen no-mensual por (alumno × cuota) ──────────────────
@@ -387,21 +389,22 @@ BEGIN
   -- Para mensual: abonado_total viene de mensual_por_cuota (período-level).
   -- Para otros:   abonado_total=0 (se aplicará en con_abono desde abonos_por_cuota).
   todos_por_cuota AS (
-    SELECT alumno_id, cuota_id,
-           total_periodos    AS total_obs,
-           periodos_pagados  AS obs_pagadas,
-           obligado, pagado,
-           abonado_total,       -- B5: período-level abono ya calculado
-           pendiente_bruto      -- gross (sin abono) para identidad algebraica
-    FROM mensual_por_cuota
+    -- B12-alias: aliases mpc/opc para evitar 42702 tras inlining
+    SELECT mpc.alumno_id, mpc.cuota_id,
+           mpc.total_periodos    AS total_obs,
+           mpc.periodos_pagados  AS obs_pagadas,
+           mpc.obligado, mpc.pagado,
+           mpc.abonado_total,       -- B5: período-level abono ya calculado
+           mpc.pendiente_bruto      -- gross (sin abono) para identidad algebraica
+    FROM mensual_por_cuota mpc
     UNION ALL
-    SELECT alumno_id, cuota_id,
-           total_obligaciones,
-           obligaciones_pagadas,
-           obligado, pagado,
+    SELECT opc.alumno_id, opc.cuota_id,
+           opc.total_obligaciones,
+           opc.obligaciones_pagadas,
+           opc.obligado, opc.pagado,
            0::NUMERIC AS abonado_total,  -- para otros, abono se aplica en con_abono
-           pendiente_bruto
-    FROM otros_por_cuota
+           opc.pendiente_bruto
+    FROM otros_por_cuota opc
   ),
 
   -- ── Aplicar abono limitado al pendiente bruto de su cuota ─────
@@ -434,16 +437,18 @@ BEGIN
 
   -- ── Resumen final agregado por alumno ─────────────────────────
   resumen_alumno AS (
+    -- B12-alias: alias ca para evitar 42702 tras inlining de con_abono
+    -- (todos_por_cuota + abonos_por_cuota tienen alumno_id)
     SELECT
-      alumno_id,
-      SUM(total_obs)::INT       AS total_obligaciones,
-      SUM(obs_pagadas)::INT     AS total_pagadas,
-      SUM(pagado)               AS monto_pagado,
-      SUM(abonado)              AS monto_abonado,
+      ca.alumno_id,
+      SUM(ca.total_obs)::INT       AS total_obligaciones,
+      SUM(ca.obs_pagadas)::INT     AS total_pagadas,
+      SUM(ca.pagado)               AS monto_pagado,
+      SUM(ca.abonado)              AS monto_abonado,
       -- pendiente = bruto − abono; bruto ≥ abono garantizado por LEAST anterior
-      SUM(pendiente_bruto - abonado) AS monto_pendiente
-    FROM con_abono
-    GROUP BY alumno_id
+      SUM(ca.pendiente_bruto - ca.abonado) AS monto_pendiente
+    FROM con_abono ca
+    GROUP BY ca.alumno_id
   )
 
   SELECT

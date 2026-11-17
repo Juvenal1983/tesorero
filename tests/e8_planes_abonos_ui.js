@@ -545,37 +545,42 @@ async function queryAbonos(jwt, planId) {
     }
 
     // ── U07-a: Confirmar vía DB (fuente de verdad — no badge genérico) ────────
-    // Polling hasta T_LARGO: esperar que abono 0 quede pagado en la DB
+    // Polling hasta T_LARGO: esperar que ALGÚN abono quede pagado en la DB.
+    // NO usar ab7[0] por índice ID: PostgreSQL ordena por id ASC, pero pagarAbono(planId,0)
+    // usa el índice 0 del array del modal, que puede estar ordenado distinto (p.ej. por fecha).
     let ab7 = [];
     const t07 = Date.now();
     while (Date.now() - t07 < T_LARGO) {
       ab7 = await queryAbonos(jwt, planId);
-      if (ab7[0]?.pagado) break;
+      if (ab7.some(a => a.pagado)) break;
       await new Promise(r => setTimeout(r, 600));
     }
-    ok('U07-a: pagar_abono completado — abono 0 pagado en DB (G03)', ab7[0]?.pagado === true);
+    // Encontrar el abono realmente pagado; no asumir que coincide con ab7[0]
+    const paidAbono7   = ab7.find(a => a.pagado);
+    const paidAbonoId7 = paidAbono7?.id ?? null;
+    console.log(`    Abono pagado: id=${paidAbonoId7} | abonoId0 (ID-ASC): ${abonoId0} | coinciden: ${paidAbonoId7 === abonoId0}`);
+    ok('U07-a: pagar_abono completado — abono índice-0 pagado en DB (G03)', !!paidAbono7);
 
     // ── U07-b: Badge ✅ visible en la UI para el abono específico ─────────────
-    // La UI debería haberse re-renderizado; usamos el data-abono para ser exactos.
-    if (ab7[0]?.pagado) {
-      const selRevertir0 = abonoId0
-        ? `.revertir-abono-btn[data-abono="${abonoId0}"]`
-        : '.revertir-abono-btn[data-idx="0"]';
-      const nBtn0 = await page.locator(selRevertir0).count();
-      if (nBtn0 === 0) {
-        // El re-render puede tardar: esperar el botón ↩ del abono 0
+    // Usar el ID real del abono pagado (no el ID más bajo por orden) para buscar ↩.
+    if (paidAbono7) {
+      const selRevertirPaid = paidAbonoId7
+        ? `.revertir-abono-btn[data-abono="${paidAbonoId7}"]`
+        : '.revertir-abono-btn';
+      const nBtnPaid = await page.locator(selRevertirPaid).count();
+      if (nBtnPaid === 0) {
         await page.waitForFunction(
           ({ aId }) =>
-            document.querySelector(`.revertir-abono-btn[data-abono="${aId}"]`) !== null ||
-            document.querySelector('.revertir-abono-btn[data-idx="0"]') !== null,
-          { aId: abonoId0 || '' },
+            (aId && document.querySelector(`.revertir-abono-btn[data-abono="${aId}"]`) !== null) ||
+            document.querySelector('.revertir-abono-btn') !== null,
+          { aId: paidAbonoId7 || '' },
           { timeout: T_CORTO }
         ).catch(async () => { await screenshot(page, 'u07-norevertir'); });
       }
       const nRevertir = await page.locator('.revertir-abono-btn').count();
-      ok('U07-b: badge ✅ + botón ↩ del abono 0 visibles en UI', nRevertir > 0);
+      ok('U07-b: badge ✅ + botón ↩ del abono pagado visibles en UI', nRevertir > 0);
     } else {
-      ok('U07-b: badge ✅ + botón ↩ del abono 0 (omitido — DB no confirmó pago)', false);
+      ok('U07-b: badge ✅ + botón ↩ del abono pagado (omitido — DB no confirmó pago)', false);
     }
 
     ok('U07-c: 1 abono pagado en staging (G03)', ab7.filter(a => a.pagado).length === 1);
@@ -715,6 +720,29 @@ async function queryAbonos(jwt, planId) {
     await page.waitForSelector('.revertir-abono-btn', { timeout: T_LARGO }).catch(async () => {
       await screenshot(page, 'u10-norevertir');
     });
+
+    // ── Diagnóstico U10: capturar HTML del modal y estado del plan en S.DB ────
+    // Verifica que getPlanPago encontró el plan cerrado y no está mostrando el form CREAR.
+    const modalHtml10 = await page.evaluate(() => {
+      const m = document.getElementById('modal-ov');
+      return m ? m.innerHTML.replace(/\s+/g, ' ').slice(0, 600) : '(modal no encontrado)';
+    });
+    console.log(`    Modal HTML (600): ${modalHtml10}`);
+    const planDb10 = await page.evaluate(({ aluId, cuotaId, periodo }) => {
+      const db = window.DB || window.S?.DB || {};
+      const planes = db.planesPago || [];
+      const p = planes.find(pl =>
+        (pl.alumnoId === aluId || pl.alumno_id === aluId) &&
+        (pl.cuotaId  === cuotaId || pl.cuota_id === cuotaId) &&
+        pl.periodo   === periodo
+      );
+      return p
+        ? { id: p.id, activo: p.activo, abonosCount: p.abonos?.length ?? 0 }
+        : null;
+    }, { aluId: ALU_ID, cuotaId: CUOTA_ID, periodo: PERIODO });
+    console.log(`    Plan en S.DB: ${JSON.stringify(planDb10)}`);
+    // ── Fin diagnóstico U10 ───────────────────────────────────────────────────
+
     const nRevertir10 = await page.locator('.revertir-abono-btn').count();
     ok('U10-b: botón ↩ visible en plan COMPLETADO (getPlanPago sin &&p.activo)', nRevertir10 > 0);
 
@@ -858,10 +886,34 @@ async function queryAbonos(jwt, planId) {
                              bodyStr.includes('"monto_pagado"') || bodyStr.includes('"deuda"');
         ok('U13-d: respuesta contiene datos de planes o abonos', tienePlanes || tieneBalance);
 
-        // Si hay planes_pago o abonos, verificar importes exactos con los del fixture
-        // Buscar monto $45.000 en la respuesta (correspondiente a abono pagado)
-        const tieneMontoAbono = bodyStr.includes(String(MONTO_AB2)) || bodyStr.includes(String(MONTO_AB1));
-        ok('U13-e: respuesta refleja importes exactos del fixture ($45.000)', tieneMontoAbono);
+        // U13-e: tras la reversión el plan debe tener monto_pagado=45000, monto_pendiente=45000,
+        // activo=true. No usar inclusión de cadena "45000": pasa aunque ambos abonos estén pagados
+        // porque cada abono tiene monto=45000. Bloquear si no hubo reversión.
+        if (!revertEjecutado) {
+          ok('U13-e: importes exactos (BLOQUEADO — revert no ejecutado)', false);
+        } else {
+          const bodyObj13 = rSit.body || {};
+          // Buscar plan del fixture en las estructuras conocidas del RPC
+          const planesArr13 = Array.isArray(bodyObj13.planes)       ? bodyObj13.planes
+            :  Array.isArray(bodyObj13.planes_pago) ? bodyObj13.planes_pago
+            :  [];
+          const planRpc13 = planesArr13.find(p =>
+            p.cuota_id  === CUOTA_ID || p.cuotaId  === CUOTA_ID || p.id === planId
+          );
+          if (planRpc13) {
+            const mp13    = Number(planRpc13.monto_pagado   ?? planRpc13.montoPagado   ?? -1);
+            const mpend13 = Number(planRpc13.monto_pendiente ?? planRpc13.montoPendiente ?? -1);
+            const act13   = planRpc13.activo;
+            console.log(`    U13-e plan CUOTA_ID: monto_pagado=${mp13}, monto_pendiente=${mpend13}, activo=${act13}`);
+            ok(`U13-e: plan CUOTA_ID monto_pagado=$${mp13}===$${MONTO_AB2}, monto_pendiente=$${mpend13}===$${MONTO_AB1}, activo=true`,
+              mp13 === MONTO_AB2 && mpend13 === MONTO_AB1 && act13 === true);
+          } else {
+            console.log('    U13-e: plan no hallado en planes/planes_pago — claves top: ' + Object.keys(bodyObj13).join(', '));
+            // Fallback parcial: al menos un importe ≠ 90000 debe aparecer
+            const tieneMontoAbono = bodyStr.includes(String(MONTO_AB2));
+            ok('U13-e: respuesta contiene $45.000 — estructura desconocida (verificación parcial)', tieneMontoAbono);
+          }
+        }
 
         // Si tiene balance_curso con total_pagado, verificar valor exacto (no >= genérico)
         const bal = rSit.body?.balance_curso;
