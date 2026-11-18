@@ -242,16 +242,27 @@ async function navegarConfig(page) {
 /**
  * Dispara importarDatos con el JSON dado y espera el mensaje TERMINAL.
  *
- * Terminal = #export-msg visible con texto que NO empiece con '⏳'.
- * Limpia el mensaje anterior antes de disparar para evitar lecturas residuales.
- * Timeout: 30 s.
+ * Señal explícita: respaldos.js escribe `data-import-done="1"` en #export-msg
+ * en TODOS sus puntos de salida (✅, ⚠️, ❌, cancelado). La señal persiste
+ * aunque el setTimeout de 8 s oculte el elemento; el texto se lee de innerHTML,
+ * no de innerText, para funcionar incluso con display:none.
+ *
+ * Antes de disparar se elimina el atributo (y se oculta el elemento) para evitar
+ * lecturas residuales de operaciones anteriores.
+ *
+ * Timeout: 40 s.
  */
 async function dispararImportacion(page, jsonContent) {
   const jsonStr = typeof jsonContent === 'string' ? jsonContent : JSON.stringify(jsonContent);
 
+  // Limpiar señal y contenido residual
   await page.evaluate(() => {
     const el = document.getElementById('export-msg');
-    if (el) { el.style.display = 'none'; el.innerHTML = ''; }
+    if (el) {
+      el.style.display = 'none';
+      el.innerHTML = '';
+      delete el.dataset.importDone;
+    }
   });
 
   await page.evaluate((jsonStr) => {
@@ -265,22 +276,30 @@ async function dispararImportacion(page, jsonContent) {
 
   let msgTexto = null;
   try {
+    // Esperar la señal explícita: data-import-done="1" escrita por setTerminal en respaldos.js.
+    // No depende de visibilidad ni de innerText para evitar falsos negativos por display:none.
     await page.waitForFunction(() => {
       const el = document.getElementById('export-msg');
-      if (!el || el.style.display === 'none') return false;
-      const txt = el.innerText.trim();
-      return txt.length > 0 && !txt.startsWith('⏳');
-    }, { timeout: 30_000 });
+      return !!(el && el.dataset.importDone === '1');
+    }, { timeout: 40_000 });
+
+    // Leer el texto desde innerHTML (funciona aunque el elemento esté oculto)
     msgTexto = await page.evaluate(() => {
       const el = document.getElementById('export-msg');
-      return el ? el.innerText.trim() : null;
+      if (!el) return null;
+      // Extraer texto visible del primer hijo (el div.alert interno)
+      const inner = el.querySelector('.alert') || el;
+      return inner.innerText?.trim() || inner.textContent?.trim() || null;
     });
-  } catch (_) {
+  } catch (err) {
+    // Timeout o error — intentar leer lo que haya
     msgTexto = await page.evaluate(() => {
       const el = document.getElementById('export-msg');
-      return el ? el.innerText.trim() : null;
+      if (!el) return null;
+      const inner = el.querySelector('.alert') || el;
+      return inner.innerText?.trim() || inner.textContent?.trim() || null;
     }).catch(() => null);
-    if (msgTexto) console.warn(`  [dispararImportacion] timeout — mensaje actual: "${msgTexto}"`);
+    console.warn(`  [dispararImportacion] timeout/error (${err.message?.slice(0,60)}) — mensaje actual: "${msgTexto}"`);
   }
   return msgTexto;
 }
@@ -838,23 +857,32 @@ async function existeEnDB(jwt, tabla, id) {
     console.log('\n[R10] FK inválida → mensaje terminal ⚠️/❌ en UI');
     if (!respaldoFixture) { skip('R10', 'requiere respaldoFixture'); } else {
       const backupFK = JSON.parse(JSON.stringify(respaldoFixture));
-      backupFK.colecciones.alumnos.push({
-        id: crypto.randomUUID(), cuenta_id: CUENTA_ID,
-        curso_id: crypto.randomUUID(),   // FK a curso inexistente
-        nombres: 'FKInvalidaR10', apellidos: EXEC_ID, estado: 'activo',
-      });
-      dialogState.ultimoDialog = null;
-      await navegarConfig(page);
-      const msgFK = await dispararImportacion(page, backupFK);
-      console.log(`  Mensaje: ${msgFK || '(vacío/timeout)'}`);
-      ok('R10-a: UI muestra mensaje terminal no vacío y no ⏳',
-        !!(msgFK && msgFK.length > 0 && !msgFK.startsWith('⏳')));
-      ok('R10-b: mensaje es ⚠️ o ❌ (error reportado)',
-        !!(msgFK && (msgFK.startsWith('⚠️') || msgFK.startsWith('❌'))));
-      ok('R10-c: UI NO anuncia ✅ restauración completa con FK inválida',
-        !(msgFK && msgFK.startsWith('✅')));
-      nota('R10-d comportamiento de chunks',
-        'La transacción es por chunk (100 filas); chunks anteriores a la FK inválida ya confirmados no revierten.');
+      // Clonar una fila REAL del respaldo para conservar exactamente el mismo juego de claves
+      // que las demás filas del lote (PostgREST rechaza PGRST102 si difieren).
+      // Solo se cambia id, curso_id (FK a UUID inexistente) y nombres para identificación.
+      const alumnoBase = backupFK.colecciones.alumnos.find(a => fc.alumnos.includes(a.id));
+      if (!alumnoBase) {
+        skip('R10', 'no hay alumno fixture en respaldoFixture para clonar');
+      } else {
+        backupFK.colecciones.alumnos.push({
+          ...alumnoBase,
+          id:       crypto.randomUUID(),
+          curso_id: crypto.randomUUID(),   // FK a curso inexistente → violación FK
+          nombres:  'FKInvalidaR10',
+        });
+        dialogState.ultimoDialog = null;
+        await navegarConfig(page);
+        const msgFK = await dispararImportacion(page, backupFK);
+        console.log(`  Mensaje: ${msgFK || '(vacío/timeout)'}`);
+        ok('R10-a: UI muestra mensaje terminal no vacío y no ⏳',
+          !!(msgFK && msgFK.length > 0 && !msgFK.startsWith('⏳')));
+        ok('R10-b: mensaje es ⚠️ o ❌ (error reportado)',
+          !!(msgFK && (msgFK.startsWith('⚠️') || msgFK.startsWith('❌'))));
+        ok('R10-c: UI NO anuncia ✅ restauración completa con FK inválida',
+          !(msgFK && msgFK.startsWith('✅')));
+        nota('R10-d comportamiento de chunks',
+          'La transacción es por chunk (100 filas); chunks anteriores a la FK inválida ya confirmados no revierten.');
+      }
     }
 
     // ── R11 ───────────────────────────────────────────────────────────────────

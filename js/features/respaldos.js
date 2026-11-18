@@ -262,8 +262,12 @@ async function _importarDatosV9(e) {
   const setMsg = (txt, ok) => {
     if (!msgEl) return;
     msgEl.innerHTML = `<div class="alert ${ok?'ag':'ar'}">${txt}</div>`;
-    msgEl.style.display = '';
+    msgEl.style.display = 'block';
   };
+  // setTerminal: escribe el mensaje final Y marca data-import-done para señalizar al test.
+  // Usar en TODOS los puntos de salida (return) y al finalizar el bucle de upsert.
+  // El atributo persiste aunque el setTimeout oculte el elemento.
+  const setTerminal = (txt, ok) => { setMsg(txt, ok); if (msgEl) msgEl.dataset.importDone = '1'; };
 
   setMsg('⏳ Leyendo archivo…', true);
 
@@ -272,12 +276,12 @@ async function _importarDatosV9(e) {
     const text = await file.text();
     backup = JSON.parse(text);
   } catch (err) {
-    setMsg('❌ Archivo inválido: ' + err.message, false);
+    setTerminal('❌ Archivo inválido: ' + err.message, false);
     return;
   }
 
   if (backup.version !== 'v9-completo') {
-    setMsg(
+    setTerminal(
       '❌ Este archivo no es un respaldo V9 (version: ' + (backup.version||'desconocida') + ').<br>' +
       'Para respaldos anteriores usa el Panel SQL de Supabase.',
       false
@@ -287,11 +291,11 @@ async function _importarDatosV9(e) {
 
   const cuentaId = _respCuentaId();
   const token    = _respToken();
-  if (!cuentaId || !token) { setMsg('❌ Sin sesión activa.', false); return; }
+  if (!cuentaId || !token) { setTerminal('❌ Sin sesión activa.', false); return; }
 
   // Guardia de encabezado: el respaldo debe pertenecer a esta cuenta.
   if (backup.cuentaId !== cuentaId) {
-    setMsg(
+    setTerminal(
       '❌ El respaldo pertenece a otra cuenta (' + backup.cuentaId + ').<br>' +
       'No se puede restaurar en esta cuenta.',
       false
@@ -343,7 +347,7 @@ async function _importarDatosV9(e) {
     if (_filasAjenas.length >= 3) break;
   }
   if (_filasAjenas.length > 0) {
-    setMsg(
+    setTerminal(
       '❌ Registros con cuenta_id ajeno o ausente detectados. Importación cancelada.<br>' +
       _filasAjenas.map(f => '&nbsp;• ' + f).join('<br>'),
       false
@@ -356,7 +360,11 @@ async function _importarDatosV9(e) {
   if (!confirm(
     '¿Restaurar ' + total + ' registros desde el respaldo del ' + fecha + '?\n\n' +
     'Los registros existentes se actualizarán; no se eliminarán registros ausentes.'
-  )) return;
+  )) {
+    // Cancelado por el usuario — señalizar igualmente para que el test no quede colgado.
+    if (msgEl) msgEl.dataset.importDone = '1';
+    return;
+  }
 
   setMsg('⏳ Restaurando datos…', true);
 
@@ -377,15 +385,17 @@ async function _importarDatosV9(e) {
 
   const nErrores = Object.keys(erroresPorTabla).length;
   if (nErrores === 0) {
-    setMsg('✅ Restauración completa: ' + restaurados + '/' + total + ' registros restaurados.', true);
+    setTerminal('✅ Restauración completa: ' + restaurados + '/' + total + ' registros restaurados.', true);
   } else {
     const detalle = Object.entries(erroresPorTabla)
       .slice(0,3).map(([t,m])=>t+': '+m).join('<br>');
-    setMsg(
+    setTerminal(
       '⚠️ Restaurado con errores (' + restaurados + '/' + total + ' registros).<br>' + detalle,
       false
     );
   }
+  // data-import-done ya fue escrito por setTerminal — el hide solo afecta la visibilidad,
+  // no la señal. El test lee innerHTML después de detectar la señal.
   setTimeout(() => { if (msgEl) msgEl.style.display = 'none'; }, 8000);
 }
 
