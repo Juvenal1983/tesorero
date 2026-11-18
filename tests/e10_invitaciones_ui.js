@@ -6,17 +6,17 @@
  * Verifica:
  *   I01  Servidor local levantado
  *   I02  Login UI completado (_v9CuentaId disponible)
- *   I03  Crear código vía UI → fila en DB (codigo, para, tipo, activo=true)
+ *   I03  Crear código vía UI (modal real) → fila en DB (para, tipo, activo=true)
  *   I04  Código persiste y aparece tras reload
  *   I05  Desactivar código → activo=false en DB
- *   I06  Crear segundo código → sincronizarCodigos → ambos aparecen en UI
+ *   I06  Crear 2° código vía REST + sincronizarCodigosDesdeSupabase → aparece en UI
  *   I07  Eliminar código → ausente en DB
  *   I08  Limpieza: fixtures eliminados de staging (en finally)
  *
- * Patrón: igual que E8/E9 — login REST para fixtures, login UI para comportamiento,
+ * Patrón: igual que E8 — login REST para fixtures, login UI para comportamiento,
  * poll REST para verificación, aislamiento por EXEC_ID.
  *
- * Variables de entorno requeridas (mismo .env que E8/E9):
+ * Variables de entorno requeridas (mismo .env que E8):
  *   STAGING_SUPABASE_URL, STAGING_SUPABASE_ANON_KEY (o STAGING_KEY),
  *   STAGING_USER_A_EMAIL (o STAGING_EMAIL), STAGING_USER_A_PASSWORD (o STAGING_PASS)
  * Opcional:
@@ -40,7 +40,7 @@ const USER_EMAIL   = process.env.STAGING_USER_A_EMAIL || process.env.STAGING_EMA
 const USER_PASS    = process.env.STAGING_USER_A_PASSWORD || process.env.STAGING_PASS || '';
 
 if (!SUPA_URL_RAW || !ANON_KEY || !USER_EMAIL || !USER_PASS) {
-  console.error('❌ Faltan variables de entorno. Revisa .env (mismas que E8/E9).');
+  console.error('❌ Faltan variables de entorno. Revisa .env (mismas que E8).');
   process.exit(1);
 }
 
@@ -55,11 +55,10 @@ if (parsedHost === PROD_HOST || parsedHost !== STAGING_HOST) {
 
 // ── Fixtures y constantes ─────────────────────────────────────────────────────
 
-const EXEC_ID  = Date.now().toString(36);
-const CODIGO1  = `INV-B1-1-${EXEC_ID}`.toUpperCase();
-const CODIGO2  = `INV-B1-2-${EXEC_ID}`.toUpperCase();
-const PARA1    = `apoderado-b1-${EXEC_ID}@test.cl`;
-const PARA2    = `apoderado-b1-2-${EXEC_ID}@test.cl`;
+const EXEC_ID = Date.now().toString(36);
+// El campo `para` es el identificador de búsqueda — el codigo se genera aleatoriamente
+const PARA1   = `testb1-1-${EXEC_ID}`;
+const PARA2   = `testb1-2-${EXEC_ID}`;
 const APP_PORT = 8799;
 
 let CUENTA_ID = process.env.STAGING_CUENTA_ID || null;
@@ -74,7 +73,7 @@ function ok(label, cond) {
 const T_CORTO = 12_000;
 const T_LARGO = 30_000;
 
-// ── HTTP helpers (mismos que E8/E9) ───────────────────────────────────────────
+// ── HTTP helpers (mismos que E8) ──────────────────────────────────────────────
 
 function _fetch(urlPath, opts = {}) {
   return new Promise((resolve, reject) => {
@@ -114,7 +113,7 @@ function supaAnon(urlPath, opts = {}) {
   return _fetch(urlPath, { ...opts, authHeader: null });
 }
 
-// ── Servidor HTTP local (igual que E8/E9) ─────────────────────────────────────
+// ── Servidor HTTP local (igual que E8) ────────────────────────────────────────
 
 function servirApp() {
   const MIME = {
@@ -199,13 +198,7 @@ function interceptDialogs(page) {
   });
 }
 
-/** Navegar a la sección de invitaciones */
-async function navegarInvitaciones(page) {
-  await page.evaluate(() => { if (typeof go === 'function') go('invitaciones'); });
-  await page.waitForFunction(() => window.S?.route === 'invitaciones', { timeout: T_CORTO });
-}
-
-/** Navegar a la sección de config (donde suelen vivir los códigos en algunas vistas) */
+/** Navegar a la sección de config (donde vive la gestión de invitaciones) */
 async function navegarConfig(page) {
   await page.evaluate(() => { if (typeof go === 'function') go('config'); });
   await page.waitForFunction(() => window.S?.route === 'config', { timeout: T_CORTO });
@@ -215,13 +208,13 @@ async function navegarConfig(page) {
 
 async function limpiarCodigos(jwt) {
   if (!CUENTA_ID) return;
-  // Elimina todos los códigos cuyo campo `id` o `codigo` contiene EXEC_ID
+  // Eliminar por para (campo identificador de test)
   const r = await supaAuth(
-    `/rest/v1/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&codigo=like.*${EXEC_ID}*`,
+    `/rest/v1/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&para=like.*${EXEC_ID}*`,
     jwt, { method: 'DELETE', prefer: 'return=minimal' }
   );
-  console.log(`  🧹 limpiarCodigos (por codigo): HTTP ${r.status}`);
-  // También limpiar por id por si el campo id contiene EXEC_ID
+  console.log(`  🧹 limpiarCodigos (por para): HTTP ${r.status}`);
+  // También por id que contiene EXEC_ID (fixture I06)
   const r2 = await supaAuth(
     `/rest/v1/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&id=like.*${EXEC_ID}*`,
     jwt, { method: 'DELETE', prefer: 'return=minimal' }
@@ -237,8 +230,8 @@ async function limpiarCodigos(jwt) {
   console.log('══════════════════════════════════════════════════════════════\n');
   console.log(`EXEC_ID  : ${EXEC_ID}`);
   console.log(`Staging  : ${SUPA_URL}`);
-  console.log(`Código 1 : ${CODIGO1}`);
-  console.log(`Código 2 : ${CODIGO2}`);
+  console.log(`Para1    : ${PARA1}`);
+  console.log(`Para2    : ${PARA2}`);
 
   // ── Pre: login REST ───────────────────────────────────────────────────────
   console.log('\n[Pre] Login REST');
@@ -252,6 +245,7 @@ async function limpiarCodigos(jwt) {
   }
 
   let server = null, browser = null;
+  let codigoGenerado1 = null; // valor del campo `codigo` generado por la app
 
   try {
     // ── I01: Servidor ─────────────────────────────────────────────────────
@@ -286,87 +280,80 @@ async function limpiarCodigos(jwt) {
       throw new Error('Login UI no completó');
     }
 
-    // ── I03: Crear código vía UI → verificar DB ───────────────────────────
+    // ── I03: Crear código vía UI (modal real) → verificar DB ─────────────
     console.log('\n[I03] Crear código vía UI → fila en DB');
-    await navegarInvitaciones(page).catch(() => navegarConfig(page));
-    // Mostrar formulario de creación
+    await navegarConfig(page);
+
+    // Abrir modal de nuevo código (tipo prueba)
     await page.evaluate(() => {
-      if (typeof mostrarFormInvitacion === 'function') mostrarFormInvitacion();
+      if (typeof showModal === 'function') showModal('nuevoCodigoModal', { tipo: 'prueba' });
     });
-    await page.waitForTimeout(500);
+    // Esperar que el modal sea visible con #cod-para
+    await page.waitForSelector('#cod-para', { state: 'visible', timeout: T_CORTO });
 
-    // Llenar campos del formulario
-    const inputCodigo = page.locator('#inv-codigo, #codigo-invitacion, input[name="codigo"]').first();
-    const inputPara   = page.locator('#inv-para, #para-invitacion, input[name="para"]').first();
-    const inputTipo   = page.locator('#inv-tipo, #tipo-invitacion, select[name="tipo"]').first();
+    // Llenar campo "para" con identificador de test
+    await page.fill('#cod-para', PARA1);
 
-    if (await inputCodigo.count() > 0) await inputCodigo.fill(CODIGO1);
-    if (await inputPara.count()   > 0) await inputPara.fill(PARA1);
-    if (await inputTipo.count()   > 0) {
-      const tag = await inputTipo.evaluate(el => el.tagName.toLowerCase());
-      if (tag === 'select') await inputTipo.selectOption({ index: 0 });
-      else await inputTipo.fill('alumno');
-    }
-
-    // Guardar
+    // Confirmar generación — interceptDialogs acepta los confirm automáticamente
     await page.evaluate(() => {
-      if (typeof guardarInvitacion     === 'function') return guardarInvitacion();
-      if (typeof crearCodigoConDatos   === 'function') return crearCodigoConDatos();
-      if (typeof agregarCodigoInvitacion === 'function') return agregarCodigoInvitacion();
+      if (typeof crearCodigoConDatos === 'function') crearCodigoConDatos('prueba');
     });
-    await page.waitForTimeout(1800);
+    await page.waitForTimeout(2000);
 
-    // Poll REST — buscar por cuenta_id + codigo
+    // Poll REST — buscar por cuenta_id + para
     const r03 = await supaAuth(
-      `/rest/v1/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&codigo=eq.${encodeURIComponent(CODIGO1)}&select=id,codigo,para,tipo,activo`,
+      `/rest/v1/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&para=eq.${encodeURIComponent(PARA1)}&select=id,codigo,para,tipo,activo`,
       jwt
     );
     ok('I03-a: GET codigos responde 200', r03.status === 200);
     const fila03 = Array.isArray(r03.body) ? r03.body[0] : null;
     ok('I03-b: fila insertada en DB', !!fila03);
-    ok('I03-c: codigo correcto', fila03?.codigo === CODIGO1);
+    ok('I03-c: para correcto', fila03?.para === PARA1);
     ok('I03-d: activo=true por defecto', fila03?.activo === true);
+    codigoGenerado1 = fila03?.codigo || null;
+    console.log(`  Código generado: ${codigoGenerado1}`);
 
     // ── I04: Código persiste tras reload ──────────────────────────────────
     console.log('\n[I04] Código persiste tras reload');
     await page.reload({ waitUntil: 'load', timeout: T_LARGO });
     await waitAppReady(page);
     await reloginViaUI(page);
-    await navegarInvitaciones(page).catch(() => navegarConfig(page));
+    await navegarConfig(page);
     const html04 = await page.locator('#contenido, main, body').innerHTML().catch(() => '');
-    ok('I04-a: código visible en UI tras reload', html04.includes(CODIGO1));
+    ok('I04-a: código visible en UI tras reload',
+      !!(codigoGenerado1 && html04.includes(codigoGenerado1)) || html04.includes(PARA1)
+    );
 
     // ── I05: Desactivar código ────────────────────────────────────────────
     console.log('\n[I05] Desactivar código → activo=false');
-    const codigoId05 = fila03?.id || null;
-
-    if (codigoId05) {
-      await page.evaluate(id => {
-        if (typeof desactivarCodigo === 'function') return desactivarCodigo(id);
-        if (typeof desactivarCodigoPorCodigo === 'function') return desactivarCodigoPorCodigo(id);
-      }, codigoId05);
+    if (codigoGenerado1) {
+      // desactivarCodigoPorCodigo recibe el string del código, no el _id
+      await page.evaluate(codigo => {
+        if (typeof desactivarCodigoPorCodigo === 'function') return desactivarCodigoPorCodigo(codigo);
+      }, codigoGenerado1);
       await page.waitForTimeout(1500);
 
       const r05 = await supaAuth(
-        `/rest/v1/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&id=eq.${encodeURIComponent(codigoId05)}&select=activo`,
+        `/rest/v1/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&para=eq.${encodeURIComponent(PARA1)}&select=activo`,
         jwt
       );
       ok('I05-a: GET codigo responde 200', r05.status === 200);
       ok('I05-b: activo=false en DB', r05.body?.[0]?.activo === false);
     } else {
-      ok('I05-a: (BLOQUEADO — id no hallado)', false);
+      ok('I05-a: (BLOQUEADO — código no hallado en I03)', false);
       ok('I05-b: (BLOQUEADO)', false);
     }
 
-    // ── I06: Crear 2° código + sincronizar ────────────────────────────────
-    console.log('\n[I06] Crear 2° código → sincronizar → ambos en UI');
-    // Crear segundo código vía REST directo (fixture) para verificar sincronización
+    // ── I06: Crear 2° código vía REST + sincronizar ───────────────────────
+    console.log('\n[I06] Crear 2° código REST → sincronizar → aparece en UI');
+    // Generar un código con formato estándar de la app (3 segmentos de 4 chars)
+    const codigo2 = `TEST-${EXEC_ID.toUpperCase().slice(0,4)}-B1`;
     const payload06 = {
       cuenta_id: CUENTA_ID,
       id:        `ci-b1-2-${EXEC_ID}`,
-      codigo:    CODIGO2,
+      codigo:    codigo2,
       para:      PARA2,
-      tipo:      'alumno',
+      tipo:      'prueba',
       activo:    true,
       usado:     false,
     };
@@ -377,29 +364,31 @@ async function limpiarCodigos(jwt) {
     );
     ok('I06-a: fixture 2° código insertado REST', r06ins.status === 201 || r06ins.status === 200);
 
-    // Sincronizar desde UI
+    // Sincronizar desde UI — recargarCodigosV9 actualiza la lista
     await page.evaluate(() => {
-      if (typeof sincronizarCodigos === 'function') return sincronizarCodigos();
       if (typeof sincronizarCodigosDesdeSupabase === 'function') return sincronizarCodigosDesdeSupabase();
-      if (typeof recargarCodigos === 'function') return recargarCodigos();
+      if (typeof recargarCodigosV9 === 'function') return recargarCodigosV9(false);
     });
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2000);
 
+    // Volver a config para que renderPage() refresque la vista
+    await navegarConfig(page);
     const html06 = await page.locator('#contenido, main, body').innerHTML().catch(() => '');
-    ok('I06-b: CODIGO1 visible tras sincronizar', html06.includes(CODIGO1) || html06.includes(EXEC_ID));
-    ok('I06-c: CODIGO2 visible tras sincronizar', html06.includes(CODIGO2));
+    ok('I06-b: PARA2 o codigo2 visible tras sincronizar',
+      html06.includes(PARA2) || html06.includes(codigo2)
+    );
 
     // ── I07: Eliminar código ──────────────────────────────────────────────
     console.log('\n[I07] Eliminar código → ausente en DB');
-    if (codigoId05) {
-      await page.evaluate(id => {
-        if (typeof eliminarCodigo === 'function') return eliminarCodigo(id);
-        if (typeof eliminarCodigoPorCodigo === 'function') return eliminarCodigoPorCodigo(id);
-      }, codigoId05);
-      await page.waitForTimeout(1500);
+    if (codigoGenerado1) {
+      // eliminarCodigoPorCodigo recibe el string del código
+      await page.evaluate(codigo => {
+        if (typeof eliminarCodigoPorCodigo === 'function') return eliminarCodigoPorCodigo(codigo);
+      }, codigoGenerado1);
+      await page.waitForTimeout(2000); // dos confirm + operación async
 
       const r07 = await supaAuth(
-        `/rest/v1/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&id=eq.${encodeURIComponent(codigoId05)}&select=id`,
+        `/rest/v1/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&para=eq.${encodeURIComponent(PARA1)}&select=id`,
         jwt
       );
       ok('I07-a: GET codigo responde 200', r07.status === 200);

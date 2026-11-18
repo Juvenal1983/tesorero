@@ -23,6 +23,14 @@ function esOwner(){
   // Solo el usuario original puede generar códigos
   // Los usuarios invitados (prueba o VIP) NO pueden, aunque tengan plan activo
   if(!S.session) return false;
+
+  // ── Rama V9 ──────────────────────────────────────────────────────────────
+  // En V9_RELACIONAL, DB.usuarios no se puebla; usar S.session._v9 y esDelegado.
+  // El propietario de la cuenta (esDelegado=false) es siempre owner.
+  // Un delegado/invitado (esDelegado=true) no lo es.
+  if(S.session._v9) return !S.session.esDelegado;
+
+  // ── Rama legado ───────────────────────────────────────────────────────────
   const u = (DB.usuarios||[]).find(u=>u.id===S.session.id);
   if(!u) return false;
   // Correos de administrador siempre son owner
