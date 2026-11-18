@@ -358,19 +358,23 @@ async function eliminarFixtures(H) {
     ).catch(() => null);
     ok('R04a: paso-alumnos visible', !!paso2);
 
-    // Seleccionar el alumno fixture por data-alu-id o por texto
-    const alumnoEl = page.locator(`[data-alu-id="${ALU_ID}"], [onclick*="${ALU_ID}"]`).first();
-    if (await alumnoEl.count()) {
-      await alumnoEl.click();
-    } else {
-      // Fallback: primer elemento de la lista
-      const firstAlu = page.locator('#lista-alumnos-selector > *').first();
-      if (await firstAlu.count()) await firstAlu.click();
-    }
+    // Esperar la tarjeta V9 del fixture por ID exacto.
+    // Las tarjetas V9 tienen onclick="_v9SeleccionarAlumno('alumnoId','nombre',this)"
+    // y NO tienen atributo data-alu-id; el selector usa el ID entre comillas simples
+    // dentro del onclick para evitar coincidencias parciales con otros alumnos.
+    const alumnoCard = await page.waitForSelector(
+      `.ap-alumno-card[onclick*="'${ALU_ID}'"]`, { timeout: 8000 }
+    ).catch(() => null);
+    ok('R04-alu: tarjeta fixture visible (.ap-alumno-card onclick contiene alumnoId)', !!alumnoCard,
+       `alumnoId=${ALU_ID}`);
+    if (alumnoCard) await alumnoCard.click();
+
+    // El botón real que avanza desde paso-alumnos a paso-pin (V9: llama irPaso3V9)
+    await page.click('[onclick="irPaso3()"]');
 
     const pasoPin = await page.waitForSelector('#paso-pin', { state: 'visible', timeout: 5000 })
       .catch(() => null);
-    ok('R04b: paso-pin visible tras seleccionar alumno', !!pasoPin);
+    ok('R04b: paso-pin visible tras seleccionar alumno y clic irPaso3()', !!pasoPin);
     if (!pasoPin) {
       await eliminarFixtures(H);
       server?.close();
