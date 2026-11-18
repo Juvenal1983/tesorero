@@ -258,16 +258,26 @@ async function _importarDatosV9(e) {
   if (!file) return;
 
   // import-msg no existe en el DOM; export-msg es el contenedor visible en config.
-  const msgEl = document.getElementById('export-msg');
+  //
+  // IMPORTANTE: NO capturar el nodo en una variable al inicio del async.
+  // Un re-render de la SPA puede reemplazar el nodo mientras awaits están activos;
+  // la referencia quedaría desconectada y las escrituras no llegarían al DOM vivo.
+  // Ambas funciones re-consultan getElementById en cada llamada para escribir
+  // siempre en el elemento actual, sea el original o el que el render creó.
   const setMsg = (txt, ok) => {
-    if (!msgEl) return;
-    msgEl.innerHTML = `<div class="alert ${ok?'ag':'ar'}">${txt}</div>`;
-    msgEl.style.display = 'block';
+    const el = document.getElementById('export-msg');
+    if (!el) return;
+    el.innerHTML = `<div class="alert ${ok?'ag':'ar'}">${txt}</div>`;
+    el.style.display = 'block';
   };
-  // setTerminal: escribe el mensaje final Y marca data-import-done para señalizar al test.
-  // Usar en TODOS los puntos de salida (return) y al finalizar el bucle de upsert.
-  // El atributo persiste aunque el setTimeout oculte el elemento.
-  const setTerminal = (txt, ok) => { setMsg(txt, ok); if (msgEl) msgEl.dataset.importDone = '1'; };
+  // setTerminal: escribe el mensaje final Y marca data-import-done en el nodo vigente.
+  // Se usa en TODOS los puntos de salida para que el test detecte la señal.
+  // El atributo persiste aunque el setTimeout de 8 s oculte el elemento.
+  const setTerminal = (txt, ok) => {
+    setMsg(txt, ok);
+    const el = document.getElementById('export-msg');
+    if (el) el.dataset.importDone = '1';
+  };
 
   setMsg('⏳ Leyendo archivo…', true);
 
@@ -361,8 +371,9 @@ async function _importarDatosV9(e) {
     '¿Restaurar ' + total + ' registros desde el respaldo del ' + fecha + '?\n\n' +
     'Los registros existentes se actualizarán; no se eliminarán registros ausentes.'
   )) {
-    // Cancelado por el usuario — señalizar igualmente para que el test no quede colgado.
-    if (msgEl) msgEl.dataset.importDone = '1';
+    // Cancelado por el usuario — señalizar en el nodo vigente para que el test no quede colgado.
+    const elCan = document.getElementById('export-msg');
+    if (elCan) elCan.dataset.importDone = '1';
     return;
   }
 
@@ -394,9 +405,13 @@ async function _importarDatosV9(e) {
       false
     );
   }
-  // data-import-done ya fue escrito por setTerminal — el hide solo afecta la visibilidad,
-  // no la señal. El test lee innerHTML después de detectar la señal.
-  setTimeout(() => { if (msgEl) msgEl.style.display = 'none'; }, 8000);
+  // data-import-done ya fue escrito por setTerminal en el nodo vigente.
+  // El hide es cosmético; re-consulta getElementById para no depender de la
+  // referencia capturada antes de los awaits (puede ser un nodo huérfano).
+  setTimeout(() => {
+    const el = document.getElementById('export-msg');
+    if (el) el.style.display = 'none';
+  }, 8000);
 }
 
 function importarDatos(e){
