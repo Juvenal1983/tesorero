@@ -192,10 +192,58 @@ const _B5_ORDEN = [
 ];
 const _B5_CHUNK = 100;
 
+/**
+ * Normaliza filas de `planes_pago` exportadas por cargarPlanesPagoV9 →
+ * _mapPlanPago (camelCase de UI) a columnas SQL (snake_case).
+ * Las columnas no mapeadas se eliminan para no confundir a PostgREST.
+ */
+function _normalizarPlanPago(fila) {
+  if (!fila || typeof fila !== 'object') return fila;
+  // Si ya tiene snake_case (cuenta_id presente) no tocar
+  if ('cuenta_id' in fila) return fila;
+  const r = { id: fila.id };
+  if (fila.cuentaId   !== undefined) r.cuenta_id  = fila.cuentaId;
+  if (fila.alumnoId   !== undefined) r.alumno_id  = fila.alumnoId;
+  if (fila.cuotaId    !== undefined) r.cuota_id   = fila.cuotaId;
+  if (fila.montoTotal !== undefined) r.monto_total = fila.montoTotal;
+  if (fila.periodo    !== undefined) r.periodo    = fila.periodo;
+  if (fila.activo     !== undefined) r.activo     = fila.activo;
+  if (fila.creadoEn   !== undefined) r.creado_en  = fila.creadoEn;
+  if (fila.obs        !== undefined) r.obs        = fila.obs;
+  // 'abonos' es campo virtual del mapa; no existe en la tabla SQL
+  return r;
+}
+
+/**
+ * Normaliza filas de `abonos` exportadas por _mapAbono (camelCase) a snake_case.
+ */
+function _normalizarAbono(fila) {
+  if (!fila || typeof fila !== 'object') return fila;
+  if ('cuenta_id' in fila) return fila;
+  const r = { id: fila.id };
+  if (fila.cuentaId  !== undefined) r.cuenta_id  = fila.cuentaId;
+  if (fila.alumnoId  !== undefined) r.alumno_id  = fila.alumnoId;
+  if (fila.cuotaId   !== undefined) r.cuota_id   = fila.cuotaId;
+  if (fila.planId    !== undefined) r.plan_id    = fila.planId;
+  if (fila.monto     !== undefined) r.monto      = fila.monto;
+  if (fila.fecha     !== undefined) r.fecha      = fila.fecha;
+  if (fila.pagado    !== undefined) r.pagado     = fila.pagado;
+  if (fila.fechaPago !== undefined) r.fecha_pago = fila.fechaPago;
+  if (fila.medio     !== undefined) r.medio      = fila.medio;
+  if (fila.estado    !== undefined) r.estado     = fila.estado;
+  if (fila.obs       !== undefined) r.obs        = fila.obs;
+  if (fila.creadoPor !== undefined) r.creado_por = fila.creadoPor;
+  return r;
+}
+
 async function _b5UpsertColeccion(tabla, filas, token) {
   const errores = [];
-  for (let i = 0; i < filas.length; i += _B5_CHUNK) {
-    const trozo = filas.slice(i, i + _B5_CHUNK);
+  // Normalizar camelCase→snake_case para colecciones exportadas con _mapPlanPago/_mapAbono
+  let filasNorm = filas;
+  if (tabla === 'planes_pago') filasNorm = filas.map(_normalizarPlanPago);
+  if (tabla === 'abonos')      filasNorm = filas.map(_normalizarAbono);
+  for (let i = 0; i < filasNorm.length; i += _B5_CHUNK) {
+    const trozo = filasNorm.slice(i, i + _B5_CHUNK);
     await _v9Fetch(`/${tabla}`, {
       method:  'POST',
       headers: { 'Prefer': 'resolution=merge-duplicates,return=minimal' },
