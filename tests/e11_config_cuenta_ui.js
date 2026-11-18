@@ -7,7 +7,7 @@
  *   C01  Servidor local levantado
  *   C02  Login UI completado (_v9CuentaId disponible)
  *   C03  Cargar config_cuenta desde Supabase (GET → estructura válida)
- *   C04  Guardar plantilla_pago via UI real (#cfg-plantilla) → PATCH → verifica en DB
+ *   C04  Guardar plantilla_pago via UI real (#cfg-plantilla) → POST upsert → verifica en DB
  *   C05  Restauración plantilla_pago → GET confirma valor original exacto
  *   C06  saveCuenta V9: nombre persiste en tesorero_cuentas vía formulario real
  *   C07  Restauración nombre → GET confirma valor original exacto
@@ -424,7 +424,7 @@ function esperarRespuestaSupabase(page, tabla, metodo, timeoutMs = T_CORTO) {
     console.log(`  config: ${JSON.stringify(cfgFila)}`);
 
     // ── C04: Guardar plantilla_pago via formulario real ───────────────────
-    console.log('\n[C04] Guardar plantilla_pago via UI real (#cfg-plantilla) → PATCH → DB');
+    console.log('\n[C04] Guardar plantilla_pago via UI real (#cfg-plantilla) → POST upsert → DB');
     await navegarConfig(page);
 
     const plantillaTest = `Test-${EXEC_ID}: Estimado apoderado, adjunto su comprobante.`;
@@ -434,17 +434,19 @@ function esperarRespuestaSupabase(page, tabla, metodo, timeoutMs = T_CORTO) {
     ok('C04-a: control #cfg-plantilla presente en ruta config', tieneInput);
     if (!tieneInput) throw new Error('C04: #cfg-plantilla ausente — ¿la ruta config no está activa?');
 
-    const promesaPatchCfg = esperarRespuestaSupabase(page, 'config_cuenta', 'PATCH', T_CORTO);
+    // guardarConfigCuentaV9 usa POST con Prefer: resolution=merge-duplicates (upsert),
+    // no PATCH. El listener debe coincidir con POST.
+    const promesaPostCfg = esperarRespuestaSupabase(page, 'config_cuenta', 'POST', T_CORTO);
     await fInputPlantilla.fill(plantillaTest);
     await page.evaluate(() => {
       if (typeof savePlantillaCfg === 'function') savePlantillaCfg();
     });
     plantillaModificada = true;
 
-    const patchCfg = await promesaPatchCfg;
-    if (patchCfg) console.log(`  [net] PATCH ${patchCfg.url} → ${patchCfg.status}`);
-    else          console.error('  [net] PATCH config_cuenta: sin respuesta en T_CORTO');
-    ok('C04-b: PATCH config_cuenta HTTP 2xx', patchCfg?.status >= 200 && patchCfg?.status < 300);
+    const postCfg = await promesaPostCfg;
+    if (postCfg) console.log(`  [net] POST ${postCfg.url} → ${postCfg.status}`);
+    else         console.error('  [net] POST config_cuenta: sin respuesta en T_CORTO');
+    ok('C04-b: POST upsert config_cuenta HTTP 2xx', postCfg?.status >= 200 && postCfg?.status < 300);
 
     const rC04 = await supaAuth(
       `/rest/v1/config_cuenta?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&select=plantilla_pago`,
