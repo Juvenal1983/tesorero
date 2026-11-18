@@ -64,7 +64,7 @@ const SUPA_URL = SUPA_URL_RAW;
 const EXEC_ID_ARG   = process.argv[2] || null;
 const LIKE_PATTERN  = EXEC_ID_ARG ? `E14-${EXEC_ID_ARG}-%` : `E14-%`;
 
-// ── HTTP helper (una página) ───────────────────────────────────────────────────
+// ── HTTP helper — devuelve status, headers y body ─────────────────────────────
 function req(urlPath, opts = {}) {
   return new Promise((resolve, reject) => {
     const url  = new URL(SUPA_URL + urlPath);
@@ -86,7 +86,8 @@ function req(urlPath, opts = {}) {
         res.on('data', c => data += c);
         res.on('end', () => {
           let parsed; try { parsed = JSON.parse(data); } catch (_) { parsed = data; }
-          resolve({ status: res.statusCode, body: parsed });
+          // Preservar headers en minúsculas para acceso uniforme
+          resolve({ status: res.statusCode, headers: res.headers, body: parsed });
         });
       }
     );
@@ -97,47 +98,91 @@ function req(urlPath, opts = {}) {
 }
 
 /**
- * Paginación completa de un endpoint PostgREST.
+ * Parsea el header Content-Range de PostgREST.
+ * Formato: "items <first>-<last>/<total|*>"
+ * Devuelve { first, last, total } donde total puede ser null si es "*".
+ */
+function parseContentRange(header) {
+  if (!header) return null;
+  const m = header.match(/^items\s+(\d+)-(\d+)\/(\d+|\*)$/i);
+  if (!m) return null;
+  return {
+    first: parseInt(m[1], 10),
+    last:  parseInt(m[2], 10),
+    total: m[3] === '*' ? null : parseInt(m[3], 10),
+  };
+}
+
+/**
+ * Paginación completa de un endpoint PostgREST con Prefer: count=exact.
  *
- * PostgREST devuelve:
- *   206 Partial Content — hay más registros; esta página no es la última.
- *   200 OK              — última página (puede tener 0 o más registros).
+ * Estrategia robusta (tres condiciones independientes de parada):
+ *   1. Content-Range confirma que se alcanzó el total declarado.
+ *   2. La página devuelta tiene 0 filas (fin de datos sin total declarado).
+ *   3. El acumulado ya supera el total del Content-Range (protección extra).
  *
- * Se itera con offset += PAGE hasta que el status sea 200 (fin de datos)
- * o la página devuelta tenga 0 elementos (protección extra ante servidores
- * que no emiten 206 correctamente).
+ * No termina solo por HTTP 200: algunos proxies normalizan 206→200;
+ * el criterio definitivo es el contenido de la página y el Content-Range.
+ *
+ * Valida que cada respuesta sea un array; lanza si no lo es.
  *
  * @param {string} jwt         Bearer token
- * @param {string} basePath    Ruta REST SIN limit/offset (p.ej. "/rest/v1/notas?...")
- * @param {number} [page=1000] Tamaño de página
- * @returns {Promise<Array>}   Todos los registros
+ * @param {string} basePath    Ruta REST con filtros pero SIN limit/offset
+ * @param {number} [page=1000] Tamaño de página (≤ límite de PostgREST)
+ * @returns {Promise<{rows: Array, total: number|null}>}
  */
 async function fetchAll(jwt, basePath, page = 1000) {
   const all = [];
   let offset = 0;
+  let declaredTotal = null;   // total del Content-Range, null si desconocido
+
+  const sep = basePath.includes('?') ? '&' : '?';
 
   while (true) {
-    const sep   = basePath.includes('?') ? '&' : '?';
-    const r     = await req(`${basePath}${sep}limit=${page}&offset=${offset}`, {
-      jwt,
-      headers: { 'Range-Unit': 'items', 'Range': `${offset}-${offset + page - 1}` },
-    });
+    const r = await req(
+      `${basePath}${sep}limit=${page}&offset=${offset}`,
+      {
+        jwt,
+        // Prefer count=exact pide a PostgREST que incluya el total en Content-Range
+        headers: { 'Prefer': 'count=exact' },
+      }
+    );
 
     if (r.status !== 200 && r.status !== 206) {
-      throw new Error(`fetchAll: HTTP ${r.status} en offset ${offset} — ${JSON.stringify(r.body).slice(0, 200)}`);
+      throw new Error(
+        `fetchAll: HTTP ${r.status} en offset ${offset} — ` +
+        JSON.stringify(r.body).slice(0, 200)
+      );
     }
 
-    const rows = Array.isArray(r.body) ? r.body : [];
+    // Validar que sea array
+    if (!Array.isArray(r.body)) {
+      throw new Error(
+        `fetchAll: respuesta no es array en offset ${offset} — ` +
+        JSON.stringify(r.body).slice(0, 200)
+      );
+    }
+
+    const rows = r.body;
     all.push(...rows);
 
-    // Fin de datos: status 200 (última página) o página vacía
-    if (r.status === 200 || rows.length === 0) break;
+    // Leer total declarado la primera vez (o cada vez, por si varía)
+    const cr = parseContentRange(r.headers['content-range']);
+    if (cr && cr.total !== null) declaredTotal = cr.total;
 
-    // 206 → hay más; avanzar al siguiente bloque
+    // Condición 1: total confirmado por Content-Range alcanzado
+    if (declaredTotal !== null && all.length >= declaredTotal) break;
+
+    // Condición 2: página vacía → no hay más datos
+    if (rows.length === 0) break;
+
+    // Condición 3: página incompleta → era la última (sin Content-Range total)
+    if (rows.length < page) break;
+
     offset += page;
   }
 
-  return all;
+  return { rows: all, total: declaredTotal };
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────────
@@ -188,18 +233,27 @@ async function fetchAll(jwt, basePath, page = 1000) {
 
   const pattern   = encodeURIComponent(LIKE_PATTERN);
   const cuentaEnc = encodeURIComponent(cuentaId);
+  // order=texto.asc garantiza orden estable entre páginas (sin orden el cursor es inconsistente)
   const baseGET   = `/rest/v1/notas?cuenta_id=eq.${cuentaEnc}&texto=like.${pattern}&select=id,texto&order=texto.asc`;
 
   // ── 3. Inspección paginada ──────────────────────────────────────────────────
-  // PostgREST devuelve 206 si hay más de una página; fetchAll itera hasta 200.
+  // Con Prefer: count=exact PostgREST incluye el total en Content-Range.
+  // fetchAll pagina hasta que el acumulado alcance ese total o la página quede vacía.
   process.stdout.write(`→ Inspeccionando (paginado) "${LIKE_PATTERN}"… `);
-  let notas;
+  let notas, declaredTotal;
   try {
-    notas = await fetchAll(jwt, baseGET);
+    ({ rows: notas, total: declaredTotal } = await fetchAll(jwt, baseGET));
   } catch (e) {
     console.error('❌ ', e.message); process.exit(1);
   }
-  console.log(`${notas.length} notas encontradas`);
+  console.log(`${notas.length} notas obtenidas` +
+    (declaredTotal !== null ? ` (total declarado: ${declaredTotal})` : ' (total no declarado)'));
+
+  // Verificar coherencia: lo que obtuvimos debe coincidir con el total declarado
+  if (declaredTotal !== null && notas.length !== declaredTotal) {
+    console.error(`❌  Discrepancia: obtuvimos ${notas.length} pero Content-Range declaró ${declaredTotal}`);
+    process.exit(1);
+  }
 
   if (notas.length === 0) {
     console.log('\n✅  No hay notas huérfanas con ese prefijo. Nada que limpiar.');
@@ -216,7 +270,7 @@ async function fetchAll(jwt, basePath, page = 1000) {
 
   // ── 4. DELETE ───────────────────────────────────────────────────────────────
   // PostgREST borra todos los registros que coinciden con el filtro en una sola
-  // llamada; no hace falta paginar el DELETE.
+  // llamada (sin paginación, independientemente del volumen).
   process.stdout.write(`\n→ Eliminando ${notas.length} notas (DELETE)… `);
   const delR = await req(
     `/rest/v1/notas?cuenta_id=eq.${cuentaEnc}&texto=like.${pattern}`,
