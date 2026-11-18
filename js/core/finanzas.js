@@ -26,9 +26,13 @@ function esOwner(){
 
   // ── Rama V9 ──────────────────────────────────────────────────────────────
   // En V9_RELACIONAL, DB.usuarios no se puebla; usar S.session._v9 y esDelegado.
-  // El propietario de la cuenta (esDelegado=false) es siempre owner.
-  // Un delegado/invitado (esDelegado=true) no lo es.
-  if(S.session._v9) return !S.session.esDelegado;
+  // esDelegado se establece en arranque.js como !!esDelegado (siempre booleano):
+  //   - cargarSesionV9: inicializa esDelegado=false; lo pone true solo si hay membresía.
+  //   - arranque.js línea 51: esDelegado: !!esDelegado — nunca undefined.
+  // RLS no se amplía: la tabla codigos_invitacion solo acepta INSERT/UPDATE/DELETE
+  // del propietario; un delegado con esDelegado=true seguirá bloqueado en Supabase
+  // aunque llegara aquí.
+  if(S.session._v9) return S.session.esDelegado === false;
 
   // ── Rama legado ───────────────────────────────────────────────────────────
   const u = (DB.usuarios||[]).find(u=>u.id===S.session.id);
