@@ -395,15 +395,17 @@ async function limpiarCodigos(jwt) {
 
     // 3. Esperar carga relacional — cargarSesionV9 llama recargarCodigosV9 async;
     //    waitForFunction asegura que la caché tenga el código exacto antes de leer HTML.
+    // DB está declarado con `let` en almacenamiento.js → no es propiedad de window.
+    // Hay que referenciar DB por nombre, no como window.DB (que siempre es undefined).
     if (codigoGenerado1) {
       await page.waitForFunction(
-        codigo => !!(window.DB?.config?.codigosInvitacion || []).find(c => c.codigo === codigo),
+        codigo => !!(typeof DB !== 'undefined' && DB?.config?.codigosInvitacion || []).find(c => c.codigo === codigo),
         codigoGenerado1,
         { timeout: T_LARGO }
       ).catch(() => {}); // si no llega, el ok lo captura
     }
     const codCargado = await page.evaluate(
-      codigo => !!(window.DB?.config?.codigosInvitacion || []).find(c => c.codigo === codigo),
+      codigo => !!(typeof DB !== 'undefined' && DB?.config?.codigosInvitacion || []).find(c => c.codigo === codigo),
       codigoGenerado1
     );
     ok('I04-c: codigosInvitacion cargados (código exacto en cache)', codCargado);
