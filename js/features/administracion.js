@@ -2,7 +2,9 @@
 let _lastCargarUsuarios = 0;
 async function cargarUsuariosDesdeSupabase(forzar=false){
   // En modo V9_RELACIONAL la tabla usuarios_app no existe en el esquema relacional.
-  // La gestión de miembros delegados se hace a través de tesorero_membresias.
+  // PENDIENTE (B6): migrar administración de usuarios a lectura desde tesorero_membresias.
+  // Por ahora se omite la carga para evitar 404 — la lista renderiza con los datos en caché local.
+  // No se considera migrada hasta tener lectura relacional explícita desde tesorero_membresias.
   if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) return;
   // Caché de 5 minutos — evita lecturas repetidas a Supabase
   const ahora = Date.now();

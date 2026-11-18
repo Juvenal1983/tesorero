@@ -330,13 +330,14 @@ async function eliminarCodigoPorCodigo(codigo){
     const cuentaId = _invCuentaId();
     const token    = _invToken();
     const ci = (DB.config?.codigosInvitacion || []).find(x => x.codigo === codigo);
-    if (!cuentaId || !token || !ci?._id) {
-      // fallback: eliminar solo localmente si no hay _id
-      if (DB.config?.codigosInvitacion)
-        DB.config.codigosInvitacion = DB.config.codigosInvitacion.filter(x => x.codigo !== codigo);
-      showToast('Código eliminado (local)');
-      const lista = document.getElementById('lista-invitaciones');
-      if (lista) lista.innerHTML = renderListaInvitaciones();
+    if (!cuentaId || !token) {
+      console.error('[invitaciones] eliminarCodigoPorCodigo V9: sin sesión activa (token o cuenta_id nulos)');
+      showToast('⛔ Sin sesión activa — no se puede eliminar', '#E24B4A');
+      return;
+    }
+    if (!ci?._id) {
+      console.error('[invitaciones] eliminarCodigoPorCodigo V9: _id nulo para código', codigo);
+      showToast('⛔ ID de código no encontrado — recarga la página y reintenta', '#E24B4A');
       return;
     }
     try {
@@ -373,11 +374,14 @@ async function desactivarCodigoPorCodigo(codigo){
     const cuentaId = _invCuentaId();
     const token    = _invToken();
     const ci = (DB.config?.codigosInvitacion || []).find(x => x.codigo === codigo);
-    if (!cuentaId || !token || !ci?._id) {
-      // fallback local
-      if (ci) ci.activo = false;
-      const lista = document.getElementById('lista-invitaciones');
-      if (lista) lista.innerHTML = renderListaInvitaciones();
+    if (!cuentaId || !token) {
+      console.error('[invitaciones] desactivarCodigoPorCodigo V9: sin sesión activa (token o cuenta_id nulos)');
+      showToast('⛔ Sin sesión activa — no se puede desactivar', '#E24B4A');
+      return;
+    }
+    if (!ci?._id) {
+      console.error('[invitaciones] desactivarCodigoPorCodigo V9: _id nulo para código', codigo);
+      showToast('⛔ ID de código no encontrado — recarga la página y reintenta', '#E24B4A');
       return;
     }
     try {
