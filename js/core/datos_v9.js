@@ -1137,6 +1137,21 @@ async function _v9RpcApoderado(nombre, params) {
 }
 
 /**
+ * Valida un código de invitación sin requerir autenticación.
+ * Llama al RPC SECURITY DEFINER validar_codigo_invitacion, que puede ser
+ * ejecutado por el rol anon (registro de nuevos usuarios).
+ *
+ * RPC: validar_codigo_invitacion(p_codigo TEXT)
+ * Retorna JSONB: { valido: bool, tipo?: text, vence_el?: date }
+ *
+ * @param {string} codigo
+ * @returns {Promise<{valido: boolean, tipo?: string, vence_el?: string}>}
+ */
+async function v9ValidarCodigoInvitacion(codigo) {
+  return _v9RpcApoderado('validar_codigo_invitacion', { p_codigo: codigo });
+}
+
+/**
  * Selector inicial: dado un código de curso devuelve la lista de alumnos del curso.
  * No requiere PIN; devuelve solo id y nombre (sin datos sensibles).
  *

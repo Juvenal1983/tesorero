@@ -175,7 +175,7 @@ function modalEditAbono(data){
       <button class="close-btn" onclick="closeModal()">×</button>
     </div>
     <div style="font-size:13px;color:var(--t2);margin-bottom:14px">
-      ${escHtml(alu?.nombres+' '+alu?.apellidos||'')} · ${escHtml(plan.periodo||'')}
+      ${escHtml([alu?.nombres,alu?.apellidos].filter(Boolean).join(' '))} · ${escHtml(plan.periodo||'')}
     </div>
     <div class="fg-row">
       <div class="fg"><label class="fl">Monto (CLP)</label>
@@ -283,7 +283,7 @@ function modalPlanPago(data){
 
   return `<div class="modal" style="max-width:480px">
     <div class="modal-hdr">
-      <div class="modal-title">📅 Plan de pago — ${escHtml(alu?.nombres+' '+alu?.apellidos||'')}</div>
+      <div class="modal-title">📅 Plan de pago — ${escHtml([alu?.nombres,alu?.apellidos].filter(Boolean).join(' '))}</div>
       <button class="close-btn" onclick="closeModal()">×</button>
     </div>
     <div style="font-size:13px;color:var(--t2);margin-bottom:14px">

@@ -149,7 +149,7 @@ function modalEditPago(data){
       <button class="close-btn" onclick="closeModal()">×</button>
     </div>
     <div style="font-size:13px;color:var(--t2);margin-bottom:14px">
-      ${escHtml(alu?.nombres+' '+alu?.apellidos||'')} · ${escHtml(cuota?.nombre||'')} · ${escHtml(p.periodo||'')}
+      ${escHtml([alu?.nombres,alu?.apellidos].filter(Boolean).join(' '))} · ${escHtml(cuota?.nombre||'')} · ${escHtml(p.periodo||'')}
     </div>
     <div class="fg-row">
       <div class="fg"><label class="fl">Monto (CLP)</label>

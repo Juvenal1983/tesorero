@@ -771,28 +771,23 @@ let codigoObj = null;
 const codigos = DB.config?.codigosInvitacion || [];
 codigoObj = codigos.find(c=>c.codigo===invitacion && c.activo && !c.usado);
 
-// 2. Si no está local, buscar en Supabase
+// 2. Si no está local, validar vía RPC SECURITY DEFINER (funciona con anon key,
+//    compatible con la RLS V9 de codigos_invitacion que requiere cuenta_id).
 if(!codigoObj){
   try{
-    const rows = await sbGet('codigos_invitacion','codigo=eq.'+encodeURIComponent(invitacion));
-    if(rows && rows.length>0){
-      const r = rows[0];
-      if(r.activo && !r.usado){
-        codigoObj = {
-          codigo: r.codigo,
-          tipo: r.tipo || 'prueba',
-          activo: r.activo === true,
-          usado: r.usado === true,
-          creadoEn: r.creado_en || isoToday(),
-          usadoPor: r.usado_por || null,
-          usadoEn: r.usado_en || null
-        };
-
-        if(!DB.config) DB.config = {};
-        if(!DB.config.codigosInvitacion) DB.config.codigosInvitacion = [];
-        DB.config.codigosInvitacion.unshift(codigoObj);
-        saveDB();
-      }
+    const res = typeof v9ValidarCodigoInvitacion === 'function'
+      ? await v9ValidarCodigoInvitacion(invitacion)
+      : null;
+    if(res && res.valido){
+      codigoObj = {
+        codigo:   invitacion,
+        tipo:     res.tipo     || 'prueba',
+        activo:   true,
+        usado:    false,
+        creadoEn: isoToday(),
+        usadoPor: null,
+        usadoEn:  null
+      };
     }
   }catch(e){}
 }
@@ -2037,12 +2032,12 @@ function _apV9RenderDeudas(cuotas) {
   }
   const fmt = n => '$' + Number(n||0).toLocaleString('es-CL');
   const rows = cuotas.map(c => {
-    const est = c.estado || 'pendiente';
+    const est = c.estado_pago || c.estado || 'pendiente';
     const colorEst = est==='pagado'?'var(--g)':est==='eximido'?'var(--t3)':'var(--r)';
     const badge = est==='pagado'?'✅ Pagado':est==='eximido'?'Eximido':'⏳ Pendiente';
     return `<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--brd)">
       <div>
-        <div style="font-size:14px;font-weight:600">${escHtml(c.cuota_nombre||'Cuota')}</div>
+        <div style="font-size:14px;font-weight:600">${escHtml(c.nombre||c.cuota_nombre||'Cuota')}</div>
         <div style="font-size:12px;color:var(--t3)">${escHtml(c.periodo||'')}</div>
       </div>
       <div style="text-align:right">
