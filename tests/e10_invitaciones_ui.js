@@ -318,6 +318,15 @@ async function limpiarCodigos(jwt) {
     await page.reload({ waitUntil: 'load', timeout: T_LARGO });
     await waitAppReady(page);
     await reloginViaUI(page);
+    // Esperar a que cargarSesionV9 termine de poblar DB.config.codigosInvitacion
+    // con el código recién creado antes de navegar a config.
+    if (codigoGenerado1) {
+      await page.waitForFunction(
+        codigo => !!(window.DB?.config?.codigosInvitacion || []).find(c => c.codigo === codigo),
+        codigoGenerado1,
+        { timeout: T_LARGO }
+      ).catch(() => {}); // si no llega, el ok lo captura
+    }
     await navegarConfig(page);
     const html04 = await page.locator('#contenido, main, body').innerHTML().catch(() => '');
     ok('I04-a: código visible en UI tras reload',
@@ -327,11 +336,20 @@ async function limpiarCodigos(jwt) {
     // ── I05: Desactivar código ────────────────────────────────────────────
     console.log('\n[I05] Desactivar código → activo=false');
     if (codigoGenerado1) {
-      // desactivarCodigoPorCodigo recibe el string del código, no el _id
-      await page.evaluate(codigo => {
-        if (typeof desactivarCodigoPorCodigo === 'function') return desactivarCodigoPorCodigo(codigo);
+      // desactivarCodigoPorCodigo es async — awaitar la Promise desde page.evaluate
+      await page.evaluate(async codigo => {
+        if (typeof desactivarCodigoPorCodigo === 'function') await desactivarCodigoPorCodigo(codigo);
       }, codigoGenerado1);
-      await page.waitForTimeout(1500);
+      // Esperar que la caché local refleje activo=false (confirmación del PATCH)
+      await page.waitForFunction(
+        codigo => {
+          const ci = (window.DB?.config?.codigosInvitacion || []).find(c => c.codigo === codigo);
+          return ci ? ci.activo === false : false;
+        },
+        codigoGenerado1,
+        { timeout: T_CORTO }
+      ).catch(() => {});
+      await page.waitForTimeout(500); // margen para que el PATCH llegue a Supabase
 
       const r05 = await supaAuth(
         `/rest/v1/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&para=eq.${encodeURIComponent(PARA1)}&select=activo`,
