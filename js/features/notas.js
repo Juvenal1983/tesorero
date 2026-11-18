@@ -9,7 +9,9 @@
 // ── Helpers de acceso a datos ─────────────────────────────────────────────────
 
 function _notasAccessToken() {
-  return (typeof S !== 'undefined' && S.session?.accessToken) || null;
+  // Usa _authToken (fuente de verdad de arranque.js) con fallback a S.session.
+  return (typeof _authToken !== 'undefined' && _authToken) ||
+         (typeof S !== 'undefined' && S.session?.accessToken) || null;
 }
 function _notasCuentaId() {
   return (typeof S !== 'undefined' && S._v9CuentaId) || null;

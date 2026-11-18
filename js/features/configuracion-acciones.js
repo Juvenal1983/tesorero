@@ -2,7 +2,8 @@
 // B4-V9: helpers para persistir config_cuenta en Supabase cuando V9_RELACIONAL=true.
 
 function _cfgV9()       { return typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL; }
-function _cfgToken()    { return (typeof S !== 'undefined' && S.session?.accessToken) || null; }
+function _cfgToken()    { return (typeof _authToken !== 'undefined' && _authToken) ||
+                                 (typeof S !== 'undefined' && S.session?.accessToken) || null; }
 function _cfgCuentaId() { return (typeof S !== 'undefined' && S._v9CuentaId) || null; }
 
 /**

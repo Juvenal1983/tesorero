@@ -929,24 +929,37 @@ async function cargarSesionV9(authId, accessToken, cursoId) {
   DB.pagos = pagosRaw.map(_mapPago);
 
   // 5. C16: limpiar colecciones no relacionales (nunca preservar de sesión anterior).
-  // B3: notas ahora se cargan desde Supabase; colegios sigue siendo legacy local.
-  DB.notas    = await cargarNotasV9(cuentaId, accessToken).catch(() => []);
+  // B3: notas se cargan desde Supabase; error propagado — no silencioso.
+  try {
+    DB.notas = await cargarNotasV9(cuentaId, accessToken);
+  } catch (e) {
+    // Loguear con contexto; dejar DB.notas como arreglo vacío para no romper render,
+    // pero no suprimir — el llamador verá el log y puede mostrar aviso al usuario.
+    console.error('[datos_v9] cargarNotasV9 falló:', e.message);
+    DB.notas = [];
+  }
   DB.colegios = [];
 
   // B4: cargar configuración de la cuenta desde Supabase (config_cuenta).
-  // Mezcla sobre DB.config existente para no pisar campos legado no migrados.
+  // Inicializa desde defaults y aplica TODOS los campos remotos, incluidos falsy válidos
+  // (ej. plantilla_pago='', categorias vacío). Un campo ausente en remoto conserva el default.
+  const CFG_DEFAULTS = { tipoOrg: 'curso', appUrl: '', plantillaPago: '', moneda: 'CLP' };
   try {
     const cfgRemota = await cargarConfigCuentaV9(cuentaId, accessToken);
+    // Siempre partimos de defaults limpios para esta cuenta (no contaminamos con sesión anterior)
+    DB.config = { ...(DB.config || {}), ...CFG_DEFAULTS };
     if (cfgRemota) {
-      if (!DB.config) DB.config = {};
-      if (cfgRemota.tipo_org)        DB.config.tipoOrg       = cfgRemota.tipo_org;
-      if (cfgRemota.app_url)         DB.config.appUrl        = cfgRemota.app_url;
-      if (cfgRemota.plantilla_pago)  DB.config.plantillaPago = cfgRemota.plantilla_pago;
-      if (cfgRemota.moneda)          DB.config.moneda        = cfgRemota.moneda;
-      if (cfgRemota.categorias)      DB.categorias           = cfgRemota.categorias;
+      // Aplicar todos los campos presentes en la fila remota (incluyendo strings vacíos)
+      if ('tipo_org'       in cfgRemota) DB.config.tipoOrg       = cfgRemota.tipo_org       ?? CFG_DEFAULTS.tipoOrg;
+      if ('app_url'        in cfgRemota) DB.config.appUrl        = cfgRemota.app_url        ?? CFG_DEFAULTS.appUrl;
+      if ('plantilla_pago' in cfgRemota) DB.config.plantillaPago = cfgRemota.plantilla_pago ?? CFG_DEFAULTS.plantillaPago;
+      if ('moneda'         in cfgRemota) DB.config.moneda        = cfgRemota.moneda         ?? CFG_DEFAULTS.moneda;
+      if ('categorias'     in cfgRemota && cfgRemota.categorias !== null)
+        DB.categorias = cfgRemota.categorias;
     }
   } catch (e) {
-    console.warn('[datos_v9] cargarConfigCuentaV9 error (no bloqueante):', e.message);
+    console.error('[datos_v9] cargarConfigCuentaV9 falló:', e.message);
+    DB.config = { ...(DB.config || {}), ...CFG_DEFAULTS };
   }
 
   // Guardar cuentaId en S para que lo usen las funciones de guardado

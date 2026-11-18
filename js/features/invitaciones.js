@@ -5,7 +5,8 @@
 
 // ── Helpers de acceso V9 ──────────────────────────────────────────────────────
 function _invV9()         { return typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL; }
-function _invToken()      { return (typeof S !== 'undefined' && S.session?.accessToken) || null; }
+function _invToken()      { return (typeof _authToken !== 'undefined' && _authToken) ||
+                                   (typeof S !== 'undefined' && S.session?.accessToken) || null; }
 function _invCuentaId()   { return (typeof S !== 'undefined' && S._v9CuentaId) || null; }
 
 /** Genera un ID estable para codigos_invitacion (Primary Key TEXT). */

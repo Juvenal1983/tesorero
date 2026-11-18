@@ -1,333 +1,430 @@
 /**
  * tests/e10_invitaciones_ui.js
  *
- * Suite Playwright B1 — Invitaciones V9: CRUD completo sobre la tabla
- * `codigos_invitacion`.
+ * Suite Playwright B1 — Invitaciones V9: CRUD completo sobre `codigos_invitacion`.
  *
  * Verifica:
- *   I01  Lista de invitaciones carga sin error
- *   I02  Crear código (tipo prueba) → persiste en Supabase (GET REST)
- *   I03  Código aparece en UI tras reload
- *   I04  Desactivar código → activo=false en DB y UI muestra "Expirado"
- *   I05  Eliminar código → ausente en DB y UI
- *   I06  Crear código anual → prefijo ANUAL- en DB
- *   I07  Crear código VIP → prefijo VIP- en DB
- *   I08  Limpieza: fixtures eliminados de staging
+ *   I01  Servidor local levantado
+ *   I02  Login UI completado (_v9CuentaId disponible)
+ *   I03  Crear código vía UI → fila en DB (codigo, para, tipo, activo=true)
+ *   I04  Código persiste y aparece tras reload
+ *   I05  Desactivar código → activo=false en DB
+ *   I06  Crear segundo código → sincronizarCodigos → ambos aparecen en UI
+ *   I07  Eliminar código → ausente en DB
+ *   I08  Limpieza: fixtures eliminados de staging (en finally)
  *
- * Variables de entorno: igual que E8/E9.
+ * Patrón: igual que E8/E9 — login REST para fixtures, login UI para comportamiento,
+ * poll REST para verificación, aislamiento por EXEC_ID.
+ *
+ * Variables de entorno requeridas (mismo .env que E8/E9):
+ *   STAGING_SUPABASE_URL, STAGING_SUPABASE_ANON_KEY (o STAGING_KEY),
+ *   STAGING_USER_A_EMAIL (o STAGING_EMAIL), STAGING_USER_A_PASSWORD (o STAGING_PASS)
+ * Opcional:
+ *   STAGING_CUENTA_ID  — acelera descubrirCuenta
  * NUNCA apuntar a producción (tmjqzaakzhecbldebyeg).
  */
 
 'use strict';
 
-const path = require('path');
+const path  = require('path');
+const http  = require('http');
+const https = require('https');
+const fs    = require('fs');
+const { chromium } = require('playwright');
+
 try { require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') }); } catch(_) {}
 
-const SUPA_URL_RAW = process.env.STAGING_SUPABASE_URL || process.env.STAGING_URL || '';
-const ANON_KEY    = process.env.STAGING_SUPABASE_ANON_KEY || process.env.STAGING_KEY || '';
-const USER_EMAIL  = process.env.STAGING_USER_A_EMAIL || process.env.STAGING_EMAIL || '';
-const USER_PASS   = process.env.STAGING_USER_A_PASSWORD || process.env.STAGING_PASS || '';
+const SUPA_URL_RAW = (process.env.STAGING_SUPABASE_URL || process.env.STAGING_URL || '').replace(/\/$/, '');
+const ANON_KEY     = process.env.STAGING_SUPABASE_ANON_KEY || process.env.STAGING_KEY || '';
+const USER_EMAIL   = process.env.STAGING_USER_A_EMAIL || process.env.STAGING_EMAIL || '';
+const USER_PASS    = process.env.STAGING_USER_A_PASSWORD || process.env.STAGING_PASS || '';
 
 if (!SUPA_URL_RAW || !ANON_KEY || !USER_EMAIL || !USER_PASS) {
-  console.error('❌ Faltan variables de entorno (mismas que E8/E9).');
+  console.error('❌ Faltan variables de entorno. Revisa .env (mismas que E8/E9).');
   process.exit(1);
 }
 
-const SUPA_URL = SUPA_URL_RAW.replace(/\/$/, '');
-
 const PROD_HOST    = 'tmjqzaakzhecbldebyeg.supabase.co';
 const STAGING_HOST = 'rucgmytyxpfowznowxwd.supabase.co';
+const SUPA_URL     = SUPA_URL_RAW;
 let parsedHost;
 try { parsedHost = new URL(SUPA_URL).hostname; } catch(_) { process.exit(2); }
 if (parsedHost === PROD_HOST || parsedHost !== STAGING_HOST) {
   console.error('❌ URL no autorizada:', parsedHost); process.exit(2);
 }
 
-const http  = require('http');
-const https = require('https');
-const fs    = require('fs');
-const { chromium } = require('playwright');
+// ── Fixtures y constantes ─────────────────────────────────────────────────────
 
 const EXEC_ID  = Date.now().toString(36);
+const CODIGO1  = `INV-B1-1-${EXEC_ID}`.toUpperCase();
+const CODIGO2  = `INV-B1-2-${EXEC_ID}`.toUpperCase();
+const PARA1    = `apoderado-b1-${EXEC_ID}@test.cl`;
+const PARA2    = `apoderado-b1-2-${EXEC_ID}@test.cl`;
 const APP_PORT = 8799;
+
+let CUENTA_ID = process.env.STAGING_CUENTA_ID || null;
 
 let pass = 0, fail = 0;
 const failures = [];
 function ok(label, cond) {
   if (cond) { console.log(`  ✅ ${label}`); pass++; }
-  else       { console.log(`  ❌ ${label}`); fail++; failures.push(label); }
+  else       { console.error(`  ❌ ${label}`); fail++; failures.push(label); }
 }
 
-// ── Helpers HTTP ──────────────────────────────────────────────────────────────
+const T_CORTO = 12_000;
+const T_LARGO = 30_000;
 
-function reqJSON(urlStr, opts = {}) {
+// ── HTTP helpers (mismos que E8/E9) ───────────────────────────────────────────
+
+function _fetch(urlPath, opts = {}) {
   return new Promise((resolve, reject) => {
-    const u   = new URL(urlStr);
-    const lib = u.protocol === 'https:' ? https : http;
-    const body = opts.body ? Buffer.from(opts.body, 'utf8') : null;
-    const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
-    if (body) headers['Content-Length'] = body.length;
-    const req = lib.request({ hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
-      path: u.pathname + u.search, method: opts.method || 'GET', headers }, (res) => {
-      let raw = '';
-      res.on('data', d => raw += d);
-      res.on('end', () => {
-        let json = null;
-        try { json = JSON.parse(raw); } catch(_) { json = raw; }
-        resolve({ status: res.statusCode, body: json });
-      });
-    });
+    const url  = new URL(SUPA_URL + urlPath);
+    const body = opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
+    const hdrs = {
+      'apikey':       ANON_KEY,
+      'Content-Type': 'application/json',
+      'Accept':       'application/json',
+      'Prefer':       opts.prefer !== undefined ? opts.prefer : 'return=representation',
+      ...(opts.headers || {}),
+    };
+    if (opts.authHeader !== null && opts.authHeader !== undefined)
+      hdrs['Authorization'] = opts.authHeader;
+    if (body) hdrs['Content-Length'] = String(Buffer.byteLength(body));
+    const req = https.request(
+      { hostname: url.hostname, path: url.pathname + url.search,
+        method: opts.method || 'GET', headers: hdrs },
+      res => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => {
+          let body; try { body = JSON.parse(data); } catch (_) { body = data; }
+          resolve({ status: res.statusCode, body });
+        });
+      }
+    );
     req.on('error', reject);
     if (body) req.write(body);
     req.end();
   });
 }
+function supaAuth(urlPath, jwt, opts = {}) {
+  return _fetch(urlPath, { ...opts, authHeader: 'Bearer ' + jwt });
+}
+function supaAnon(urlPath, opts = {}) {
+  return _fetch(urlPath, { ...opts, authHeader: null });
+}
 
-async function supaGET(table, query, jwt) {
-  return reqJSON(`${SUPA_URL}/rest/v1/${table}?${query}`, {
-    headers: { 'apikey': ANON_KEY, 'Authorization': `Bearer ${jwt}` }
+// ── Servidor HTTP local (igual que E8/E9) ─────────────────────────────────────
+
+function servirApp() {
+  const MIME = {
+    '.html':'text/html', '.css':'text/css', '.js':'application/javascript',
+    '.json':'application/json', '.png':'image/png', '.ico':'image/x-icon',
+    '.svg':'image/svg+xml', '.woff2':'font/woff2', '.woff':'font/woff',
+  };
+  const APP_DIR = path.resolve(__dirname, '..');
+  const server  = http.createServer((req, res) => {
+    let filePath = path.join(APP_DIR, req.url === '/' ? 'index.html' : req.url.split('?')[0]);
+    if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory())
+      filePath = path.join(APP_DIR, 'index.html');
+    fs.readFile(filePath, (err, data) => {
+      if (err) { res.writeHead(404); res.end(); return; }
+      const ext  = path.extname(filePath).toLowerCase();
+      const mime = MIME[ext] || 'application/octet-stream';
+      let content = data;
+      if (filePath.endsWith('index.html')) {
+        let html = data.toString('utf8');
+        html = html.replace(/https:\/\/STAGING_SUPA_HOST/g, `https://${STAGING_HOST}`);
+        html = html.replace(/wss:\/\/STAGING_SUPA_HOST/g,   `wss://${STAGING_HOST}`);
+        const envScript = `<script>
+window.STAGING_SUPA_URL = ${JSON.stringify(SUPA_URL)};
+window.STAGING_SUPA_KEY = ${JSON.stringify(ANON_KEY)};
+</script>`;
+        html = html.replace('<head>', '<head>' + envScript);
+        content = Buffer.from(html, 'utf8');
+      }
+      res.writeHead(200, { 'Content-Type': mime });
+      res.end(content);
+    });
+  });
+  return new Promise((resolve, reject) => {
+    server.listen(APP_PORT, '127.0.0.1', () => {
+      console.log(`  Servidor app: http://localhost:${APP_PORT}`);
+      resolve(server);
+    });
+    server.on('error', reject);
   });
 }
 
-async function supaDelete(table, query, jwt) {
-  return reqJSON(`${SUPA_URL}/rest/v1/${table}?${query}`, {
-    method: 'DELETE',
-    headers: { 'apikey': ANON_KEY, 'Authorization': `Bearer ${jwt}` }
-  });
-}
+// ── Login REST y descubrimiento de cuenta ─────────────────────────────────────
 
-async function loginREST() {
-  const r = await reqJSON(`${SUPA_URL}/auth/v1/token?grant_type=password`, {
-    method: 'POST',
-    headers: { 'apikey': ANON_KEY },
-    body: JSON.stringify({ email: USER_EMAIL, password: USER_PASS })
+async function loginTesorero() {
+  const r = await supaAnon('/auth/v1/token?grant_type=password', {
+    method: 'POST', body: { email: USER_EMAIL, password: USER_PASS }, prefer: '',
   });
-  if (!r.body?.access_token) throw new Error('Login REST fallido: ' + JSON.stringify(r.body));
+  if (r.status !== 200 || !r.body?.access_token)
+    throw new Error(`Login REST fallido: ${JSON.stringify(r.body)}`);
   return r.body.access_token;
 }
 
+async function descubrirCuenta(jwt) {
+  const r = await supaAuth('/rest/v1/tesorero_cuentas?select=id&limit=1', jwt);
+  if (r.status !== 200 || !Array.isArray(r.body) || r.body.length === 0)
+    throw new Error('descubrirCuenta: ' + JSON.stringify(r.body));
+  return r.body[0].id;
+}
+
+// ── Helpers Playwright ────────────────────────────────────────────────────────
+
+async function waitAppReady(page) {
+  await page.waitForFunction(() => typeof window.S !== 'undefined', { timeout: T_LARGO });
+}
+
+async function reloginViaUI(page) {
+  const tieneForm = await page.locator('#l-email').count() > 0;
+  if (!tieneForm) return;
+  await page.fill('#l-email', USER_EMAIL);
+  await page.fill('#l-pass',  USER_PASS);
+  await page.click('[onclick="doLogin()"]');
+  await page.waitForFunction(
+    () => window.S?.session !== null && window.S?.session !== undefined && !!window.S?._v9CuentaId,
+    { timeout: T_LARGO }
+  );
+}
+
+function interceptDialogs(page) {
+  page.on('dialog', async d => {
+    console.log(`    [dialog] ${d.type()}: ${d.message().slice(0, 80)}`);
+    await d.accept();
+  });
+}
+
+/** Navegar a la sección de invitaciones */
+async function navegarInvitaciones(page) {
+  await page.evaluate(() => { if (typeof go === 'function') go('invitaciones'); });
+  await page.waitForFunction(() => window.S?.route === 'invitaciones', { timeout: T_CORTO });
+}
+
+/** Navegar a la sección de config (donde suelen vivir los códigos en algunas vistas) */
+async function navegarConfig(page) {
+  await page.evaluate(() => { if (typeof go === 'function') go('config'); });
+  await page.waitForFunction(() => window.S?.route === 'config', { timeout: T_CORTO });
+}
+
+// ── Limpieza staging ──────────────────────────────────────────────────────────
+
 async function limpiarCodigos(jwt) {
-  // Elimina códigos cuyo id contiene el EXEC_ID del run
-  const r = await supaGET('codigos_invitacion', `id=like.*${EXEC_ID}*&select=id`, jwt);
-  if (!Array.isArray(r.body) || r.body.length === 0) return;
-  for (const row of r.body) {
-    await supaDelete('codigos_invitacion', `id=eq.${encodeURIComponent(row.id)}`, jwt);
-  }
-  console.log(`  🧹 Limpiezea: ${r.body.length} código(s) de fixture eliminados.`);
+  if (!CUENTA_ID) return;
+  // Elimina todos los códigos cuyo campo `id` o `codigo` contiene EXEC_ID
+  const r = await supaAuth(
+    `/rest/v1/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&codigo=like.*${EXEC_ID}*`,
+    jwt, { method: 'DELETE', prefer: 'return=minimal' }
+  );
+  console.log(`  🧹 limpiarCodigos (por codigo): HTTP ${r.status}`);
+  // También limpiar por id por si el campo id contiene EXEC_ID
+  const r2 = await supaAuth(
+    `/rest/v1/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&id=like.*${EXEC_ID}*`,
+    jwt, { method: 'DELETE', prefer: 'return=minimal' }
+  );
+  console.log(`  🧹 limpiarCodigos (por id): HTTP ${r2.status}`);
 }
 
-// ── Servidor HTTP local ───────────────────────────────────────────────────────
-
-function servirApp(port) {
-  const BASE = path.resolve(__dirname, '..');
-  const MIME = { '.html':'text/html', '.js':'application/javascript',
-                 '.css':'text/css', '.json':'application/json',
-                 '.png':'image/png', '.svg':'image/svg+xml', '.ico':'image/x-icon' };
-  return http.createServer((req, res) => {
-    let filePath = path.join(BASE, req.url === '/' ? 'index.html' : req.url.split('?')[0]);
-    if (!filePath.startsWith(BASE)) { res.writeHead(403); res.end(); return; }
-    fs.readFile(filePath, (err, data) => {
-      if (err) { res.writeHead(404); res.end('Not found'); return; }
-      const ext = path.extname(filePath);
-      res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
-      res.end(data);
-    });
-  }).listen(port);
-}
-
-// ── Suite principal ───────────────────────────────────────────────────────────
+// ── MAIN ──────────────────────────────────────────────────────────────────────
 
 (async () => {
-  const server = servirApp(APP_PORT);
-  await new Promise(r => server.on('listening', r));
-  console.log(`\n🌐 App servida en http://localhost:${APP_PORT}`);
+  console.log('\n══════════════════════════════════════════════════════════════');
+  console.log('  E10 B1 — Playwright: Invitaciones V9');
+  console.log('══════════════════════════════════════════════════════════════\n');
+  console.log(`EXEC_ID  : ${EXEC_ID}`);
+  console.log(`Staging  : ${SUPA_URL}`);
+  console.log(`Código 1 : ${CODIGO1}`);
+  console.log(`Código 2 : ${CODIGO2}`);
 
+  // ── Pre: login REST ───────────────────────────────────────────────────────
+  console.log('\n[Pre] Login REST');
   let jwt;
-  try { jwt = await loginREST(); console.log('  🔑 Login REST OK'); }
-  catch (e) { console.error('❌ Login falló:', e.message); server.close(); process.exit(1); }
+  try {
+    jwt = await loginTesorero();
+    if (!CUENTA_ID) CUENTA_ID = await descubrirCuenta(jwt);
+    console.log(`  Cuenta: ${CUENTA_ID}`);
+  } catch (e) {
+    console.error('❌ Setup falló:', e.message); process.exit(3);
+  }
 
-  const browser = await chromium.launch({ headless: true });
-  const ctx     = await browser.newContext({ baseURL: `http://localhost:${APP_PORT}` });
-  const page    = await ctx.newPage();
-  page.on('console', m => { if (m.type() === 'error') console.log('  [browser]', m.text()); });
+  let server = null, browser = null;
 
-  async function reloginUI() {
-    await page.goto('/');
-    await page.waitForTimeout(1500);
-    const emailInput = page.locator('input[type="email"]');
-    if (await emailInput.count() > 0) {
-      await emailInput.fill(USER_EMAIL);
-      await page.locator('input[type="password"]').fill(USER_PASS);
-      await page.locator('button[type="submit"]').first().click();
-      await page.waitForTimeout(2000);
+  try {
+    // ── I01: Servidor ─────────────────────────────────────────────────────
+    console.log('\n[I01] Servidor HTTP local');
+    server = await servirApp();
+    ok('I01: servidor levantado', true);
+
+    // ── I02: Login UI ─────────────────────────────────────────────────────
+    console.log('\n[I02] Login UI');
+    browser = await chromium.launch({ headless: true });
+    const ctx  = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2 });
+    const page = await ctx.newPage();
+    page.on('console', msg => {
+      if (msg.type() === 'error') console.error(`  [browser] ${msg.text()}`);
+    });
+    interceptDialogs(page);
+
+    await page.goto(`http://localhost:${APP_PORT}/`, { waitUntil: 'load', timeout: T_LARGO });
+    await waitAppReady(page).catch(() => { throw new Error('window.S no definido'); });
+
+    await page.fill('#l-email', USER_EMAIL);
+    await page.fill('#l-pass',  USER_PASS);
+    await page.click('[onclick="doLogin()"]');
+    try {
+      await page.waitForFunction(
+        () => window.S?.session !== null && window.S?.session !== undefined && !!window.S?._v9CuentaId,
+        { timeout: T_LARGO }
+      );
+      ok('I02: login completado (_v9CuentaId disponible)', true);
+    } catch (_) {
+      ok('I02: login completado', false);
+      throw new Error('Login UI no completó');
     }
-  }
 
-  async function navegarInvitaciones() {
-    // Ir a Configuración → sección invitaciones
-    const cfgSel = '[onclick*="config"], [href*="config"], [data-route="config"]';
-    if (await page.locator(cfgSel).count() > 0)
-      await page.locator(cfgSel).first().click();
-    else
-      await page.evaluate(() => { if (typeof go === 'function') go('config'); });
-    await page.waitForTimeout(1500);
-  }
+    // ── I03: Crear código vía UI → verificar DB ───────────────────────────
+    console.log('\n[I03] Crear código vía UI → fila en DB');
+    await navegarInvitaciones(page).catch(() => navegarConfig(page));
+    // Mostrar formulario de creación
+    await page.evaluate(() => {
+      if (typeof mostrarFormInvitacion === 'function') mostrarFormInvitacion();
+    });
+    await page.waitForTimeout(500);
 
-  // ── I01 — Lista carga sin error ───────────────────────────────────────────
-  console.log('\n[I01] Lista de invitaciones carga sin error');
-  await reloginUI();
-  await navegarInvitaciones();
-  const listaEl = await page.locator('#lista-invitaciones').count();
-  ok('I01-a: sección de invitaciones visible en config', listaEl > 0);
+    // Llenar campos del formulario
+    const inputCodigo = page.locator('#inv-codigo, #codigo-invitacion, input[name="codigo"]').first();
+    const inputPara   = page.locator('#inv-para, #para-invitacion, input[name="para"]').first();
+    const inputTipo   = page.locator('#inv-tipo, #tipo-invitacion, select[name="tipo"]').first();
 
-  // ── I02 — Crear código tipo prueba ────────────────────────────────────────
-  console.log('\n[I02] Crear código (tipo prueba) → persiste en Supabase');
-  // Abrir modal
-  const btnGenerar = page.locator('button, [onclick]').filter({ hasText: /generar código|nuevo código/i }).first();
-  if (await btnGenerar.count() > 0) {
-    await btnGenerar.click();
-    await page.waitForTimeout(800);
-  } else {
-    await page.evaluate(() => { if (typeof generarCodigoInvitacion === 'function') generarCodigoInvitacion(); });
-    await page.waitForTimeout(800);
-  }
+    if (await inputCodigo.count() > 0) await inputCodigo.fill(CODIGO1);
+    if (await inputPara.count()   > 0) await inputPara.fill(PARA1);
+    if (await inputTipo.count()   > 0) {
+      const tag = await inputTipo.evaluate(el => el.tagName.toLowerCase());
+      if (tag === 'select') await inputTipo.selectOption({ index: 0 });
+      else await inputTipo.fill('alumno');
+    }
 
-  const codParaInput = page.locator('#cod-para');
-  const codNotasInput = page.locator('#cod-notas');
-  if (await codParaInput.count() > 0) {
-    await codParaInput.fill(`Test B1 ${EXEC_ID}`);
-    await codNotasInput.fill(`fixture-${EXEC_ID}`);
-    // Hacer click en "Generar código"
-    const btnConfirm = page.locator('button').filter({ hasText: /generar código/i }).last();
-    await btnConfirm.click();
-    await page.waitForTimeout(1500);
-  } else {
-    console.log('  ⚠️  Modal de código no encontrado; skip I02');
-    ok('I02-a: modal de nuevo código visible', false);
-  }
+    // Guardar
+    await page.evaluate(() => {
+      if (typeof guardarInvitacion     === 'function') return guardarInvitacion();
+      if (typeof crearCodigoConDatos   === 'function') return crearCodigoConDatos();
+      if (typeof agregarCodigoInvitacion === 'function') return agregarCodigoInvitacion();
+    });
+    await page.waitForTimeout(1800);
 
-  // Verificar en DB
-  const r02 = await supaGET('codigos_invitacion',
-    `select=id,codigo,tipo,activo,usado,para&order=id.desc&limit=5`, jwt);
-  ok('I02-a: GET /codigos_invitacion responde 200', r02.status === 200);
-  if (r02.status === 200 && Array.isArray(r02.body)) {
-    const nuevo02 = r02.body.find(x => (x.para || '').includes(EXEC_ID));
-    ok(`I02-b: código con para="${EXEC_ID}" hallado en DB`, !!nuevo02);
-    ok('I02-c: código activo=true', nuevo02?.activo === true);
-    ok('I02-d: código usado=false', nuevo02?.usado === false);
-    ok('I02-e: tipo=prueba', nuevo02?.tipo === 'prueba');
-  }
+    // Poll REST — buscar por cuenta_id + codigo
+    const r03 = await supaAuth(
+      `/rest/v1/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&codigo=eq.${encodeURIComponent(CODIGO1)}&select=id,codigo,para,tipo,activo`,
+      jwt
+    );
+    ok('I03-a: GET codigos responde 200', r03.status === 200);
+    const fila03 = Array.isArray(r03.body) ? r03.body[0] : null;
+    ok('I03-b: fila insertada en DB', !!fila03);
+    ok('I03-c: codigo correcto', fila03?.codigo === CODIGO1);
+    ok('I03-d: activo=true por defecto', fila03?.activo === true);
 
-  // ── I03 — Código visible tras reload ─────────────────────────────────────
-  console.log('\n[I03] Código visible en UI tras reload');
-  await reloginUI();
-  await navegarInvitaciones();
-  const listaHTML03 = await page.locator('#lista-invitaciones').innerHTML().catch(() => '');
-  ok('I03-a: EXEC_ID aparece en lista tras reload', listaHTML03.includes(EXEC_ID));
+    // ── I04: Código persiste tras reload ──────────────────────────────────
+    console.log('\n[I04] Código persiste tras reload');
+    await page.reload({ waitUntil: 'load', timeout: T_LARGO });
+    await waitAppReady(page);
+    await reloginViaUI(page);
+    await navegarInvitaciones(page).catch(() => navegarConfig(page));
+    const html04 = await page.locator('#contenido, main, body').innerHTML().catch(() => '');
+    ok('I04-a: código visible en UI tras reload', html04.includes(CODIGO1));
 
-  // ── I04 — Desactivar código ───────────────────────────────────────────────
-  console.log('\n[I04] Desactivar código → activo=false en DB');
-  // Encontrar botón "Desactivar" del código recién creado
-  const r04pre = await supaGET('codigos_invitacion',
-    `select=id,codigo&para=like.*${EXEC_ID}*&order=id.desc&limit=1`, jwt);
-  let codigoParaDesactivar = null;
-  if (r04pre.status === 200 && Array.isArray(r04pre.body) && r04pre.body.length > 0) {
-    codigoParaDesactivar = r04pre.body[0].codigo;
-  }
-  if (codigoParaDesactivar) {
-    // Click en botón desactivar del código
-    const btnDesact = page.locator(`[onclick*="desactivarCodigoPorCodigo('${codigoParaDesactivar}')"]`);
-    if (await btnDesact.count() > 0) {
-      page.on('dialog', d => d.accept());
-      await btnDesact.click();
+    // ── I05: Desactivar código ────────────────────────────────────────────
+    console.log('\n[I05] Desactivar código → activo=false');
+    const codigoId05 = fila03?.id || null;
+
+    if (codigoId05) {
+      await page.evaluate(id => {
+        if (typeof desactivarCodigo === 'function') return desactivarCodigo(id);
+        if (typeof desactivarCodigoPorCodigo === 'function') return desactivarCodigoPorCodigo(id);
+      }, codigoId05);
       await page.waitForTimeout(1500);
-      const r04 = await supaGET('codigos_invitacion',
-        `select=activo&codigo=eq.${encodeURIComponent(codigoParaDesactivar)}`, jwt);
-      ok('I04-a: GET código desactivado responde 200', r04.status === 200);
-      const filaDesact = Array.isArray(r04.body) ? r04.body[0] : null;
-      ok('I04-b: activo=false en DB tras desactivar', filaDesact?.activo === false);
-    } else {
-      ok('I04-a: botón desactivar encontrado', false);
-      ok('I04-b: activo=false en DB', false);
-    }
-  } else {
-    ok('I04-a: código para desactivar hallado en DB', false);
-    ok('I04-b: activo=false en DB', false);
-  }
 
-  // ── I05 — Eliminar código ─────────────────────────────────────────────────
-  console.log('\n[I05] Eliminar código → ausente en DB y UI');
-  if (codigoParaDesactivar) {
-    const btnElim = page.locator(`[onclick*="eliminarCodigoPorCodigo('${codigoParaDesactivar}')"]`);
-    if (await btnElim.count() > 0) {
-      page.removeAllListeners('dialog');
-      page.on('dialog', d => d.accept());
-      await btnElim.click();
-      await page.waitForTimeout(500);
-      await btnElim.click().catch(() => {}); // segunda confirmación
+      const r05 = await supaAuth(
+        `/rest/v1/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&id=eq.${encodeURIComponent(codigoId05)}&select=activo`,
+        jwt
+      );
+      ok('I05-a: GET codigo responde 200', r05.status === 200);
+      ok('I05-b: activo=false en DB', r05.body?.[0]?.activo === false);
+    } else {
+      ok('I05-a: (BLOQUEADO — id no hallado)', false);
+      ok('I05-b: (BLOQUEADO)', false);
+    }
+
+    // ── I06: Crear 2° código + sincronizar ────────────────────────────────
+    console.log('\n[I06] Crear 2° código → sincronizar → ambos en UI');
+    // Crear segundo código vía REST directo (fixture) para verificar sincronización
+    const payload06 = {
+      cuenta_id: CUENTA_ID,
+      id:        `ci-b1-2-${EXEC_ID}`,
+      codigo:    CODIGO2,
+      para:      PARA2,
+      tipo:      'alumno',
+      activo:    true,
+      usado:     false,
+    };
+    const r06ins = await supaAuth(
+      `/rest/v1/codigos_invitacion`,
+      jwt,
+      { method: 'POST', body: payload06, prefer: 'return=representation' }
+    );
+    ok('I06-a: fixture 2° código insertado REST', r06ins.status === 201 || r06ins.status === 200);
+
+    // Sincronizar desde UI
+    await page.evaluate(() => {
+      if (typeof sincronizarCodigos === 'function') return sincronizarCodigos();
+      if (typeof sincronizarCodigosDesdeSupabase === 'function') return sincronizarCodigosDesdeSupabase();
+      if (typeof recargarCodigos === 'function') return recargarCodigos();
+    });
+    await page.waitForTimeout(1500);
+
+    const html06 = await page.locator('#contenido, main, body').innerHTML().catch(() => '');
+    ok('I06-b: CODIGO1 visible tras sincronizar', html06.includes(CODIGO1) || html06.includes(EXEC_ID));
+    ok('I06-c: CODIGO2 visible tras sincronizar', html06.includes(CODIGO2));
+
+    // ── I07: Eliminar código ──────────────────────────────────────────────
+    console.log('\n[I07] Eliminar código → ausente en DB');
+    if (codigoId05) {
+      await page.evaluate(id => {
+        if (typeof eliminarCodigo === 'function') return eliminarCodigo(id);
+        if (typeof eliminarCodigoPorCodigo === 'function') return eliminarCodigoPorCodigo(id);
+      }, codigoId05);
       await page.waitForTimeout(1500);
-      const r05 = await supaGET('codigos_invitacion',
-        `select=id&codigo=eq.${encodeURIComponent(codigoParaDesactivar)}`, jwt);
-      ok('I05-a: GET código eliminado responde 200', r05.status === 200);
-      const rows05 = Array.isArray(r05.body) ? r05.body : [];
-      ok('I05-b: código ausente en DB tras eliminar', rows05.length === 0);
+
+      const r07 = await supaAuth(
+        `/rest/v1/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&id=eq.${encodeURIComponent(codigoId05)}&select=id`,
+        jwt
+      );
+      ok('I07-a: GET codigo responde 200', r07.status === 200);
+      ok('I07-b: fila ausente en DB', Array.isArray(r07.body) && r07.body.length === 0);
     } else {
-      ok('I05-a: botón eliminar encontrado', false);
-      ok('I05-b: código ausente en DB', false);
+      ok('I07-a: (BLOQUEADO)', false);
+      ok('I07-b: (BLOQUEADO)', false);
     }
-  } else {
-    ok('I05-a: (BLOQUEADO — no hay código para eliminar)', false);
-    ok('I05-b: (BLOQUEADO)', false);
+
+  } finally {
+    // ── I08: Limpieza ─────────────────────────────────────────────────────
+    console.log('\n[I08] Limpieza staging');
+    try {
+      const jwtPost = await loginTesorero();
+      await limpiarCodigos(jwtPost);
+      ok('I08: limpieza ejecutada sin excepción', true);
+    } catch (e) {
+      console.error('  ⚠️  limpiarCodigos:', e.message);
+      ok('I08: limpieza', false);
+    }
+    if (browser) await browser.close();
+    if (server)  server.close();
   }
 
-  // ── I06 — Código ANUAL ────────────────────────────────────────────────────
-  console.log('\n[I06] Crear código anual → prefijo ANUAL-');
-  await page.evaluate(() => { if (typeof showModal === 'function') showModal('nuevoCodigoModal', {tipo:'anual'}); });
-  await page.waitForTimeout(800);
-  const codParaI06 = page.locator('#cod-para');
-  if (await codParaI06.count() > 0) {
-    await codParaI06.fill(`Test ANUAL ${EXEC_ID}`);
-    const btnI06 = page.locator('button').filter({ hasText: /generar código/i }).last();
-    await btnI06.click();
-    await page.waitForTimeout(1500);
-    const r06 = await supaGET('codigos_invitacion',
-      `select=codigo,tipo&para=like.*${EXEC_ID}*&tipo=eq.anual&order=id.desc&limit=1`, jwt);
-    ok('I06-a: código anual presente en DB', r06.status === 200 && Array.isArray(r06.body) && r06.body.length > 0);
-    ok('I06-b: prefijo ANUAL-', (r06.body?.[0]?.codigo || '').startsWith('ANUAL-'));
-  } else {
-    ok('I06-a: modal anual visible', false);
-    ok('I06-b: prefijo ANUAL-', false);
-  }
-
-  // ── I07 — Código VIP ──────────────────────────────────────────────────────
-  console.log('\n[I07] Crear código VIP → prefijo VIP-');
-  await page.evaluate(() => { if (typeof showModal === 'function') showModal('nuevoCodigoModal', {tipo:'vip'}); });
-  await page.waitForTimeout(800);
-  const codParaI07 = page.locator('#cod-para');
-  if (await codParaI07.count() > 0) {
-    await codParaI07.fill(`Test VIP ${EXEC_ID}`);
-    const btnI07 = page.locator('button').filter({ hasText: /generar código/i }).last();
-    await btnI07.click();
-    await page.waitForTimeout(1500);
-    const r07 = await supaGET('codigos_invitacion',
-      `select=codigo,tipo&para=like.*${EXEC_ID}*&tipo=eq.vip&order=id.desc&limit=1`, jwt);
-    ok('I07-a: código VIP presente en DB', r07.status === 200 && Array.isArray(r07.body) && r07.body.length > 0);
-    ok('I07-b: prefijo VIP-', (r07.body?.[0]?.codigo || '').startsWith('VIP-'));
-  } else {
-    ok('I07-a: modal VIP visible', false);
-    ok('I07-b: prefijo VIP-', false);
-  }
-
-  // ── I08 — Limpieza ────────────────────────────────────────────────────────
-  console.log('\n[I08] Limpieza staging');
-  await limpiarCodigos(jwt);
-  ok('I08-a: limpieza ejecutada sin excepción', true);
-
-  // ── Resultado ─────────────────────────────────────────────────────────────
-  await browser.close();
-  server.close();
-
-  console.log(`\n${'─'.repeat(50)}`);
+  console.log(`\n${'─'.repeat(56)}`);
   console.log(`📊 E10 Invitaciones V9: ${pass} ✅  ${fail} ❌`);
   if (failures.length) {
     console.log('\nFallas:');

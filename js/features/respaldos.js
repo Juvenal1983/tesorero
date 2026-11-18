@@ -1,12 +1,141 @@
 // js/features/respaldos.js — extraído de la copia de demostración.
-// B5-V9: en modo V9_RELACIONAL la exportación usa DB (cargada desde Supabase al
-// iniciar sesión). La importación no está disponible en V9 — los datos se gestionan
-// directamente en Supabase.
+//
+// B5-V9 — estado de implementación:
+//
+// ✅ exportarDatosConFecha / exportarDatos:
+//    En V9_RELACIONAL se reemplaza por exportarDatosCompletosV9(), que descarga
+//    cada colección directamente desde Supabase (no desde la caché DB), cubre
+//    todos los cursos de la cuenta y documenta el alcance en el JSON.
+//
+// ⛔ importarDatos (legado): bloqueada en V9 con mensaje claro.
+//    La importación V9 (restauración completa desde JSON a Supabase) está
+//    PENDIENTE — se requiere validación de conflictos y operaciones en lote.
+//    No se declara B5 completo hasta implementar esa función.
+//
+// ⚠️  saveCuenta — inventario V9 (pendiente):
+//    - Modifica DB.usuarios[ui].nombre y DB.cursos[ci].tesorero en memoria.
+//    - Llama saveDB() (no-op en V9) → cambios NO persisten en Supabase.
+//    - authClient?.auth.updateUser() para contraseña usa .catch(()=>{}) que
+//      silencia errores (401, rate-limit, política de contraseñas).
+//    - Pendiente: wiring V9 para actualizar tesorero_cuentas / auth.updateUser
+//      con await y manejo de error explícito antes de mostrar éxito.
 
 function _respaldosV9() { return typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL; }
+function _respToken()   { return (typeof _authToken !== 'undefined' && _authToken) ||
+                                 (typeof S !== 'undefined' && S.session?.accessToken) || null; }
+function _respCuentaId(){ return (typeof S !== 'undefined' && S._v9CuentaId) || null; }
+
+// ── Exportación completa desde Supabase (V9) ──────────────────────────────────
+
+/**
+ * Descarga toda la cuenta directamente desde Supabase, curso a curso.
+ * Colecciones cubiertas: cursos, alumnos, apoderados, cuotas, pagos,
+ * movimientos, fondo_movimientos, planes_pago, notas, codigos_invitacion,
+ * config_cuenta.
+ *
+ * @returns {Promise<void>}  — genera descarga del archivo JSON.
+ */
+async function exportarDatosCompletosV9() {
+  if (!puedeExportarDatos()) { showToast('⛔ Exportación no disponible para este rol','#E24B4A'); return; }
+  const cuentaId = _respCuentaId();
+  const token    = _respToken();
+  if (!cuentaId || !token) { showToast('⛔ Sin sesión activa','#E24B4A'); return; }
+
+  const msgEl = document.getElementById('export-msg');
+  const setMsg = (txt, ok) => {
+    if (!msgEl) return;
+    msgEl.innerHTML = `<div class="alert ${ok?'ag':'ar'}">${txt}</div>`;
+    msgEl.style.display = '';
+  };
+  setMsg('⏳ Generando respaldo completo desde Supabase…', true);
+
+  try {
+    const respaldo = {
+      version:   'v9-completo',
+      fecha:     new Date().toISOString(),
+      cuentaId,
+      alcance:   'todos los cursos de la cuenta',
+      colecciones: {},
+    };
+
+    // 1. Cursos
+    const cursos = await cargarCursos(cuentaId, token);
+    respaldo.colecciones.cursos = cursos;
+    const cursoIds = cursos.map(c => c.id);
+
+    // 2. Por curso: alumnos, cuotas (+ planes_pago), movimientos, fondo_movimientos
+    respaldo.colecciones.alumnos          = [];
+    respaldo.colecciones.cuotas           = [];
+    respaldo.colecciones.planes_pago      = [];
+    respaldo.colecciones.movimientos      = [];
+    respaldo.colecciones.fondo_movimientos= [];
+
+    for (const cursoId of cursoIds) {
+      const [alus, cuotas, movs, fondoMovs] = await Promise.all([
+        cargarAlumnos(cuentaId, cursoId, token),
+        cargarCuotas(cuentaId, cursoId, token),
+        cargarMovimientosV9(cuentaId, cursoId, token),
+        cargarFondoMovimientosV9(cuentaId, cursoId, token).catch(() => []),
+      ]);
+      respaldo.colecciones.alumnos          .push(...alus);
+      respaldo.colecciones.cuotas           .push(...cuotas);
+      respaldo.colecciones.movimientos      .push(...movs);
+      respaldo.colecciones.fondo_movimientos.push(...fondoMovs);
+
+      const cuotaIds = cuotas.map(q => q.id);
+      const planes = cuotaIds.length
+        ? await cargarPlanesPagoV9(cuentaId, cuotaIds, token).catch(() => [])
+        : [];
+      respaldo.colecciones.planes_pago.push(...planes);
+    }
+
+    // 3. Colecciones de cuenta (no por curso)
+    const [apoderados, pagos, notas, codigos, cfg] = await Promise.all([
+      cargarTodosApoderadosV9(cuentaId, token).catch(() => []),
+      cargarPagos(cuentaId, token),
+      cargarNotasV9(cuentaId, token).catch(() => []),
+      cargarCodigosInvitacionV9(cuentaId, token).catch(() => []),
+      cargarConfigCuentaV9(cuentaId, token).catch(() => null),
+    ]);
+    respaldo.colecciones.apoderados        = apoderados;
+    respaldo.colecciones.pagos             = pagos;
+    respaldo.colecciones.notas             = notas;
+    respaldo.colecciones.codigos_invitacion= codigos;
+    respaldo.colecciones.config_cuenta     = cfg ? [cfg] : [];
+
+    // 4. Descargar
+    const json = JSON.stringify(respaldo, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `tesorero-respaldo-v9-${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    previewStorage.setItem('tesorero_ultimo_respaldo', new Date().toISOString());
+    const nCursos   = cursoIds.length;
+    const nAlumnos  = respaldo.colecciones.alumnos.length;
+    const nPagos    = respaldo.colecciones.pagos.length;
+    setMsg(`✅ Respaldo completo generado — ${nCursos} curso(s), ${nAlumnos} alumno(s), ${nPagos} pago(s).`, true);
+    setTimeout(() => { if (msgEl) msgEl.style.display = 'none'; }, 6000);
+
+  } catch (e) {
+    console.error('[respaldos] exportarDatosCompletosV9:', e.message);
+    setMsg('❌ Error al generar el respaldo: ' + e.message, false);
+  }
+}
+
+// ── Punto de entrada unificado ────────────────────────────────────────────────
 
 function exportarDatosConFecha(){
   if(!puedeExportarDatos()){ showToast('⛔ Exportación de respaldos no disponible para este rol','#E24B4A'); return; }
+  if (_respaldosV9()) {
+    // B5-V9: descarga completa desde Supabase
+    exportarDatosCompletosV9();
+    return;
+  }
+  // Legado: exporta caché local
   exportarDatos();
   previewStorage.setItem('tesorero_ultimo_respaldo', new Date().toISOString());
   const msg = document.getElementById('export-msg');
@@ -31,12 +160,14 @@ function exportarDatos(){
   URL.revokeObjectURL(url);
 }
 
+// ── Importación ───────────────────────────────────────────────────────────────
+
 function importarDatos(e){
   if(!puedeExportarDatos()){ showToast('⛔ Importación de datos no disponible para este rol','#E24B4A'); return; }
-  // B5-V9: en modo relacional los datos viven en Supabase; la importación por JSON
-  // no está disponible porque saveDB() es no-op y los datos no se persistirían.
+  // B5-V9 PENDIENTE: la restauración completa (JSON → Supabase, todas las tablas)
+  // aún no está implementada. Bloquear para evitar falso guardado.
   if(_respaldosV9()){
-    alert('⚠️ La importación de respaldo no está disponible en el modo relacional V9.\n\nEn este modo los datos se gestionan directamente en Supabase.\nSi necesitas restaurar datos, utiliza el Panel SQL de Supabase o contacta al soporte.');
+    alert('⚠️ La importación de respaldo no está disponible aún en el modo relacional V9.\n\nSe requiere implementar la restauración completa a Supabase.\nSi necesitas restaurar datos urgentemente, usa el Panel SQL de Supabase.');
     return;
   }
   const file = e.target.files[0];
@@ -76,6 +207,11 @@ function importarDatos(e){
   reader.readAsText(file);
 }
 
+// ── saveCuenta — PENDIENTE V9 ─────────────────────────────────────────────────
+// Ver inventario en el encabezado del archivo.
+// La función actual se mantiene operativa en legado; en V9 los cambios de nombre
+// y tesorero quedan en memoria pero no persisten en Supabase.
+
 function saveCuenta(){
   if(!puedeConfigurar()){ showToast('⛔ Sin permisos para modificar datos de cuenta','#E24B4A'); return; }
   const nombre = document.getElementById('cfg-usr-nombre').value.trim();
@@ -101,7 +237,8 @@ function saveCuenta(){
   DB.usuarios[ui].nombre = nombre;
   DB.usuarios[ui].email  = email;
   if(pass){
-    // Contraseña solo se actualiza en Supabase Auth — nunca en DB local
+    // Contraseña solo se actualiza en Supabase Auth — nunca en DB local.
+    // ⚠️ PENDIENTE V9: usar await + manejo de error explícito antes de mostrar éxito.
     delete DB.usuarios[ui].pass;
     authClient?.auth.updateUser({ password: pass }).catch(()=>{});
     // Regenerar código de recuperación al cambiar contraseña
@@ -121,6 +258,7 @@ function saveCuenta(){
   S.session.email  = email;
 
   // Actualizar nombre del tesorero en el curso
+  // ⚠️ PENDIENTE V9: persistir en tabla cursos de Supabase.
   const ci = (DB.cursos||[]).findIndex(c=>c.id===S.cursoId);
   if(ci>=0) DB.cursos[ci].tesorero = nombre;
 
@@ -129,4 +267,3 @@ function saveCuenta(){
   document.getElementById('cfg-usr-pass2').value = '';
   showMsg('✅ Datos de cuenta actualizados correctamente.', true);
 }
-
