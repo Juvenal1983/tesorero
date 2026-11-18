@@ -282,7 +282,7 @@ async function insertarFixtures(jwt, cuentaId, fixtureCreados) {
         fecha:      hoy,
         medio:      'efectivo',
         estado:     'pagado',
-        periodo:    `Fixture-${EXEC_ID}-${i}`, // único por run → evita colisión en índice único
+        periodo:    `Fixture-${EXEC_ID}-${i}`, // único por run → identifica el fixture en el respaldo
         obs:        `FixturePago E12 ${EXEC_ID}`,
         // Sin 'curso_id', 'tipo', 'descripcion' — columnas inexistentes en pagos
       },
