@@ -82,6 +82,9 @@ const FIXTURE_PIN = '7391';   // ≥4 caracteres, cumple la validación de guard
 
 // ── ID único para esta ejecución ─────────────────────────────────────────────
 const EXEC_ID = Date.now().toString(36).toUpperCase();
+// IDs de fixture deterministas: TEXT explícito (cursos.id y alumnos.id son TEXT NOT NULL sin DEFAULT)
+const FIXTURE_CURSO_ID = 'e15-curso-' + EXEC_ID.toLowerCase();
+const FIXTURE_ALU_ID   = 'e15-alu-'   + EXEC_ID.toLowerCase();
 
 // ── Utilidades ───────────────────────────────────────────────────────────────
 function apiUrl(p) { return `${SUPA_URL}/rest/v1${p}`; }
@@ -154,44 +157,45 @@ async function crearFixtures(H, sub) {
 
   // Paso 2: crear curso fixture
   const FIXTURE_CODIGO = `TST15-${EXEC_ID}`;
+  // cursos.id es TEXT NOT NULL sin DEFAULT → se pasa explícitamente
   const cursoRes = await apiFetch(apiUrl('/cursos'), {
     method: 'POST',
     headers: { ...H, 'Prefer': 'return=representation' },
     body: JSON.stringify({
       cuenta_id: fixtureCuentaId,
+      id:        FIXTURE_CURSO_ID,
       nombre:    `Fixture E15 ${EXEC_ID}`,
       anio:      2099,
       codigo:    FIXTURE_CODIGO,
-      activo:    true,
+      activo:    true,   // cursos usa booleano 'activo' (filtro del RPC: c.activo = TRUE)
     }),
   });
   if (cursoRes.status !== 201) {
     throw new Error(`No se pudo crear curso fixture (${cursoRes.status}): ${cursoRes.body}`);
   }
-  const cursoData = JSON.parse(cursoRes.body || '[]');
-  const curso = Array.isArray(cursoData) ? cursoData[0] : cursoData;
-  fixtureCursoId = curso?.id;
-  if (!fixtureCursoId) throw new Error('Respuesta de INSERT curso sin id: ' + cursoRes.body);
+  fixtureCursoId = FIXTURE_CURSO_ID;
 
   // Paso 3: crear alumno fixture
   const aluRes = await apiFetch(apiUrl('/alumnos'), {
     method: 'POST',
     headers: { ...H, 'Prefer': 'return=representation' },
+    // alumnos.id es TEXT NOT NULL sin DEFAULT → se pasa explícitamente
+    // estado TEXT DEFAULT 'activo' (no boolean 'activo') — el RPC filtra a.estado = 'activo'
+    // nombre TEXT — el RPC apoderado_alumnos_curso devuelve a.nombre directamente
     body: JSON.stringify({
       cuenta_id: fixtureCuentaId,
-      curso_id:  fixtureCursoId,
-      nombres:   'ALU',
-      apellidos: `FIXTURE-E15-${EXEC_ID}`,
-      activo:    true,
+      id:        FIXTURE_ALU_ID,
+      curso_id:  FIXTURE_CURSO_ID,
+      nombre:    `ALU FIXTURE-E15 ${EXEC_ID}`,
+      nombres:   'ALU FIXTURE-E15',
+      apellidos: EXEC_ID,
+      estado:    'activo',
     }),
   });
   if (aluRes.status !== 201) {
     throw new Error(`No se pudo crear alumno fixture (${aluRes.status}): ${aluRes.body}`);
   }
-  const aluData = JSON.parse(aluRes.body || '[]');
-  const alu = Array.isArray(aluData) ? aluData[0] : aluData;
-  fixtureAluId = alu?.id;
-  if (!fixtureAluId) throw new Error('Respuesta de INSERT alumno sin id: ' + aluRes.body);
+  fixtureAluId = FIXTURE_ALU_ID;
 
   // Paso 4: establecer PIN vía RPC tesorero_set_pin (SECURITY DEFINER, hash server-side)
   // No se guarda el PIN en texto plano en ningún lado; solo se envía al RPC.
@@ -204,7 +208,9 @@ async function crearFixtures(H, sub) {
       p_pin:       FIXTURE_PIN,
     }),
   });
-  if (pinRes.status !== 200 && pinRes.status !== 204) {
+  // tesorero_set_pin devuelve JSONB: {ok:true} o {ok:false,error:"..."}
+  const pinData = (() => { try { return JSON.parse(pinRes.body || '{}'); } catch (_) { return {}; } })();
+  if (pinRes.status !== 200 || pinData.ok !== true) {
     throw new Error(`tesorero_set_pin falló (${pinRes.status}): ${pinRes.body}`);
   }
 
@@ -212,27 +218,53 @@ async function crearFixtures(H, sub) {
 }
 
 async function eliminarFixtures(H) {
-  const errs = [];
-  // Eliminar alumno (en cascade elimina alumnos_credenciales)
+  // Eliminar alumno (el FK ON DELETE CASCADE borra también alumnos_credenciales)
   if (fixtureAluId) {
-    const r = await apiFetch(
+    const delAlu = await apiFetch(
       apiUrl(`/alumnos?id=eq.${fixtureAluId}&cuenta_id=eq.${fixtureCuentaId}`),
       { method: 'DELETE', headers: H }
     ).catch(e => ({ status: 'error', body: e.message }));
-    if (r.status !== 200 && r.status !== 204)
-      errs.push(`alumno DELETE (${r.status}): ${r.body}`);
+    ok('Teardown: alumno DELETE exitoso',
+       delAlu.status === 200 || delAlu.status === 204,
+       `status=${delAlu.status}`);
+
+    // Verificar por GET que el alumno ya no existe
+    const verAlu = await apiFetch(
+      apiUrl(`/alumnos?id=eq.${fixtureAluId}&cuenta_id=eq.${fixtureCuentaId}&select=id`),
+      { headers: H }
+    ).catch(e => ({ status: 'error', body: e.message }));
+    const aluRows = (() => {
+      try { return JSON.parse(verAlu.body || '[]'); } catch (_) { return [1]; }
+    })();
+    ok('Teardown: fixture alumno eliminado (GET)',
+       Array.isArray(aluRows) && aluRows.length === 0,
+       `body=${verAlu.body}`);
   }
+
   // Eliminar curso
   if (fixtureCursoId) {
-    const r = await apiFetch(
+    const delCurso = await apiFetch(
       apiUrl(`/cursos?id=eq.${fixtureCursoId}&cuenta_id=eq.${fixtureCuentaId}`),
       { method: 'DELETE', headers: H }
     ).catch(e => ({ status: 'error', body: e.message }));
-    if (r.status !== 200 && r.status !== 204)
-      errs.push(`curso DELETE (${r.status}): ${r.body}`);
+    ok('Teardown: curso DELETE exitoso',
+       delCurso.status === 200 || delCurso.status === 204,
+       `status=${delCurso.status}`);
+
+    // Verificar por GET que el curso ya no existe
+    const verCurso = await apiFetch(
+      apiUrl(`/cursos?id=eq.${fixtureCursoId}&cuenta_id=eq.${fixtureCuentaId}&select=id`),
+      { headers: H }
+    ).catch(e => ({ status: 'error', body: e.message }));
+    const cursoRows = (() => {
+      try { return JSON.parse(verCurso.body || '[]'); } catch (_) { return [1]; }
+    })();
+    ok('Teardown: fixture curso eliminado (GET)',
+       Array.isArray(cursoRows) && cursoRows.length === 0,
+       `body=${verCurso.body}`);
   }
-  if (errs.length) console.error('⚠️  Teardown con errores:', errs.join('; '));
-  else             console.log('  🧹 Fixtures eliminados correctamente.');
+
+  console.log('  🧹 Teardown completado.');
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
