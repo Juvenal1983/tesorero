@@ -167,12 +167,23 @@ async function loginTesorero() {
   return r.body.access_token;
 }
 
+function jwtSub(token) {
+  try {
+    const payload = token.split('.')[1];
+    const padded  = payload + '='.repeat((4 - payload.length % 4) % 4);
+    return JSON.parse(Buffer.from(padded, 'base64url').toString('utf8')).sub || null;
+  } catch { return null; }
+}
+
 async function descubrirCuenta(jwt) {
-  // order=id.asc para resultado determinista.
-  // Si el usuario tiene acceso a varias cuentas, fija STAGING_CUENTA_ID en .env.
-  const r = await supaAuth('/rest/v1/tesorero_cuentas?select=id&order=id.asc&limit=1', jwt);
+  const sub = jwtSub(jwt);
+  if (!sub) throw new Error('descubrirCuenta: no se pudo extraer sub del JWT');
+  const r = await supaAuth(
+    `/rest/v1/tesorero_cuentas?auth_id=eq.${encodeURIComponent(sub)}&select=id&limit=1`,
+    jwt
+  );
   if (r.status !== 200 || !Array.isArray(r.body) || r.body.length === 0)
-    throw new Error('descubrirCuenta: ' + JSON.stringify(r.body));
+    throw new Error(`descubrirCuenta: auth_id=${sub} → ${JSON.stringify(r.body)}`);
   return r.body[0].id;
 }
 
@@ -412,11 +423,6 @@ async function eliminarFixtures(jwt, cuentaId, fixtureCreados) {
   let fallosCleanup = 0;
 
   try {
-    // Insertar fixtures DENTRO del try (si falla parcialmente, finally limpia)
-    console.log('\n[Pre] Insertar fixtures propios (2 cursos, 4 alumnos, 2 pagos)');
-    await insertarFixtures(jwt, CUENTA_ID, fixtureCreados);
-    console.log(`  Fixtures insertados: cursos=${fixtureCreados.cursos.length}, alumnos=${fixtureCreados.alumnos.length}, pagos=${fixtureCreados.pagos.length}`);
-
     // ── R01: Servidor ─────────────────────────────────────────────────────
     console.log('\n[R01] Servidor HTTP local');
     server = await servirApp();
@@ -450,10 +456,9 @@ async function eliminarFixtures(jwt, cuentaId, fixtureCreados) {
       throw new Error('Login UI no completó');
     }
 
-    // Validar coherencia de cuenta REST ↔ UI antes de cualquier escritura.
-    // Si difieren, los fixtures irían a la cuenta correcta (CUENTA_ID) pero el
-    // respaldo exportado usaría la cuenta de la UI — las aserciones fallarían
-    // con datos confusos. Abortar temprano evita modificar staging innecesariamente.
+    // Validar coherencia de cuenta REST ↔ UI.
+    // DEBE ejecutarse ANTES del primer INSERT de fixtures.
+    // Si difieren, abortar sin escribir nada en staging.
     const cuentaUI = await page.evaluate(() => window.S?._v9CuentaId ?? null);
     if (!cuentaUI) throw new Error('_v9CuentaId no disponible en window.S tras login');
     if (cuentaUI !== CUENTA_ID) {
@@ -463,6 +468,12 @@ async function eliminarFixtures(jwt, cuentaId, fixtureCreados) {
       );
     }
     console.log(`  Cuenta REST = Cuenta UI = ${CUENTA_ID} ✓`);
+
+    // Insertar fixtures DESPUÉS de la validación de coherencia y DENTRO del try
+    // (si falla parcialmente, el finally limpia lo que ya se insertó).
+    console.log('\n[Pre] Insertar fixtures propios (2 cursos, 4 alumnos, 2 pagos)');
+    await insertarFixtures(jwt, CUENTA_ID, fixtureCreados);
+    console.log(`  Fixtures insertados: cursos=${fixtureCreados.cursos.length}, alumnos=${fixtureCreados.alumnos.length}, pagos=${fixtureCreados.pagos.length}`);
 
     // ── R03: Exportar respaldo completo ───────────────────────────────────
     console.log('\n[R03] exportarDatosCompletosV9 → capturar JSON');

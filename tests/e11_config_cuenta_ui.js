@@ -272,13 +272,33 @@ async function loginTesorero() {
   return r.body.access_token;
 }
 
+/**
+ * Extrae el 'sub' (user UUID) del payload del JWT sin verificar firma.
+ * Solo para obtener el auth_id que luego se valida contra Supabase.
+ */
+function jwtSub(token) {
+  try {
+    const payload = token.split('.')[1];
+    // Padding para Base64
+    const padded  = payload + '='.repeat((4 - payload.length % 4) % 4);
+    return JSON.parse(Buffer.from(padded, 'base64url').toString('utf8')).sub || null;
+  } catch { return null; }
+}
+
+/**
+ * Resuelve la cuenta del usuario autenticado usando auth_id=eq.{sub}.
+ * El campo auth_id en tesorero_cuentas vincula la fila al propietario autenticado,
+ * igual que hace cargarCuenta() en datos_v9.js.
+ */
 async function descubrirCuenta(jwt) {
-  // Ordena por id.asc para un resultado determinista.
-  // Si el usuario tiene acceso a varias cuentas la primera puede no coincidir
-  // con la que resuelve la UI; en ese caso set STAGING_CUENTA_ID en .env.
-  const r = await supaAuth('/rest/v1/tesorero_cuentas?select=id&order=id.asc&limit=1', jwt);
+  const sub = jwtSub(jwt);
+  if (!sub) throw new Error('descubrirCuenta: no se pudo extraer sub del JWT');
+  const r = await supaAuth(
+    `/rest/v1/tesorero_cuentas?auth_id=eq.${encodeURIComponent(sub)}&select=id&limit=1`,
+    jwt
+  );
   if (r.status !== 200 || !Array.isArray(r.body) || r.body.length === 0)
-    throw new Error('descubrirCuenta: ' + JSON.stringify(r.body));
+    throw new Error(`descubrirCuenta: auth_id=${sub} → ${JSON.stringify(r.body)}`);
   return r.body[0].id;
 }
 
@@ -314,30 +334,31 @@ async function navegarConfig(page) {
 }
 
 /**
- * Espera la primera respuesta de Supabase que coincida con tabla + método +
- * (opcionalmente) un fragmento que debe aparecer en la URL.
+ * Espera la primera respuesta de Supabase que coincida con tabla + método y,
+ * opcionalmente, pase los filtros de URL y de cuerpo.
  *
- * @param {Page}   page
- * @param {string} tabla      — fragmento a buscar en la URL (ej. 'config_cuenta')
- * @param {string} metodo     — 'POST' | 'PATCH' | 'GET' | 'DELETE'
- * @param {number} timeoutMs
- * @param {string} [urlFrag]  — fragmento adicional (ej. el cuenta_id) que la URL debe contener
+ * @param {Page}     page
+ * @param {string}   tabla        — fragmento en la URL (ej. 'config_cuenta')
+ * @param {string}   metodo       — 'POST' | 'PATCH' | 'GET' | 'DELETE'
+ * @param {number}   timeoutMs
+ * @param {string}   [urlFrag]    — fragmento que la URL debe contener (ej. cuenta_id en PATCH)
+ * @param {Function} [bodyCheck]  — fn(body) → bool; para validar cuenta en el cuerpo del POST
  */
-function esperarRespuestaSupabase(page, tabla, metodo, timeoutMs = T_CORTO, urlFrag = null) {
+function esperarRespuestaSupabase(page, tabla, metodo, timeoutMs = T_CORTO, urlFrag = null, bodyCheck = null) {
   return new Promise(resolve => {
     let resolved = false;
     const handler = async res => {
       if (resolved) return;
       const url = res.url();
-      if (url.includes(tabla) && res.request().method() === metodo) {
-        if (urlFrag && !url.includes(urlFrag)) return; // cuenta incorrecta — ignorar
-        resolved = true;
-        page.off('response', handler);
-        const status = res.status();
-        let body = null;
-        try { body = await res.json(); } catch(_) {}
-        resolve({ status, body, url });
-      }
+      if (!url.includes(tabla) || res.request().method() !== metodo) return;
+      if (urlFrag && !url.includes(urlFrag)) return; // cuenta incorrecta en URL — ignorar
+      const status = res.status();
+      let body = null;
+      try { body = await res.json(); } catch(_) {}
+      if (bodyCheck && !bodyCheck(body)) return; // cuenta incorrecta en cuerpo — ignorar
+      resolved = true;
+      page.off('response', handler);
+      resolve({ status, body, url });
     };
     page.on('response', handler);
     setTimeout(() => {
@@ -465,9 +486,14 @@ function esperarRespuestaSupabase(page, tabla, metodo, timeoutMs = T_CORTO, urlF
     ok('C04-a: control #cfg-plantilla presente en ruta config', tieneInput);
     if (!tieneInput) throw new Error('C04: #cfg-plantilla ausente — ¿la ruta config no está activa?');
 
-    // guardarConfigCuentaV9 usa POST con Prefer: resolution=merge-duplicates (upsert),
-    // no PATCH. El listener debe coincidir con POST.
-    const promesaPostCfg = esperarRespuestaSupabase(page, 'config_cuenta', 'POST', T_CORTO, CUENTA_ID);
+    // guardarConfigCuentaV9 hace POST a /config_cuenta sin filtro en la URL;
+    // el cuenta_id va solo en el cuerpo del request.
+    // urlFrag no aplica aquí — validamos cuenta_id en el cuerpo de la RESPUESTA.
+    const promesaPostCfg = esperarRespuestaSupabase(
+      page, 'config_cuenta', 'POST', T_CORTO,
+      null,                                                    // urlFrag: no hay ID en la URL
+      body => Array.isArray(body) && body[0]?.cuenta_id === CUENTA_ID  // bodyCheck
+    );
     await fInputPlantilla.fill(plantillaTest);
     await page.evaluate(() => {
       if (typeof savePlantillaCfg === 'function') savePlantillaCfg();
