@@ -245,8 +245,8 @@ function renderLogin(){
           <div style="font-size:12px;color:var(--t3);margin-bottom:10px;text-align:center">
             ¿No tienes PIN? Solicítalo al tesorero del curso.
           </div>
-          <!-- PENDIENTE: "Recordar mi acceso" — oculto hasta implementar almacenamiento seguro de PIN -->
-          <div style="display:none;align-items:center;gap:8px;margin-bottom:14px;justify-content:center">
+          <!-- "Recordar mi acceso" — guarda cuentaId/alumnoId, NUNCA el PIN -->
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;justify-content:center">
             <input type="checkbox" id="ap-recordar" style="width:16px;height:16px;cursor:pointer;accent-color:var(--gm)">
             <label for="ap-recordar" style="font-size:13px;color:var(--t2);cursor:pointer;user-select:none">Recordar mi acceso</label>
           </div>
@@ -276,6 +276,17 @@ function bindLogin(){
     var nombreEl = document.getElementById('ap-rapido-nombre');
     if(panelRapido){ panelRapido.style.display=''; }
     if(nombreEl){ nombreEl.textContent = '👨‍👩‍👧 Apoderado de '+nombreAp; }
+  }
+
+  // Panel de acceso rápido v9: si el apoderado guardó su contexto (SIN PIN),
+  // mostramos el panel para que solo necesite ingresar el PIN nuevamente.
+  if(typeof V9_RELACIONAL!=='undefined' && V9_RELACIONAL &&
+     previewStorage.getItem('tesorero_ap_v9_recordar')==='1'){
+    const v9Nombre  = previewStorage.getItem('tesorero_ap_v9_alumnoNombre') || 'tu alumno/a';
+    const panelRap  = document.getElementById('panel-ap-rapido');
+    const nombreEl  = document.getElementById('ap-rapido-nombre');
+    if(panelRap){ panelRap.style.display=''; }
+    if(nombreEl){ nombreEl.textContent = '👨‍👩‍👧 Apoderado de '+v9Nombre; }
   }
 
   // Auto-login apoderado si tiene sesión guardada (y no acaba de cerrar sesión)
@@ -350,6 +361,9 @@ function accesoRapido(){
   document.getElementById('l-pass').focus();
 }
 function reingresarApoderado(){
+  // ── v9: delegar al flujo relacional si la bandera está activa ──
+  if(typeof V9_RELACIONAL!=='undefined'&&V9_RELACIONAL){ return reingresarApoderadoV9(); }
+
   var apCursoId = previewStorage.getItem('tesorero_ap_cursoId');
   var apAluId   = previewStorage.getItem('tesorero_ap_aluId');
   var apPin     = previewStorage.getItem('tesorero_ap_pin');
@@ -1287,6 +1301,48 @@ async function refrescarDatosApoderado(btnEl){
   }
 }
 
+/**
+ * Reingresar apoderado v9: pre-carga el contexto guardado (cuentaId + alumnoId)
+ * en _v9ApState y lleva al usuario directamente al paso-pin para que introduzca
+ * su PIN.  El PIN NUNCA se persiste — el usuario siempre debe escribirlo.
+ */
+function reingresarApoderadoV9() {
+  const cuentaId   = previewStorage.getItem('tesorero_ap_v9_cuentaId');
+  const alumnoId   = previewStorage.getItem('tesorero_ap_v9_alumnoId');
+  const alumnoNombre = previewStorage.getItem('tesorero_ap_v9_alumnoNombre') || alumnoId;
+
+  if (!cuentaId || !alumnoId) {
+    // Datos incompletos — volver al flujo normal de código
+    previewStorage.removeItem('tesorero_ap_v9_recordar');
+    switchLoginTab('codigo');
+    return;
+  }
+
+  // Pre-cargar estado transitorio para que doAccesoCodigoV9() funcione
+  _v9ApState.cuentaId     = cuentaId;
+  _v9ApState.alumnoId     = alumnoId;
+  _v9ApState.alumnoNombre = alumnoNombre;
+  _v9ApState.alumnos      = [];  // no necesitamos la lista completa
+
+  // Ir directamente al paso-pin (ocultar pasos previos)
+  const pasoCodigo  = document.getElementById('paso-codigo');
+  const pasoAlumnos = document.getElementById('paso-alumnos');
+  const pasoPin     = document.getElementById('paso-pin');
+  const panelRapido = document.getElementById('panel-ap-rapido');
+
+  if(pasoCodigo)  pasoCodigo.style.display  = 'none';
+  if(pasoAlumnos) pasoAlumnos.style.display = 'none';
+  if(pasoPin)     pasoPin.style.display     = '';
+  if(panelRapido) panelRapido.style.display = 'none';
+
+  // Mostrar el nombre del alumno en el encabezado del paso-pin
+  const nombreEl = document.getElementById('paso3-alumno-nombre');
+  if(nombreEl) nombreEl.textContent = alumnoNombre;
+
+  // Enfocar el input del PIN
+  setTimeout(function(){ const p=document.getElementById('l-pin'); if(p) p.focus(); }, 80);
+}
+
 function limpiarSesionApoderado(){
   // Borra completamente la sesión guardada del apoderado
   // Usar cuando quiere entrar con un código distinto
@@ -1294,6 +1350,11 @@ function limpiarSesionApoderado(){
   previewStorage.removeItem('tesorero_ap_cursoId');
   previewStorage.removeItem('tesorero_ap_aluId');
   previewStorage.removeItem('tesorero_ap_pin');
+  // V9 context
+  previewStorage.removeItem('tesorero_ap_v9_recordar');
+  previewStorage.removeItem('tesorero_ap_v9_cuentaId');
+  previewStorage.removeItem('tesorero_ap_v9_alumnoId');
+  previewStorage.removeItem('tesorero_ap_v9_alumnoNombre');
   window._skipApAutoLogin = true;
   // Ocultar panel rápido y mostrar formulario de código
   const p = document.getElementById('panel-ap-rapido');
@@ -1328,6 +1389,11 @@ function logoutLector(){
   const apCursoId  = previewStorage.getItem('tesorero_ap_cursoId');
   const apAluId    = previewStorage.getItem('tesorero_ap_aluId');
   const apPin      = previewStorage.getItem('tesorero_ap_pin');
+  // V9 context (nunca incluye el PIN)
+  const apV9Recordar     = previewStorage.getItem('tesorero_ap_v9_recordar');
+  const apV9CuentaId     = previewStorage.getItem('tesorero_ap_v9_cuentaId');
+  const apV9AluId        = previewStorage.getItem('tesorero_ap_v9_alumnoId');
+  const apV9AluNombre    = previewStorage.getItem('tesorero_ap_v9_alumnoNombre');
 
   // ⚠️  Resetear KEY a la clave anónima y vaciarla ANTES de initDB().
   //     Paso 1: KEY debe apuntar a la clave neutral, no a 'tesorero_u_<userId>'.
@@ -1345,6 +1411,12 @@ function logoutLector(){
     previewStorage.setItem('tesorero_ap_cursoId', apCursoId||'');
     previewStorage.setItem('tesorero_ap_aluId',   apAluId||'');
     previewStorage.setItem('tesorero_ap_pin',      apPin||'');
+  }
+  if(apV9Recordar==='1'){
+    previewStorage.setItem('tesorero_ap_v9_recordar',   '1');
+    previewStorage.setItem('tesorero_ap_v9_cuentaId',   apV9CuentaId||'');
+    previewStorage.setItem('tesorero_ap_v9_alumnoId',   apV9AluId||'');
+    previewStorage.setItem('tesorero_ap_v9_alumnoNombre', apV9AluNombre||'');
   }
   render();
 }
@@ -1375,6 +1447,10 @@ async function logout(){
   previewStorage.removeItem('tesorero_ap_cursoId');
   previewStorage.removeItem('tesorero_ap_aluId');
   previewStorage.removeItem('tesorero_ap_pin');
+  previewStorage.removeItem('tesorero_ap_v9_recordar');
+  previewStorage.removeItem('tesorero_ap_v9_cuentaId');
+  previewStorage.removeItem('tesorero_ap_v9_alumnoId');
+  previewStorage.removeItem('tesorero_ap_v9_alumnoNombre');
 
   // ⚠️  Resetear KEY a la clave anónima y vaciarla ANTES de initDB().
   //     Paso 1: KEY debe apuntar a la clave neutral, no a 'tesorero_u_<userId>'.
@@ -1795,6 +1871,21 @@ async function doAccesoCodigoV9() {
     _v9ApState.alumnos  = [];
     _v9ApState.alumnoId = null;
     window._aluSelId    = null;
+
+    // "Recordar mi acceso": guardar contexto (cuentaId + alumnoId) — NUNCA el PIN.
+    // El PIN nunca sale de esta función.
+    const recordarV9 = document.getElementById('ap-recordar')?.checked || false;
+    if(recordarV9){
+      previewStorage.setItem('tesorero_ap_v9_recordar',   '1');
+      previewStorage.setItem('tesorero_ap_v9_cuentaId',   cuentaId);
+      previewStorage.setItem('tesorero_ap_v9_alumnoId',   alumnoId);
+      previewStorage.setItem('tesorero_ap_v9_alumnoNombre', nombreAlu);
+    } else {
+      previewStorage.removeItem('tesorero_ap_v9_recordar');
+      previewStorage.removeItem('tesorero_ap_v9_cuentaId');
+      previewStorage.removeItem('tesorero_ap_v9_alumnoId');
+      previewStorage.removeItem('tesorero_ap_v9_alumnoNombre');
+    }
 
     // Navegar al dashboard
     go('dashboard');
