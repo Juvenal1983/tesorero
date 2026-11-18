@@ -12,13 +12,10 @@
 //    PENDIENTE — se requiere validación de conflictos y operaciones en lote.
 //    No se declara B5 completo hasta implementar esa función.
 //
-// ⚠️  saveCuenta — inventario V9 (pendiente):
-//    - Modifica DB.usuarios[ui].nombre y DB.cursos[ci].tesorero en memoria.
-//    - Llama saveDB() (no-op en V9) → cambios NO persisten en Supabase.
-//    - authClient?.auth.updateUser() para contraseña usa .catch(()=>{}) que
-//      silencia errores (401, rate-limit, política de contraseñas).
-//    - Pendiente: wiring V9 para actualizar tesorero_cuentas / auth.updateUser
-//      con await y manejo de error explícito antes de mostrar éxito.
+// ✅ saveCuenta — wiring V9 (commit en esta sesión):
+//    - nombre persiste en tesorero_cuentas vía actualizarCuentaV9() (PATCH).
+//    - authClient.auth.updateUser() usa await + manejo de error explícito.
+//    - En caso de fallo muestra error sin anunciar éxito.
 
 function _respaldosV9() { return typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL; }
 function _respToken()   { return (typeof _authToken !== 'undefined' && _authToken) ||
@@ -212,7 +209,7 @@ function importarDatos(e){
 // La función actual se mantiene operativa en legado; en V9 los cambios de nombre
 // y tesorero quedan en memoria pero no persisten en Supabase.
 
-function saveCuenta(){
+async function saveCuenta(){
   if(!puedeConfigurar()){ showToast('⛔ Sin permisos para modificar datos de cuenta','#E24B4A'); return; }
   const nombre = document.getElementById('cfg-usr-nombre').value.trim();
   const email  = document.getElementById('cfg-usr-email').value.trim().toLowerCase();
@@ -234,34 +231,58 @@ function saveCuenta(){
   const ui = (DB.usuarios||[]).findIndex(u=>u.id===S.session.id);
   if(ui < 0){ showMsg('No se encontró el usuario.', false); return; }
 
-  DB.usuarios[ui].nombre = nombre;
-  DB.usuarios[ui].email  = email;
   if(pass){
-    // Contraseña solo se actualiza en Supabase Auth — nunca en DB local.
-    // ⚠️ PENDIENTE V9: usar await + manejo de error explícito antes de mostrar éxito.
+    // Contraseña: Supabase Auth únicamente — nunca en DB local.
+    if(authClient){
+      try {
+        const { error } = await authClient.auth.updateUser({ password: pass });
+        if (error) { showMsg('❌ Error al cambiar contraseña: ' + error.message, false); return; }
+      } catch(e) {
+        showMsg('❌ Error al cambiar contraseña: ' + e.message, false); return;
+      }
+    }
+    // Regenerar código de recuperación
     delete DB.usuarios[ui].pass;
-    authClient?.auth.updateUser({ password: pass }).catch(()=>{});
-    // Regenerar código de recuperación al cambiar contraseña
     const nuevoCodigo = generarCodigoRecuperacion();
     DB.usuarios[ui].codigoRecuperacion = nuevoCodigo;
     saveDB();
     document.getElementById('cfg-usr-pass').value  = '';
     document.getElementById('cfg-usr-pass2').value = '';
     showMsg('✅ Datos actualizados. Se generó un nuevo código de recuperación.', true);
-    // Mostrar nuevo código de recuperación
     setTimeout(()=> mostrarCodigoRecuperacion(nuevoCodigo, 'cambio'), 300);
     return;
   }
 
-  // Actualizar sesión activa
+  // Actualizar nombre y email
+  DB.usuarios[ui].nombre = nombre;
+  DB.usuarios[ui].email  = email;
+
+  if (_respaldosV9()) {
+    // B4-V9: persistir nombre en tesorero_cuentas.
+    const cuentaId = _respCuentaId();
+    const token    = _respToken();
+    if (!cuentaId || !token) { showMsg('❌ Sin sesión activa — no se pudo guardar.', false); return; }
+    try {
+      await actualizarCuentaV9(cuentaId, { nombre }, token);
+    } catch(e) {
+      console.error('[saveCuenta] actualizarCuentaV9:', e.message);
+      showMsg('❌ No se pudo guardar en la nube: ' + e.message, false);
+      return;
+    }
+    // Actualizar sesión activa
+    S.session.nombre = nombre;
+    S.session.email  = email;
+    document.getElementById('cfg-usr-pass').value  = '';
+    document.getElementById('cfg-usr-pass2').value = '';
+    showMsg('✅ Datos de cuenta actualizados correctamente.', true);
+    return;
+  }
+
+  // Legado: persistir en caché local
   S.session.nombre = nombre;
   S.session.email  = email;
-
-  // Actualizar nombre del tesorero en el curso
-  // ⚠️ PENDIENTE V9: persistir en tabla cursos de Supabase.
   const ci = (DB.cursos||[]).findIndex(c=>c.id===S.cursoId);
   if(ci>=0) DB.cursos[ci].tesorero = nombre;
-
   saveDB();
   document.getElementById('cfg-usr-pass').value  = '';
   document.getElementById('cfg-usr-pass2').value = '';

@@ -92,6 +92,27 @@ async function cargarCuenta(authId, accessToken) {
 }
 
 /**
+ * Actualiza campos de la fila del propietario en tesorero_cuentas.
+ * Solo el propietario puede PATCH su propia fila (RLS tc_propietario_update).
+ *
+ * @param {string} cuentaId     — id de la cuenta
+ * @param {object} cambios      — campos a actualizar ({ nombre?, email? })
+ * @param {string} accessToken  — JWT del propietario
+ * @returns {Promise<object>}   — fila actualizada
+ */
+async function actualizarCuentaV9(cuentaId, cambios, accessToken) {
+  const rows = await _v9Fetch(
+    `/tesorero_cuentas?id=eq.${encodeURIComponent(cuentaId)}`,
+    { method: 'PATCH', body: JSON.stringify(cambios),
+      headers: { 'Prefer': 'return=representation' } },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error('[datos_v9] actualizarCuentaV9: sin fila devuelta tras PATCH.');
+  return rows[0];
+}
+
+/**
  * Carga los cursos activos de una cuenta.
  */
 async function cargarCursos(cuentaId, accessToken) {
