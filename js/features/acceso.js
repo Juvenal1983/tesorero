@@ -1339,6 +1339,14 @@ function reingresarApoderadoV9() {
   const nombreEl = document.getElementById('paso3-alumno-nombre');
   if(nombreEl) nombreEl.textContent = alumnoNombre;
 
+  // Restaurar el estado del checkbox "Recordar mi acceso" desde la preferencia guardada.
+  // Sin esto, doAccesoCodigoV9() lee el checkbox como no marcado y elimina las claves V9.
+  // El usuario puede desmarcarlo explícitamente antes de presionar "Acceder →".
+  const checkboxRapido = document.getElementById('ap-recordar');
+  if (checkboxRapido) {
+    checkboxRapido.checked = previewStorage.getItem('tesorero_ap_v9_recordar') === '1';
+  }
+
   // Enfocar el input del PIN
   setTimeout(function(){ const p=document.getElementById('l-pin'); if(p) p.focus(); }, 80);
 }

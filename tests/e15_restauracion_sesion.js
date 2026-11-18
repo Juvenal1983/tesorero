@@ -473,13 +473,29 @@ async function eliminarFixtures(H) {
     ).then(() => true).catch(() => false);
     ok('R10: acceso rápido con PIN correcto → dashboard', enDash2);
 
-    // ── R11: logoutLector conserva claves V9 ────────────────────────────────
+    // ── R10b/R10c: claves exactas en localStorage inmediatamente tras R10 ────
+    // Verifica cuenta y alumno exactos (no solo valores presentes) ANTES del logout,
+    // para distinguir un fallo en doAccesoCodigoV9 de un fallo en logoutLector.
+    const v9RecordarR10 = await page.evaluate(() => localStorage.getItem('tesorero_ap_v9_recordar'));
+    const v9CuentaR10   = await page.evaluate(() => localStorage.getItem('tesorero_ap_v9_cuentaId'));
+    const v9AluR10      = await page.evaluate(() => localStorage.getItem('tesorero_ap_v9_alumnoId'));
+    ok('R10b: v9_recordar=1 persiste tras acceso rápido', v9RecordarR10 === '1');
+    ok('R10c: cuentaId exacto persiste tras acceso rápido', v9CuentaR10 === CUENTA_ID,
+       `esperado=${CUENTA_ID} actual=${v9CuentaR10}`);
+    ok('R10d: alumnoId exacto persiste tras acceso rápido', v9AluR10 === ALU_ID,
+       `esperado=${ALU_ID} actual=${v9AluR10}`);
+
+    // ── R11: logoutLector conserva claves V9 (cuentaId y alumnoId exactos) ───
     await page.evaluate(() => { if (typeof logoutLector === 'function') logoutLector(); });
     await page.waitForTimeout(500);
     const v9RecordarPost = await page.evaluate(() => localStorage.getItem('tesorero_ap_v9_recordar'));
     const v9CuentaPost   = await page.evaluate(() => localStorage.getItem('tesorero_ap_v9_cuentaId'));
+    const v9AluPost      = await page.evaluate(() => localStorage.getItem('tesorero_ap_v9_alumnoId'));
     ok('R11a: v9_recordar conservado tras logoutLector', v9RecordarPost === '1');
-    ok('R11b: v9_cuentaId conservado tras logoutLector', !!v9CuentaPost);
+    ok('R11b: cuentaId exacto conservado tras logoutLector', v9CuentaPost === CUENTA_ID,
+       `esperado=${CUENTA_ID} actual=${v9CuentaPost}`);
+    ok('R11c: alumnoId exacto conservado tras logoutLector', v9AluPost === ALU_ID,
+       `esperado=${ALU_ID} actual=${v9AluPost}`);
 
     // ── R12: logout (tesorero) limpia claves V9 ──────────────────────────────
     await page.evaluate(() => {
