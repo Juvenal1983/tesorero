@@ -348,9 +348,18 @@ async function limpiarNotas(jwt) {
     await waitAppReady(page);
     await reloginViaUI(page);
 
-    // 1. Sesión completa (S._v9CuentaId disponible)
+    // 1. Sesión completa: esperar _v9CuentaId explícitamente, con o sin re-login.
+    //    reloginViaUI solo espera cuando hay formulario visible; si la sesión
+    //    persiste retorna de inmediato y la inicialización V9 puede seguir corriendo.
+    //    Verificar además que coincide con la cuenta esperada (no solo truthy).
+    await page.waitForFunction(
+      cuentaId => window.S?._v9CuentaId === cuentaId,
+      CUENTA_ID,
+      { timeout: T_LARGO }
+    ).catch(() => {});
     const cuentaIdPost = await page.evaluate(() => window.S?._v9CuentaId || null);
-    ok('N04-a: sesión completa tras reload (_v9CuentaId)', !!cuentaIdPost);
+    ok('N04-a: sesión completa tras reload (_v9CuentaId === CUENTA_ID)',
+      cuentaIdPost === CUENTA_ID);
 
     // 2. Esperar que DB.notas tenga la nota exacta (carga relacional completada)
     if (notaId) {
