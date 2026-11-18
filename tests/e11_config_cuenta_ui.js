@@ -379,7 +379,10 @@ function esperarRespuestaSupabase(page, tabla, metodo, timeoutMs = T_CORTO, urlF
     process.exit(3);
   }
   console.log(`  Nombre original en DB    : ${JSON.stringify(nombreOriginal)}`);
-  console.log(`  Plantilla original en DB : ${JSON.stringify((plantillaOriginal ?? '').toString().slice(0, 60))}`);
+  // JSON.stringify preserva null como "null" y trunca strings largos con slice
+  const plantillaLog = plantillaOriginal === null ? null
+                     : (typeof plantillaOriginal === 'string' ? plantillaOriginal.slice(0, 60) : plantillaOriginal);
+  console.log(`  Plantilla original en DB : ${JSON.stringify(plantillaLog)}`);
 
   // Flags: qué se modificó (para restaurar en finally)
   let plantillaModificada = false;

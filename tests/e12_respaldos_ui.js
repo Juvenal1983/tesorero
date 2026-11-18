@@ -168,7 +168,9 @@ async function loginTesorero() {
 }
 
 async function descubrirCuenta(jwt) {
-  const r = await supaAuth('/rest/v1/tesorero_cuentas?select=id&limit=1', jwt);
+  // order=id.asc para resultado determinista.
+  // Si el usuario tiene acceso a varias cuentas, fija STAGING_CUENTA_ID en .env.
+  const r = await supaAuth('/rest/v1/tesorero_cuentas?select=id&order=id.asc&limit=1', jwt);
   if (r.status !== 200 || !Array.isArray(r.body) || r.body.length === 0)
     throw new Error('descubrirCuenta: ' + JSON.stringify(r.body));
   return r.body[0].id;
@@ -448,11 +450,19 @@ async function eliminarFixtures(jwt, cuentaId, fixtureCreados) {
       throw new Error('Login UI no completó');
     }
 
-    await page.waitForFunction(
-      cuentaId => window.S?._v9CuentaId === cuentaId,
-      CUENTA_ID,
-      { timeout: T_LARGO }
-    ).catch(() => {});
+    // Validar coherencia de cuenta REST ↔ UI antes de cualquier escritura.
+    // Si difieren, los fixtures irían a la cuenta correcta (CUENTA_ID) pero el
+    // respaldo exportado usaría la cuenta de la UI — las aserciones fallarían
+    // con datos confusos. Abortar temprano evita modificar staging innecesariamente.
+    const cuentaUI = await page.evaluate(() => window.S?._v9CuentaId ?? null);
+    if (!cuentaUI) throw new Error('_v9CuentaId no disponible en window.S tras login');
+    if (cuentaUI !== CUENTA_ID) {
+      throw new Error(
+        `Discrepancia de cuenta: REST descubrió "${CUENTA_ID}" pero la UI usó "${cuentaUI}".\n` +
+        `  → Fija STAGING_CUENTA_ID=${cuentaUI} en .env para usar la misma cuenta en ambos lados.`
+      );
+    }
+    console.log(`  Cuenta REST = Cuenta UI = ${CUENTA_ID} ✓`);
 
     // ── R03: Exportar respaldo completo ───────────────────────────────────
     console.log('\n[R03] exportarDatosCompletosV9 → capturar JSON');
