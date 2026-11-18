@@ -124,6 +124,31 @@ async function cargarCursos(cuentaId, accessToken) {
 }
 
 /**
+ * Carga TODOS los cursos de una cuenta (activos e inactivos).
+ * Uso exclusivo para respaldo completo — las vistas de UI siguen usando
+ * cargarCursos() que filtra activo=true.
+ */
+async function cargarTodosCursosV9(cuentaId, accessToken) {
+  const rows = await _v9Fetch(
+    `/cursos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*&order=nombre.asc`,
+    {}, accessToken
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+/**
+ * Carga todos los abonos de planes de pago de la cuenta (sin filtrar por curso).
+ * Para respaldo completo: permite exportar abonos como colección plana independiente.
+ */
+async function cargarTodosAbonosV9(cuentaId, accessToken) {
+  const rows = await _v9Fetch(
+    `/abonos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*&order=fecha.asc`,
+    {}, accessToken
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+/**
  * Carga todos los alumnos de una cuenta, opcionalmente filtrado por curso.
  */
 async function cargarAlumnos(cuentaId, cursoId, accessToken) {

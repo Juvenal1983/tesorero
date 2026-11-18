@@ -46,61 +46,76 @@ async function exportarDatosCompletosV9() {
   };
   setMsg('⏳ Generando respaldo completo desde Supabase…', true);
 
+  // Nota de paginación: Supabase REST devuelve máx 1000 filas por petición.
+  // Cuentas con colecciones muy grandes (> 1000 filas) requieren paginación
+  // con Range. Para el alcance actual de staging esto no aplica; se documenta
+  // para futura implementación.
+
   try {
     const respaldo = {
       version:   'v9-completo',
       fecha:     new Date().toISOString(),
       cuentaId,
-      alcance:   'todos los cursos de la cuenta',
+      alcance:   'todos los cursos de la cuenta (activos e inactivos)',
       colecciones: {},
     };
 
-    // 1. Cursos
-    const cursos = await cargarCursos(cuentaId, token);
+    // 1. Todos los cursos (activos e inactivos) — cargarCursos() solo trae activos
+    const cursos = await cargarTodosCursosV9(cuentaId, token);
     respaldo.colecciones.cursos = cursos;
     const cursoIds = cursos.map(c => c.id);
 
-    // 2. Por curso: alumnos, cuotas (+ planes_pago), movimientos, fondo_movimientos
-    respaldo.colecciones.alumnos          = [];
-    respaldo.colecciones.cuotas           = [];
-    respaldo.colecciones.planes_pago      = [];
-    respaldo.colecciones.movimientos      = [];
-    respaldo.colecciones.fondo_movimientos= [];
+    // 2. Por curso: alumnos, cuotas, planes_pago, movimientos, fondo_movimientos, actividades
+    // Errores en colecciones por curso se propagan — no silenciamos con catch(() => []).
+    respaldo.colecciones.alumnos           = [];
+    respaldo.colecciones.cuotas            = [];
+    respaldo.colecciones.planes_pago       = [];
+    respaldo.colecciones.movimientos       = [];
+    respaldo.colecciones.fondo_movimientos = [];
+    respaldo.colecciones.actividades       = [];
 
     for (const cursoId of cursoIds) {
-      const [alus, cuotas, movs, fondoMovs] = await Promise.all([
+      const [alus, cuotas, movs, fondoMovs, acts] = await Promise.all([
         cargarAlumnos(cuentaId, cursoId, token),
         cargarCuotas(cuentaId, cursoId, token),
         cargarMovimientosV9(cuentaId, cursoId, token),
-        cargarFondoMovimientosV9(cuentaId, cursoId, token).catch(() => []),
+        cargarFondoMovimientosV9(cuentaId, cursoId, token),
+        cargarActividadesV9(cuentaId, cursoId, token),
       ]);
-      respaldo.colecciones.alumnos          .push(...alus);
-      respaldo.colecciones.cuotas           .push(...cuotas);
-      respaldo.colecciones.movimientos      .push(...movs);
-      respaldo.colecciones.fondo_movimientos.push(...fondoMovs);
+      respaldo.colecciones.alumnos           .push(...alus);
+      respaldo.colecciones.cuotas            .push(...cuotas);
+      respaldo.colecciones.movimientos       .push(...movs);
+      respaldo.colecciones.fondo_movimientos .push(...fondoMovs);
+      respaldo.colecciones.actividades       .push(...acts);
 
       const cuotaIds = cuotas.map(q => q.id);
       const planes = cuotaIds.length
-        ? await cargarPlanesPagoV9(cuentaId, cuotaIds, token).catch(() => [])
+        ? await cargarPlanesPagoV9(cuentaId, cuotaIds, token)
         : [];
       respaldo.colecciones.planes_pago.push(...planes);
     }
 
-    // 3. Colecciones de cuenta (no por curso)
+    // 3. Abonos como colección plana independiente
+    // (también accesibles anidados en planes_pago, pero la colección plana
+    //  facilita la restauración atómica y la validación de integridad).
+    respaldo.colecciones.abonos = await cargarTodosAbonosV9(cuentaId, token);
+
+    // 4. Colecciones de cuenta (no por curso)
+    // Errores se propagan — evitar anunciar "respaldo completo" si alguna falló.
     const [apoderados, pagos, notas, codigos, cfg] = await Promise.all([
-      cargarTodosApoderadosV9(cuentaId, token).catch(() => []),
+      cargarTodosApoderadosV9(cuentaId, token),
       cargarPagos(cuentaId, token),
-      cargarNotasV9(cuentaId, token).catch(() => []),
-      cargarCodigosInvitacionV9(cuentaId, token).catch(() => []),
+      cargarNotasV9(cuentaId, token),
+      cargarCodigosInvitacionV9(cuentaId, token),
       cargarConfigCuentaV9(cuentaId, token).catch(() => null),
     ]);
-    respaldo.colecciones.apoderados        = apoderados;
-    respaldo.colecciones.pagos             = pagos;
-    respaldo.colecciones.notas             = notas;
-    respaldo.colecciones.codigos_invitacion= codigos;
-    respaldo.colecciones.config_cuenta     = cfg ? [cfg] : [];
+    respaldo.colecciones.apoderados         = apoderados;
+    respaldo.colecciones.pagos              = pagos;
+    respaldo.colecciones.notas              = notas;
+    respaldo.colecciones.codigos_invitacion = codigos;
+    respaldo.colecciones.config_cuenta      = cfg ? [cfg] : [];
 
-    // 4. Descargar
+    // 5. Descargar
     const json = JSON.stringify(respaldo, null, 2);
     const blob = new Blob([json], { type: 'application/json' });
     const url  = URL.createObjectURL(blob);
@@ -111,9 +126,9 @@ async function exportarDatosCompletosV9() {
     URL.revokeObjectURL(url);
 
     previewStorage.setItem('tesorero_ultimo_respaldo', new Date().toISOString());
-    const nCursos   = cursoIds.length;
-    const nAlumnos  = respaldo.colecciones.alumnos.length;
-    const nPagos    = respaldo.colecciones.pagos.length;
+    const nCursos  = cursoIds.length;
+    const nAlumnos = respaldo.colecciones.alumnos.length;
+    const nPagos   = respaldo.colecciones.pagos.length;
     setMsg(`✅ Respaldo completo generado — ${nCursos} curso(s), ${nAlumnos} alumno(s), ${nPagos} pago(s).`, true);
     setTimeout(() => { if (msgEl) msgEl.style.display = 'none'; }, 6000);
 
@@ -204,10 +219,14 @@ function importarDatos(e){
   reader.readAsText(file);
 }
 
-// ── saveCuenta — PENDIENTE V9 ─────────────────────────────────────────────────
-// Ver inventario en el encabezado del archivo.
-// La función actual se mantiene operativa en legado; en V9 los cambios de nombre
-// y tesorero quedan en memoria pero no persisten en Supabase.
+// ── saveCuenta ────────────────────────────────────────────────────────────────
+//
+// B4-V9 flujo:
+//   - El lookup de DB.usuarios (caché local) solo se usa en el path legado y en
+//     el cambio de contraseña (donde se regenera el código de recuperación local).
+//   - En V9 el nombre persiste en tesorero_cuentas vía actualizarCuentaV9().
+//     El email NO se persiste: es read-only vía Supabase Auth.
+//   - Ninguna memoria se modifica antes de confirmar Supabase.
 
 async function saveCuenta(){
   if(!puedeConfigurar()){ showToast('⛔ Sin permisos para modificar datos de cuenta','#E24B4A'); return; }
@@ -228,9 +247,7 @@ async function saveCuenta(){
   if(pass && pass.length < 6){ showMsg('La contraseña debe tener al menos 6 caracteres.', false); return; }
   if(pass && pass !== pass2){ showMsg('Las contraseñas no coinciden.', false); return; }
 
-  const ui = (DB.usuarios||[]).findIndex(u=>u.id===S.session.id);
-  if(ui < 0){ showMsg('No se encontró el usuario.', false); return; }
-
+  // ── Cambio de contraseña ───────────────────────────────────────────────────
   if(pass){
     // Contraseña: Supabase Auth únicamente — nunca en DB local.
     if(authClient){
@@ -241,24 +258,28 @@ async function saveCuenta(){
         showMsg('❌ Error al cambiar contraseña: ' + e.message, false); return;
       }
     }
-    // Regenerar código de recuperación
-    delete DB.usuarios[ui].pass;
-    const nuevoCodigo = generarCodigoRecuperacion();
-    DB.usuarios[ui].codigoRecuperacion = nuevoCodigo;
-    saveDB();
+    // Regenerar código de recuperación (legado; no-op si DB.usuarios está vacío)
+    const uiPass = (DB.usuarios||[]).findIndex(u=>u.id===S.session.id);
     document.getElementById('cfg-usr-pass').value  = '';
     document.getElementById('cfg-usr-pass2').value = '';
-    showMsg('✅ Datos actualizados. Se generó un nuevo código de recuperación.', true);
-    setTimeout(()=> mostrarCodigoRecuperacion(nuevoCodigo, 'cambio'), 300);
+    if(uiPass >= 0){
+      delete DB.usuarios[uiPass].pass;
+      const nuevoCodigo = generarCodigoRecuperacion();
+      DB.usuarios[uiPass].codigoRecuperacion = nuevoCodigo;
+      saveDB();
+      showMsg('✅ Contraseña actualizada. Se generó un nuevo código de recuperación.', true);
+      setTimeout(()=> mostrarCodigoRecuperacion(nuevoCodigo, 'cambio'), 300);
+    } else {
+      showMsg('✅ Contraseña actualizada en Supabase Auth.', true);
+    }
     return;
   }
 
-  // Actualizar nombre y email
-  DB.usuarios[ui].nombre = nombre;
-  DB.usuarios[ui].email  = email;
-
+  // ── V9: persistir solo nombre en tesorero_cuentas ─────────────────────────
+  // Debe ejecutarse ANTES de modificar cualquier estado local.
+  // El email no se persiste: es read-only en tesorero_cuentas (campo gestionado
+  // por Supabase Auth). No anunciar que el email fue guardado.
   if (_respaldosV9()) {
-    // B4-V9: persistir nombre en tesorero_cuentas.
     const cuentaId = _respCuentaId();
     const token    = _respToken();
     if (!cuentaId || !token) { showMsg('❌ Sin sesión activa — no se pudo guardar.', false); return; }
@@ -269,16 +290,19 @@ async function saveCuenta(){
       showMsg('❌ No se pudo guardar en la nube: ' + e.message, false);
       return;
     }
-    // Actualizar sesión activa
+    // Solo actualizar nombre en sesión; email no fue persistido en Supabase.
     S.session.nombre = nombre;
-    S.session.email  = email;
     document.getElementById('cfg-usr-pass').value  = '';
     document.getElementById('cfg-usr-pass2').value = '';
-    showMsg('✅ Datos de cuenta actualizados correctamente.', true);
+    showMsg('✅ Nombre actualizado correctamente.', true);
     return;
   }
 
-  // Legado: persistir en caché local
+  // ── Legado: persistir en caché local ──────────────────────────────────────
+  const ui = (DB.usuarios||[]).findIndex(u=>u.id===S.session.id);
+  if(ui < 0){ showMsg('No se encontró el usuario.', false); return; }
+  DB.usuarios[ui].nombre = nombre;
+  DB.usuarios[ui].email  = email;
   S.session.nombre = nombre;
   S.session.email  = email;
   const ci = (DB.cursos||[]).findIndex(c=>c.id===S.cursoId);
