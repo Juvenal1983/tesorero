@@ -77,6 +77,37 @@ async function _v9Fetch(path, opts = {}, accessToken) {
   return json;
 }
 
+/**
+ * Obtiene TODAS las filas de una consulta paginando en bloques de _V9_PAGE_SIZE.
+ * Usa limit/offset; `path` no debe incluir ya limit= ni offset=.
+ * Las demás funciones de lectura masiva deben usar esto para evitar el límite de
+ * 1000 filas de PostgREST y exportar cuentas grandes sin pérdida silenciosa.
+ *
+ * @param {string} path       — ruta Supabase REST sin parámetros limit/offset
+ * @param {object} [opts]     — opciones fetch (method, headers; body ignorado en GET)
+ * @param {string} [accessToken]
+ * @returns {Promise<Array>}  — todas las filas combinadas
+ */
+const _V9_PAGE_SIZE = 1000;
+
+async function _v9FetchAll(path, opts = {}, accessToken) {
+  const all = [];
+  let offset = 0;
+  for (;;) {
+    const sep  = path.includes('?') ? '&' : '?';
+    const page = await _v9Fetch(
+      `${path}${sep}limit=${_V9_PAGE_SIZE}&offset=${offset}`,
+      opts,
+      accessToken
+    );
+    const rows = Array.isArray(page) ? page : [];
+    all.push(...rows);
+    if (rows.length < _V9_PAGE_SIZE) break;
+    offset += _V9_PAGE_SIZE;
+  }
+  return all;
+}
+
 // ─── API pública ─────────────────────────────────────────────────────────────
 
 /**
@@ -129,11 +160,10 @@ async function cargarCursos(cuentaId, accessToken) {
  * cargarCursos() que filtra activo=true.
  */
 async function cargarTodosCursosV9(cuentaId, accessToken) {
-  const rows = await _v9Fetch(
+  return _v9FetchAll(
     `/cursos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*&order=nombre.asc`,
     {}, accessToken
   );
-  return Array.isArray(rows) ? rows : [];
 }
 
 /**
@@ -141,11 +171,10 @@ async function cargarTodosCursosV9(cuentaId, accessToken) {
  * Para respaldo completo: permite exportar abonos como colección plana independiente.
  */
 async function cargarTodosAbonosV9(cuentaId, accessToken) {
-  const rows = await _v9Fetch(
+  return _v9FetchAll(
     `/abonos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*&order=fecha.asc`,
     {}, accessToken
   );
-  return Array.isArray(rows) ? rows : [];
 }
 
 /**
@@ -154,30 +183,27 @@ async function cargarTodosAbonosV9(cuentaId, accessToken) {
 async function cargarAlumnos(cuentaId, cursoId, accessToken) {
   let path = `/alumnos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*&order=apellidos.asc,nombres.asc`;
   if (cursoId) path += `&curso_id=eq.${encodeURIComponent(cursoId)}`;
-  const rows = await _v9Fetch(path, {}, accessToken);
-  return Array.isArray(rows) ? rows : [];
+  return _v9FetchAll(path, {}, accessToken);
 }
 
 /**
  * Carga las cuotas de un curso específico.
  */
 async function cargarCuotas(cuentaId, cursoId, accessToken) {
-  const rows = await _v9Fetch(
+  return _v9FetchAll(
     `/cuotas?cuenta_id=eq.${encodeURIComponent(cuentaId)}&curso_id=eq.${encodeURIComponent(cursoId)}&select=*&order=nombre.asc`,
     {}, accessToken
   );
-  return Array.isArray(rows) ? rows : [];
 }
 
 /**
  * Carga todos los pagos de una cuenta.
  */
 async function cargarPagos(cuentaId, accessToken) {
-  const rows = await _v9Fetch(
+  return _v9FetchAll(
     `/pagos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*&order=fecha.desc`,
     {}, accessToken
   );
-  return Array.isArray(rows) ? rows : [];
 }
 
 /**
@@ -573,12 +599,11 @@ async function cargarApoderadosV9(cuentaId, alumnoId, accessToken) {
  * solo request. Los apoderados son de cuenta, no de curso.
  */
 async function cargarTodosApoderadosV9(cuentaId, accessToken) {
-  const rows = await _v9Fetch(
+  return _v9FetchAll(
     `/apoderados?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*&order=nombre.asc`,
     { method: 'GET' },
     accessToken
   );
-  return Array.isArray(rows) ? rows : [];
 }
 
 /**
@@ -586,12 +611,11 @@ async function cargarTodosApoderadosV9(cuentaId, accessToken) {
  * Usar en cargarSesionV9 y recargarCursoV9 para poblar DB.movimientos.
  */
 async function cargarMovimientosV9(cuentaId, cursoId, accessToken) {
-  const rows = await _v9Fetch(
+  return _v9FetchAll(
     `/movimientos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&curso_id=eq.${encodeURIComponent(cursoId)}&select=*&order=fecha.desc`,
     { method: 'GET' },
     accessToken
   );
-  return Array.isArray(rows) ? rows : [];
 }
 
 /**
@@ -1403,12 +1427,11 @@ async function v9CcRevocar(cuentaId, cursoId) {
  * Carga todos los movimientos de fondo especial del curso.
  */
 async function cargarFondoMovimientosV9(cuentaId, cursoId, accessToken) {
-  const rows = await _v9Fetch(
+  return _v9FetchAll(
     `/fondo_movimientos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&curso_id=eq.${encodeURIComponent(cursoId)}&select=*&order=fecha.desc`,
     { method: 'GET' },
     accessToken
   );
-  return Array.isArray(rows) ? rows : [];
 }
 
 /**
@@ -1507,12 +1530,11 @@ async function eliminarFondoMovimientoV9(cuentaId, movId, accessToken) {
  * Carga todas las actividades de recaudación del curso.
  */
 async function cargarActividadesV9(cuentaId, cursoId, accessToken) {
-  const rows = await _v9Fetch(
+  return _v9FetchAll(
     `/actividades?cuenta_id=eq.${encodeURIComponent(cuentaId)}&curso_id=eq.${encodeURIComponent(cursoId)}&select=*&order=fecha.desc`,
     { method: 'GET' },
     accessToken
   );
-  return Array.isArray(rows) ? rows : [];
 }
 
 /**
@@ -1661,21 +1683,20 @@ async function cargarPlanesPagoV9(cuentaId, cuotaIds, accessToken) {
   // PostgREST acepta in.(id1,id2,...) para TEXT sin comillas adicionales
   // siempre que los IDs no contengan comas ni paréntesis (uid() genera UUID hex).
   const cuotaFilter = cuotaIds.join(',');
-  const planes = await _v9Fetch(
+  const planes = await _v9FetchAll(
     `/planes_pago?cuenta_id=eq.${encodeURIComponent(cuentaId)}&cuota_id=in.(${cuotaFilter})&select=*&order=creado_en.asc`,
     {},
     accessToken
   );
   if (!Array.isArray(planes) || planes.length === 0) return [];
 
-  // Cargar abonos de todos los planes en una sola petición
+  // Cargar abonos de todos los planes en una sola petición (paginada)
   const planIds = planes.map(p => p.id).join(',');
-  const abonos = await _v9Fetch(
+  const abonosArr = await _v9FetchAll(
     `/abonos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&plan_id=in.(${planIds})&select=*&order=fecha.asc`,
     {},
     accessToken
   );
-  const abonosArr = Array.isArray(abonos) ? abonos : [];
 
   return planes.map(p => {
     const plan = _mapPlanPago(p);
@@ -1904,12 +1925,11 @@ async function actualizarFondoEspecialV9(cuentaId, cursoId, cfg, accessToken) {
  * @returns {Promise<object[]>}  — filas ordenadas: fijadas primero, luego fecha DESC
  */
 async function cargarNotasV9(cuentaId, accessToken) {
-  const rows = await _v9Fetch(
+  return _v9FetchAll(
     `/notas?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*&order=fijada.desc,fecha.desc`,
     { method: 'GET' },
     accessToken
   );
-  return Array.isArray(rows) ? rows : [];
 }
 
 /**
@@ -1998,12 +2018,11 @@ async function eliminarNotaV9(cuentaId, notaId, accessToken) {
  * @returns {Promise<object[]>}  — filas ordenadas por activo DESC, creado DESC
  */
 async function cargarCodigosInvitacionV9(cuentaId, accessToken) {
-  const rows = await _v9Fetch(
+  return _v9FetchAll(
     `/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*&order=activo.desc,id.desc`,
     { method: 'GET' },
     accessToken
   );
-  return Array.isArray(rows) ? rows : [];
 }
 
 /**

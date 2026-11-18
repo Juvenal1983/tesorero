@@ -46,10 +46,7 @@ async function exportarDatosCompletosV9() {
   };
   setMsg('⏳ Generando respaldo completo desde Supabase…', true);
 
-  // Nota de paginación: Supabase REST devuelve máx 1000 filas por petición.
-  // Cuentas con colecciones muy grandes (> 1000 filas) requieren paginación
-  // con Range. Para el alcance actual de staging esto no aplica; se documenta
-  // para futura implementación.
+  // Paginación: todas las funciones cargarXxx usan _v9FetchAll (bloques de 1000).
 
   try {
     const respaldo = {
