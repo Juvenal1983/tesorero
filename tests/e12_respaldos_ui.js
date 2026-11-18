@@ -33,6 +33,7 @@
 'use strict';
 
 const path   = require('path');
+const os     = require('os');
 const http   = require('http');
 const https  = require('https');
 const fs     = require('fs');
@@ -69,6 +70,10 @@ const failures = [];
 function ok(label, cond) {
   if (cond) { console.log(`  ✅ ${label}`); pass++; }
   else       { console.error(`  ❌ ${label}`); fail++; failures.push(label); }
+}
+/** Marca una aserción como bloqueada (prerequisito falló); no cuenta como fallo. */
+function skip(label, razon) {
+  console.log(`  ⏭  ${label} [bloqueado: ${razon}]`);
 }
 
 const T_CORTO = 12_000;
@@ -193,10 +198,22 @@ async function waitAppReady(page) {
   await page.waitForFunction(() => typeof window.S !== 'undefined', { timeout: T_LARGO });
 }
 
-function interceptDialogs(page) {
+/**
+ * Instala un único manejador de diálogos en la página.
+ * Acepta siempre (para no bloquear la UI) y guarda el mensaje en el objeto
+ * compartido `estado.ultimoDialog`.  R08 lee ese objeto en lugar de registrar
+ * un segundo handler que intentaría aceptar un diálogo ya aceptado.
+ *
+ * @param {import('playwright').Page} page
+ * @param {{ ultimoDialog: {type:string, message:string}|null }} estado
+ */
+function instalarManejadorDialogos(page, estado) {
   page.on('dialog', async d => {
-    console.log(`    [dialog] ${d.type()}: ${d.message().slice(0, 100)}`);
-    await d.accept();
+    const tipo = d.type();
+    const msg  = d.message();
+    console.log(`    [dialog] ${tipo}: ${msg.slice(0, 120)}`);
+    estado.ultimoDialog = { type: tipo, message: msg };
+    await d.accept().catch(() => {}); // accept puede fallar si ya fue manejado
   });
 }
 
@@ -423,10 +440,12 @@ async function eliminarFixtures(jwt, cuentaId, fixtureCreados) {
   // limpiar lo que se haya insertado, incluso si insertarFixtures lanzó a mitad.
   const fixtureCreados = { cursos: [], alumnos: [], pagos: [] };
 
-  let server      = null;
-  let browser     = null;
+  let server       = null;
+  let browser      = null;
   let respaldoJSON = null;
   let fallosCleanup = 0;
+  // Estado compartido para el manejador único de diálogos
+  const dialogState = { ultimoDialog: null };
 
   try {
     // ── R01: Servidor ─────────────────────────────────────────────────────
@@ -437,12 +456,17 @@ async function eliminarFixtures(jwt, cuentaId, fixtureCreados) {
     // ── R02: Login UI ─────────────────────────────────────────────────────
     console.log('\n[R02] Login UI');
     browser = await chromium.launch({ headless: true });
-    const ctx  = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2 });
+    const ctx  = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      deviceScaleFactor: 2,
+      acceptDownloads: true,   // Playwright captura descargas en un directorio temp
+    });
     const page = await ctx.newPage();
     page.on('console', msg => {
       if (msg.type() === 'error') console.error(`  [browser] ${msg.text()}`);
     });
-    interceptDialogs(page);
+    // Un único manejador de diálogos — R08 lee dialogState.ultimoDialog, no registra otro handler
+    instalarManejadorDialogos(page, dialogState);
     registrarRespuestasError(page);
 
     await page.goto(`http://localhost:${APP_PORT}/`, { waitUntil: 'load', timeout: T_LARGO });
@@ -482,39 +506,34 @@ async function eliminarFixtures(jwt, cuentaId, fixtureCreados) {
     console.log(`  Fixtures insertados: cursos=${fixtureCreados.cursos.length}, alumnos=${fixtureCreados.alumnos.length}, pagos=${fixtureCreados.pagos.length}`);
 
     // ── R03: Exportar respaldo completo ───────────────────────────────────
-    console.log('\n[R03] exportarDatosCompletosV9 → capturar JSON');
-
-    await page.evaluate(() => {
-      window.__respaldoCapturado = null;
-      const _origCreate = document.createElement.bind(document);
-      document.createElement = function(tag) {
-        const el = _origCreate(tag);
-        if (tag.toLowerCase() === 'a') {
-          el.click = function() {
-            if (el.href && el.href.startsWith('blob:')) {
-              fetch(el.href)
-                .then(r => r.text())
-                .then(txt => { window.__respaldoCapturado = txt; });
-            }
-          };
-        }
-        return el;
-      };
-    });
+    // exportarDatosCompletosV9 crea un <a download="..."> y llama .click().
+    // Playwright captura el evento download del navegador (no requiere parchear
+    // DOM ni fetch de blob:URL — sin impacto en CSP de la app).
+    console.log('\n[R03] exportarDatosCompletosV9 → waitForEvent("download")');
 
     await navegarConfig(page);
 
-    await page.evaluate(async () => {
-      if (typeof exportarDatosCompletosV9 === 'function') await exportarDatosCompletosV9();
-    });
+    let capturado = null;
+    let tmpFile   = null;
+    try {
+      // Iniciar escucha ANTES de disparar la función — Promise.all garantiza el orden
+      const [download] = await Promise.all([
+        page.waitForEvent('download', { timeout: T_LARGO }),
+        page.evaluate(async () => {
+          if (typeof exportarDatosCompletosV9 === 'function') await exportarDatosCompletosV9();
+        }),
+      ]);
+      // Playwright guarda la descarga en un directorio temporal automáticamente
+      tmpFile = path.join(os.tmpdir(), `e12-backup-${EXEC_ID}.json`);
+      await download.saveAs(tmpFile);
+      capturado = fs.readFileSync(tmpFile, 'utf8');
+    } catch (e) {
+      console.error(`  [R03] Error capturando descarga: ${e.message}`);
+    } finally {
+      if (tmpFile) try { fs.unlinkSync(tmpFile); } catch(_) {}
+    }
 
-    const capturado = await page.waitForFunction(
-      () => window.__respaldoCapturado !== null,
-      { timeout: T_LARGO }
-    ).then(() => page.evaluate(() => window.__respaldoCapturado))
-      .catch(() => null);
-
-    ok('R03-a: blob de respaldo capturado', !!capturado);
+    ok('R03-a: archivo de respaldo descargado', !!capturado);
 
     if (capturado) {
       try {
@@ -540,66 +559,80 @@ async function eliminarFixtures(jwt, cuentaId, fixtureCreados) {
       ok('R03-e: colecciones', false);
     }
 
-    // ── R04: Cursos fixture presentes en el respaldo ──────────────────────
-    console.log('\n[R04] Cursos fixture presentes en el respaldo (IDs exactos)');
-    const colecciones = respaldoJSON?.colecciones || {};
-    const cursosEnRespaldo = Array.isArray(colecciones.cursos) ? colecciones.cursos : [];
-    console.log(`  Cursos en respaldo: ${cursosEnRespaldo.length}`);
-    for (const cursoId of fixtureCreados.cursos) {
-      const encontrado = cursosEnRespaldo.some(c => c.id === cursoId);
-      console.log(`  Curso fixture ${cursoId.slice(0,8)}…: ${encontrado ? '✓' : '✗'}`);
-      ok(`R04: curso fixture ${cursoId.slice(0,8)}… en respaldo`, encontrado);
-    }
+    // ── R04–R07: solo si R03 obtuvo el JSON ──────────────────────────────
+    if (!respaldoJSON) {
+      const BLOQ = 'R03 no obtuvo JSON de respaldo';
+      console.log(`\n  ⚠️  R04–R07 bloqueados — ${BLOQ}`);
+      for (const lbl of [
+        ...fixtureCreados.cursos.map((_, k) => `R04: curso fixture ${k+1} en respaldo`),
+        'R05-a: alumnos fixture en respaldo',
+        'R05-b: pagos fixture en respaldo',
+        'R06-a: alumnos fixture tienen cuenta_id correcto',
+        'R06-b: alumnos fixture tienen curso_id',
+        'R06-c: pagos fixture tienen cuenta_id correcto',
+        'R07: colecciones complementarias',
+      ]) skip(lbl, BLOQ);
+    } else {
+      const colecciones = respaldoJSON.colecciones || {};
 
-    // ── R05: Alumnos y pagos fixture en el respaldo ───────────────────────
-    console.log('\n[R05] Alumnos y pagos fixture en el respaldo (IDs exactos)');
-    const alumnosEnRespaldo = Array.isArray(colecciones.alumnos) ? colecciones.alumnos : [];
-    const pagosEnRespaldo   = Array.isArray(colecciones.pagos)   ? colecciones.pagos   : [];
+      // ── R04: Cursos fixture presentes en el respaldo ────────────────────
+      console.log('\n[R04] Cursos fixture presentes en el respaldo (IDs exactos)');
+      const cursosEnRespaldo = Array.isArray(colecciones.cursos) ? colecciones.cursos : [];
+      console.log(`  Cursos en respaldo: ${cursosEnRespaldo.length}`);
+      for (const cursoId of fixtureCreados.cursos) {
+        const encontrado = cursosEnRespaldo.some(c => c.id === cursoId);
+        console.log(`  Curso fixture ${cursoId.slice(0,8)}…: ${encontrado ? '✓' : '✗'}`);
+        ok(`R04: curso fixture ${cursoId.slice(0,8)}… en respaldo`, encontrado);
+      }
 
-    let alumnosFixtureOk = true;
-    for (const id of fixtureCreados.alumnos) {
-      if (!alumnosEnRespaldo.some(a => a.id === id)) { alumnosFixtureOk = false; break; }
-    }
-    ok(`R05-a: ${fixtureCreados.alumnos.length} alumnos fixture en respaldo`, alumnosFixtureOk);
+      // ── R05: Alumnos y pagos fixture en el respaldo ─────────────────────
+      console.log('\n[R05] Alumnos y pagos fixture en el respaldo (IDs exactos)');
+      const alumnosEnRespaldo = Array.isArray(colecciones.alumnos) ? colecciones.alumnos : [];
+      const pagosEnRespaldo   = Array.isArray(colecciones.pagos)   ? colecciones.pagos   : [];
 
-    let pagosFixtureOk = true;
-    for (const id of fixtureCreados.pagos) {
-      if (!pagosEnRespaldo.some(p => p.id === id)) { pagosFixtureOk = false; break; }
-    }
-    ok(`R05-b: ${fixtureCreados.pagos.length} pagos fixture en respaldo`, pagosFixtureOk);
-    console.log(`  Alumnos en respaldo: ${alumnosEnRespaldo.length} (${fixtureCreados.alumnos.length} fixture)`);
-    console.log(`  Pagos en respaldo:   ${pagosEnRespaldo.length} (${fixtureCreados.pagos.length} fixture)`);
+      let alumnosFixtureOk = true;
+      for (const id of fixtureCreados.alumnos) {
+        if (!alumnosEnRespaldo.some(a => a.id === id)) { alumnosFixtureOk = false; break; }
+      }
+      ok(`R05-a: ${fixtureCreados.alumnos.length} alumnos fixture en respaldo`, alumnosFixtureOk);
 
-    // ── R06: Integridad de colecciones ────────────────────────────────────
-    console.log('\n[R06] Integridad: cuenta_id y curso_id en alumnos y pagos fixture');
-    const alumnosFixture = alumnosEnRespaldo.filter(a => fixtureCreados.alumnos.includes(a.id));
-    ok('R06-a: alumnos fixture tienen cuenta_id correcto',
-      alumnosFixture.length > 0 && alumnosFixture.every(a => a.cuenta_id === CUENTA_ID));
-    ok('R06-b: alumnos fixture tienen curso_id',
-      alumnosFixture.length > 0 && alumnosFixture.every(a => !!a.curso_id));
+      let pagosFixtureOk = true;
+      for (const id of fixtureCreados.pagos) {
+        if (!pagosEnRespaldo.some(p => p.id === id)) { pagosFixtureOk = false; break; }
+      }
+      ok(`R05-b: ${fixtureCreados.pagos.length} pagos fixture en respaldo`, pagosFixtureOk);
+      console.log(`  Alumnos en respaldo: ${alumnosEnRespaldo.length} (${fixtureCreados.alumnos.length} fixture)`);
+      console.log(`  Pagos en respaldo:   ${pagosEnRespaldo.length} (${fixtureCreados.pagos.length} fixture)`);
 
-    const pagosFixture = pagosEnRespaldo.filter(p => fixtureCreados.pagos.includes(p.id));
-    ok('R06-c: pagos fixture tienen cuenta_id correcto',
-      pagosFixture.length > 0 && pagosFixture.every(p => p.cuenta_id === CUENTA_ID));
+      // ── R06: Integridad de colecciones ──────────────────────────────────
+      console.log('\n[R06] Integridad: cuenta_id y curso_id en alumnos y pagos fixture');
+      const alumnosFixture = alumnosEnRespaldo.filter(a => fixtureCreados.alumnos.includes(a.id));
+      ok('R06-a: alumnos fixture tienen cuenta_id correcto',
+        alumnosFixture.length > 0 && alumnosFixture.every(a => a.cuenta_id === CUENTA_ID));
+      ok('R06-b: alumnos fixture tienen curso_id',
+        alumnosFixture.length > 0 && alumnosFixture.every(a => !!a.curso_id));
 
-    // ── R07: Colecciones complementarias ──────────────────────────────────
-    console.log('\n[R07] Colecciones complementarias presentes');
-    const colsCompl = ['cuotas', 'movimientos', 'notas', 'codigos_invitacion', 'actividades', 'abonos'];
-    for (const col of colsCompl) {
-      const arr = colecciones[col];
-      console.log(`  ${col}: ${Array.isArray(arr) ? arr.length + ' registros' : 'ausente'}`);
-      ok(`R07: colección "${col}" presente`, Array.isArray(arr));
-    }
+      const pagosFixture = pagosEnRespaldo.filter(p => fixtureCreados.pagos.includes(p.id));
+      ok('R06-c: pagos fixture tienen cuenta_id correcto',
+        pagosFixture.length > 0 && pagosFixture.every(p => p.cuenta_id === CUENTA_ID));
+
+      // ── R07: Colecciones complementarias ────────────────────────────────
+      console.log('\n[R07] Colecciones complementarias presentes');
+      const colsCompl = ['cuotas', 'movimientos', 'notas', 'codigos_invitacion', 'actividades', 'abonos'];
+      for (const col of colsCompl) {
+        const arr = colecciones[col];
+        console.log(`  ${col}: ${Array.isArray(arr) ? arr.length + ' registros' : 'ausente'}`);
+        ok(`R07: colección "${col}" presente`, Array.isArray(arr));
+      }
+    } // fin bloque respaldoJSON
 
     // ── R08: importarDatos en V9 bloquea ──────────────────────────────────
+    // El manejador de diálogos ya está instalado (instalarManejadorDialogos).
+    // No registramos un segundo handler — solo reseteamos el estado y leemos
+    // lo que capturó el handler único después del timeout.
     console.log('\n[R08] importarDatos en V9 → alert bloqueante, DB sin modificar');
 
-    let alertTexto = null;
-    page.once('dialog', async d => {
-      alertTexto = d.message();
-      console.log(`  [dialog] alert: ${alertTexto.slice(0, 100)}`);
-      await d.accept();
-    });
+    dialogState.ultimoDialog = null; // reset para aislar el diálogo de R08
 
     const estadoAntes = await page.evaluate(() =>
       JSON.stringify((typeof DB !== 'undefined' && DB?.alumnos?.length) || 0)
@@ -620,6 +653,7 @@ async function eliminarFixtures(jwt, cuentaId, fixtureCreados) {
       JSON.stringify((typeof DB !== 'undefined' && DB?.alumnos?.length) || 0)
     );
 
+    const alertTexto = dialogState.ultimoDialog?.message ?? null;
     ok('R08-a: importarDatos muestra alert en V9',
       alertTexto !== null &&
       (alertTexto.includes('V9') || alertTexto.includes('relacional') || alertTexto.includes('disponible')));
