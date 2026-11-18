@@ -212,7 +212,8 @@ async function _importarDatosV9(e) {
   const file = e.target.files[0];
   if (!file) return;
 
-  const msgEl = document.getElementById('import-msg');
+  // import-msg no existe en el DOM; export-msg es el contenedor visible en config.
+  const msgEl = document.getElementById('export-msg');
   const setMsg = (txt, ok) => {
     if (!msgEl) return;
     msgEl.innerHTML = `<div class="alert ${ok?'ag':'ar'}">${txt}</div>`;
@@ -243,7 +244,7 @@ async function _importarDatosV9(e) {
   const token    = _respToken();
   if (!cuentaId || !token) { setMsg('❌ Sin sesión activa.', false); return; }
 
-  // Guardia de seguridad: el respaldo debe pertenecer a esta cuenta.
+  // Guardia de encabezado: el respaldo debe pertenecer a esta cuenta.
   if (backup.cuentaId !== cuentaId) {
     setMsg(
       '❌ El respaldo pertenece a otra cuenta (' + backup.cuentaId + ').<br>' +
@@ -253,7 +254,31 @@ async function _importarDatosV9(e) {
     return;
   }
 
-  const cols  = backup.colecciones || {};
+  const cols = backup.colecciones || {};
+
+  // Guardia por registro: cada fila debe pertenecer a esta cuenta.
+  // Detecta manipulación o mezcla de cuentas antes de escribir cualquier dato.
+  // La RLS previene cross-account en staging, pero no sustituye validar el destino.
+  const _filasAjenas = [];
+  for (const _tabla of _B5_ORDEN) {
+    const _filas = Array.isArray(cols[_tabla]) ? cols[_tabla] : [];
+    for (const _fila of _filas) {
+      if (Object.prototype.hasOwnProperty.call(_fila, 'cuenta_id') &&
+          _fila.cuenta_id !== cuentaId) {
+        _filasAjenas.push(_tabla + '[' + (_fila.id || '?') + '] → ' + _fila.cuenta_id);
+        if (_filasAjenas.length >= 3) break;
+      }
+    }
+    if (_filasAjenas.length >= 3) break;
+  }
+  if (_filasAjenas.length > 0) {
+    setMsg(
+      '❌ Registros con cuenta_id ajeno detectados. Importación cancelada.<br>' +
+      _filasAjenas.map(f => '&nbsp;• ' + f).join('<br>'),
+      false
+    );
+    return;
+  }
   const total = _B5_ORDEN.reduce((s, k) => s + (Array.isArray(cols[k]) ? cols[k].length : 0), 0);
   const fecha = backup.fecha ? backup.fecha.slice(0,10) : '?';
 

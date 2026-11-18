@@ -117,7 +117,18 @@ async function descubrirCuenta(jwt) {
       `/rest/v1/${tabla}?cuenta_id=eq.${encodeURIComponent(cuentaId)}&${filtroQs}&select=id`,
       jwt
     );
-    if (!Array.isArray(rGet.body) || rGet.body.length === 0) {
+    // Exigir HTTP 200 + array
+    if (rGet.status !== 200) {
+      console.error(`  ${tabla}: GET de búsqueda falló HTTP ${rGet.status}`);
+      errores++;
+      return;
+    }
+    if (!Array.isArray(rGet.body)) {
+      console.error(`  ${tabla}: GET no devolvió array: ${JSON.stringify(rGet.body).slice(0,80)}`);
+      errores++;
+      return;
+    }
+    if (rGet.body.length === 0) {
       console.log(`  ${tabla}: 0 registros ${descripcion}`);
       return;
     }
@@ -127,12 +138,28 @@ async function descubrirCuenta(jwt) {
         `/rest/v1/${tabla}?id=eq.${encodeURIComponent(id)}&cuenta_id=eq.${encodeURIComponent(cuentaId)}`,
         jwt, { method: 'DELETE', prefer: '' }
       );
-      if (rDel.status >= 200 && rDel.status < 300) {
-        console.log(`    ✓ ${tabla} ${id.slice(0,8)}… eliminado`);
-        eliminados++;
-      } else {
-        console.error(`    ✗ ${tabla} ${id.slice(0,8)}… HTTP ${rDel.status}`);
+      if (rDel.status < 200 || rDel.status >= 300) {
+        console.error(`    ✗ ${tabla} ${id.slice(0,8)}… DELETE HTTP ${rDel.status}`);
         errores++;
+        continue;
+      }
+      // Verificar que fue eliminado: HTTP 200 + array + length 0
+      const rVerif = await supaAuth(
+        `/rest/v1/${tabla}?id=eq.${encodeURIComponent(id)}&select=id`,
+        jwt
+      );
+      if (rVerif.status !== 200) {
+        console.error(`    ✗ ${tabla} ${id.slice(0,8)}… verificación GET HTTP ${rVerif.status}`);
+        errores++;
+      } else if (!Array.isArray(rVerif.body)) {
+        console.error(`    ✗ ${tabla} ${id.slice(0,8)}… GET no devolvió array`);
+        errores++;
+      } else if (rVerif.body.length > 0) {
+        console.error(`    ✗ ${tabla} ${id.slice(0,8)}… sigue en DB después de DELETE`);
+        errores++;
+      } else {
+        console.log(`    ✓ ${tabla} ${id.slice(0,8)}… eliminado y verificado`);
+        eliminados++;
       }
     }
   }
