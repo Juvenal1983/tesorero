@@ -233,12 +233,12 @@ async function insertarFixtures(jwt, cuentaId, fixtureCreados) {
     const r = await supaAuth('/rest/v1/cursos', jwt, {
       method: 'POST',
       body: {
-        id:          cursoId,
-        cuenta_id:   cuentaId,
-        nombre:      `FixtureCurso-${EXEC_ID}-${i}`,
-        activo:      true,
-        anio:        2026,
-        descripcion: `Fixture E12 ${EXEC_ID}`,
+        id:        cursoId,
+        cuenta_id: cuentaId,
+        nombre:    `FixtureCurso-${EXEC_ID}-${i}`,
+        activo:    true,
+        anio:      2026,
+        // Sin 'descripcion' — columna inexistente en el esquema
       },
       prefer: 'return=representation',
     });
@@ -248,6 +248,8 @@ async function insertarFixtures(jwt, cuentaId, fixtureCreados) {
     fixtureCreados.cursos.push(cursoId);
     console.log(`  [fixture] curso ${i} insertado: ${cursoId}`);
 
+    // Recordar el primer alumno de cada curso para el pago (FK alumno_id requerida)
+    let primerAlumnoId = null;
     for (let j = 1; j <= 2; j++) {
       const alumnoId = uid();
       const rA = await supaAuth('/rest/v1/alumnos', jwt, {
@@ -258,13 +260,14 @@ async function insertarFixtures(jwt, cuentaId, fixtureCreados) {
           curso_id:  cursoId,
           nombres:   `FixtureAlumno${j}`,
           apellidos: `${EXEC_ID}`,
-          activo:    true,
+          estado:    'activo',          // TEXT — no existe columna boolean 'activo'
         },
         prefer: 'return=representation',
       });
       if (rA.status < 200 || rA.status >= 300)
         throw new Error(`insertarFixtures: alumno ${j} en curso ${i} falló HTTP ${rA.status}: ${JSON.stringify(rA.body)}`);
       fixtureCreados.alumnos.push(alumnoId);
+      if (j === 1) primerAlumnoId = alumnoId;
     }
     console.log(`  [fixture] 2 alumnos insertados en curso ${i}`);
 
@@ -272,13 +275,16 @@ async function insertarFixtures(jwt, cuentaId, fixtureCreados) {
     const rP = await supaAuth('/rest/v1/pagos', jwt, {
       method: 'POST',
       body: {
-        id:          pagoId,
-        cuenta_id:   cuentaId,
-        curso_id:    cursoId,
-        monto:       10000,
-        fecha:       hoy,
-        tipo:        'fixture',
-        descripcion: `FixturePago E12 ${EXEC_ID}`,
+        id:         pagoId,
+        cuenta_id:  cuentaId,
+        alumno_id:  primerAlumnoId,          // FK requerida; apunta al primer alumno del curso
+        monto:      10000,
+        fecha:      hoy,
+        medio:      'efectivo',
+        estado:     'pagado',
+        periodo:    `Fixture-${EXEC_ID}-${i}`, // único por run → evita colisión en índice único
+        obs:        `FixturePago E12 ${EXEC_ID}`,
+        // Sin 'curso_id', 'tipo', 'descripcion' — columnas inexistentes en pagos
       },
       prefer: 'return=representation',
     });
@@ -621,6 +627,14 @@ async function eliminarFixtures(jwt, cuentaId, fixtureCreados) {
 
     console.log('\n⚠️  NOTA: B5 (importación/restauración) sigue PENDIENTE de implementar.');
 
+  } catch (e) {
+    // Capturar cualquier error no controlado dentro del try (p.ej. fallo de setup,
+    // discrepancia de cuenta, error de red) para que el finally pueda limpiar y
+    // R09 + el resumen siempre se ejecuten.  No volver a lanzar.
+    console.error(`\n❌ Error inesperado durante el test: ${e.message}`);
+    // Marcar el test como fallido sin un ok() específico
+    fail++;
+    failures.push(`Error inesperado: ${e.message.split('\n')[0].slice(0, 120)}`);
   } finally {
     if (browser) await browser.close().catch(() => {});
     if (server)  server.close();
