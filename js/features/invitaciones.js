@@ -1,4 +1,48 @@
-// js/features/invitaciones.js — extraído de la copia de demostración.
+// js/features/invitaciones.js — B1 V9: CRUD sobre codigos_invitacion en Supabase.
+// En modo V9_RELACIONAL las operaciones INSERT/UPDATE/DELETE se persisten en la
+// tabla `codigos_invitacion` vía datos_v9.js en lugar del blob legado.
+// La lógica de render y UI existente se conserva íntegramente.
+
+// ── Helpers de acceso V9 ──────────────────────────────────────────────────────
+function _invV9()         { return typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL; }
+function _invToken()      { return (typeof S !== 'undefined' && S.session?.accessToken) || null; }
+function _invCuentaId()   { return (typeof S !== 'undefined' && S._v9CuentaId) || null; }
+
+/** Genera un ID estable para codigos_invitacion (Primary Key TEXT). */
+function _genCiId()       { return 'ci-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6); }
+
+/**
+ * Carga los códigos de invitación en DB.config.codigosInvitacion desde Supabase
+ * y re-renderiza la lista si está visible.
+ */
+async function recargarCodigosV9(silencioso = false) {
+  if (!_invV9()) return;
+  const cuentaId = _invCuentaId();
+  const token    = _invToken();
+  if (!cuentaId || !token) return;
+  try {
+    const filas = await cargarCodigosInvitacionV9(cuentaId, token);
+    if (!DB.config) DB.config = {};
+    DB.config.codigosInvitacion = filas.map(f => ({
+      _id:     f.id,
+      codigo:  f.codigo,
+      tipo:    f.tipo  || 'prueba',
+      activo:  f.activo === true,
+      usado:   f.usado  === true,
+      para:    f.para   || null,
+      notas:   f.notas  || null,
+      venceEl: f.vence_el   ? f.vence_el.slice(0, 10) : null,
+      creadoEn: f.id.startsWith('ci-') ? null : null,  // campo no en schema; se omite
+      usadoPor: f.usado_por || null,
+      usadoEn:  f.usado_en  || null,
+    }));
+    const lista = document.getElementById('lista-invitaciones');
+    if (lista) lista.innerHTML = renderListaInvitaciones();
+    if (!silencioso && S?.route === 'config') renderPage();
+  } catch (e) {
+    if (!silencioso) console.error('[invitaciones] recargarCodigosV9:', e.message);
+  }
+}
 function copyCodigo(){
   const cur=getCurso();
   navigator.clipboard?.writeText(cur.codigo||'').then(()=>alert('Código copiado: '+cur.codigo)).catch(()=>alert('Código: '+cur.codigo));
@@ -71,7 +115,10 @@ async function sbGetCodes(){
 
 let _lastSincCodigos = 0;
 async function sincronizarCodigosDesdeSupabase(forzar=false){
-  // Caché de 5 minutos — evita lecturas repetidas a Supabase
+  // B1-V9: en modo relacional delegamos en recargarCodigosV9 y salimos.
+  if (_invV9()) { await recargarCodigosV9(false); return; }
+
+  // Legado: caché de 5 minutos — evita lecturas repetidas a Supabase
   const ahora = Date.now();
   if(!forzar && (ahora - _lastSincCodigos) < 5*60*1000) return;
   _lastSincCodigos = ahora;
@@ -159,12 +206,34 @@ async function crearCodigoConDatos(tipo){
                : tipo==='vip'   ? 'VIP-'+seg()+'-'+seg()
                : generarCodigoNuevo();
   const nuevo  = { codigo, tipo, activo:true, usado:false, creadoEn:isoToday(), para, venceEl:vence, notas, usadoPor:null, usadoEn:null };
-  DB.config.codigosInvitacion.unshift(nuevo);
-  saveDB();
-  if(typeof sbSaveCode==='function') await sbSaveCode(nuevo);
+
+  if (_invV9()) {
+    // B1-V9: persistir en Supabase; actualizar caché local tras confirmación del servidor.
+    const cuentaId = _invCuentaId();
+    const token    = _invToken();
+    if (!cuentaId || !token) { showToast('⛔ Sin sesión activa', '#E24B4A'); return; }
+    try {
+      const fila = await insertarCodigoInvitacionV9(cuentaId, {
+        id:       _genCiId(),
+        codigo, tipo,
+        para:     para || null,
+        notas:    notas || null,
+        vence_el: vence || null,
+      }, token);
+      DB.config.codigosInvitacion.unshift({ ...nuevo, _id: fila.id });
+    } catch (e) {
+      console.error('[invitaciones] crearCodigoConDatos V9:', e.message);
+      showToast('❌ No se pudo guardar el código', '#E24B4A');
+      return;
+    }
+  } else {
+    DB.config.codigosInvitacion.unshift(nuevo);
+    saveDB();
+    if (typeof sbSaveCode === 'function') await sbSaveCode(nuevo);
+  }
   closeModal();
   const lista = document.getElementById('lista-invitaciones');
-  if(lista) lista.innerHTML = renderListaInvitaciones();
+  if (lista) lista.innerHTML = renderListaInvitaciones();
 }
 
 function renderListaInvitaciones(){
@@ -254,13 +323,40 @@ function desactivarCodigoInv(idx){
 async function eliminarCodigoPorCodigo(codigo){
   if(!confirm('¿Eliminar el código ' + codigo + '? Esta acción no se puede deshacer.')) return;
   if(!confirm('Segunda confirmación: ¿Confirmas eliminar definitivamente este código?')) return;
-  // Eliminar de Supabase
+
+  if (_invV9()) {
+    // B1-V9: eliminar en Supabase por cuenta_id+id; buscar _id en caché local.
+    const cuentaId = _invCuentaId();
+    const token    = _invToken();
+    const ci = (DB.config?.codigosInvitacion || []).find(x => x.codigo === codigo);
+    if (!cuentaId || !token || !ci?._id) {
+      // fallback: eliminar solo localmente si no hay _id
+      if (DB.config?.codigosInvitacion)
+        DB.config.codigosInvitacion = DB.config.codigosInvitacion.filter(x => x.codigo !== codigo);
+      showToast('Código eliminado (local)');
+      const lista = document.getElementById('lista-invitaciones');
+      if (lista) lista.innerHTML = renderListaInvitaciones();
+      return;
+    }
+    try {
+      await eliminarCodigoInvitacionV9(cuentaId, ci._id, token);
+      DB.config.codigosInvitacion = DB.config.codigosInvitacion.filter(x => x.codigo !== codigo);
+      showToast('Código eliminado');
+      const lista = document.getElementById('lista-invitaciones');
+      if (lista) lista.innerHTML = renderListaInvitaciones();
+    } catch (e) {
+      console.error('[invitaciones] eliminarCodigoPorCodigo V9:', e.message);
+      showToast('❌ No se pudo eliminar el código', '#E24B4A');
+    }
+    return;
+  }
+
+  // Legado: eliminar de Supabase vía sbFetch y de previewStorage
   try{
     await sbFetch('/rest/v1/codigos_invitacion?codigo=eq.'+encodeURIComponent(codigo),{
       method:'DELETE'
     });
   }catch(e){}
-  // Eliminar de previewStorage
   if(DB.config?.codigosInvitacion){
     DB.config.codigosInvitacion = DB.config.codigosInvitacion.filter(x=>x.codigo!==codigo);
   }
@@ -271,14 +367,37 @@ async function eliminarCodigoPorCodigo(codigo){
 
 async function desactivarCodigoPorCodigo(codigo){
   if(!confirm('¿Desactivar el código ' + codigo + '? Ya no podrá usarse.')) return;
-  // Actualizar en Supabase
+
+  if (_invV9()) {
+    const cuentaId = _invCuentaId();
+    const token    = _invToken();
+    const ci = (DB.config?.codigosInvitacion || []).find(x => x.codigo === codigo);
+    if (!cuentaId || !token || !ci?._id) {
+      // fallback local
+      if (ci) ci.activo = false;
+      const lista = document.getElementById('lista-invitaciones');
+      if (lista) lista.innerHTML = renderListaInvitaciones();
+      return;
+    }
+    try {
+      await actualizarCodigoInvitacionV9(cuentaId, ci._id, { activo: false }, token);
+      if (ci) ci.activo = false;
+      const lista = document.getElementById('lista-invitaciones');
+      if (lista) lista.innerHTML = renderListaInvitaciones();
+    } catch (e) {
+      console.error('[invitaciones] desactivarCodigoPorCodigo V9:', e.message);
+      showToast('❌ No se pudo desactivar el código', '#E24B4A');
+    }
+    return;
+  }
+
+  // Legado
   try{
     await sbFetch('/rest/v1/codigos_invitacion?codigo=eq.'+encodeURIComponent(codigo),{
       method:'PATCH', headers:{'Prefer':'return=minimal'},
       body:JSON.stringify({activo:false})
     });
   }catch(e){}
-  // Actualizar localmente
   const c = (DB.config?.codigosInvitacion||[]).find(x=>x.codigo===codigo);
   if(c) c.activo=false;
   saveDB();

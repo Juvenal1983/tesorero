@@ -1,4 +1,27 @@
 // js/features/configuracion-acciones.js — extraído de la copia de demostración.
+// B4-V9: helpers para persistir config_cuenta en Supabase cuando V9_RELACIONAL=true.
+
+function _cfgV9()       { return typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL; }
+function _cfgToken()    { return (typeof S !== 'undefined' && S.session?.accessToken) || null; }
+function _cfgCuentaId() { return (typeof S !== 'undefined' && S._v9CuentaId) || null; }
+
+/**
+ * Persiste un subconjunto de campos de config en la tabla config_cuenta.
+ * Los campos deben estar en snake_case (tipo_org, app_url, plantilla_pago, categorias, moneda).
+ * No lanza — muestra toast en caso de error.
+ */
+async function _persistirConfigV9(campos) {
+  if (!_cfgV9()) return;
+  const cuentaId = _cfgCuentaId();
+  const token    = _cfgToken();
+  if (!cuentaId || !token) { showToast('⛔ Sin sesión activa', '#E24B4A'); return; }
+  try {
+    await guardarConfigCuentaV9(cuentaId, campos, token);
+  } catch (e) {
+    console.error('[config] _persistirConfigV9:', e.message);
+    showToast('❌ No se pudo guardar la configuración en la nube', '#E24B4A');
+  }
+}
 function saveDatosBancarios(){
   if(!puedeConfigurar()){ showToast('⛔ Sin permisos para modificar los datos bancarios','#E24B4A'); return; }
   // B4-fix: en modo relacional v9, los datos bancarios deben persistirse en la tabla cursos de Supabase.
@@ -214,6 +237,8 @@ function cambiarTipoOrg(tipo){
     }
   });
   saveDB();
+  // B4-V9: persistir tipo_org y categorias en Supabase
+  _persistirConfigV9({ tipo_org: tipo, categorias: DB.categorias });
   showToast(v.icono+' Tipo de organización: '+v.nombre);
   go('config');
 }

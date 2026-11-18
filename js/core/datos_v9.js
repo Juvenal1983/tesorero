@@ -929,8 +929,25 @@ async function cargarSesionV9(authId, accessToken, cursoId) {
   DB.pagos = pagosRaw.map(_mapPago);
 
   // 5. C16: limpiar colecciones no relacionales (nunca preservar de sesión anterior).
-  DB.notas    = [];
+  // B3: notas ahora se cargan desde Supabase; colegios sigue siendo legacy local.
+  DB.notas    = await cargarNotasV9(cuentaId, accessToken).catch(() => []);
   DB.colegios = [];
+
+  // B4: cargar configuración de la cuenta desde Supabase (config_cuenta).
+  // Mezcla sobre DB.config existente para no pisar campos legado no migrados.
+  try {
+    const cfgRemota = await cargarConfigCuentaV9(cuentaId, accessToken);
+    if (cfgRemota) {
+      if (!DB.config) DB.config = {};
+      if (cfgRemota.tipo_org)        DB.config.tipoOrg       = cfgRemota.tipo_org;
+      if (cfgRemota.app_url)         DB.config.appUrl        = cfgRemota.app_url;
+      if (cfgRemota.plantilla_pago)  DB.config.plantillaPago = cfgRemota.plantilla_pago;
+      if (cfgRemota.moneda)          DB.config.moneda        = cfgRemota.moneda;
+      if (cfgRemota.categorias)      DB.categorias           = cfgRemota.categorias;
+    }
+  } catch (e) {
+    console.warn('[datos_v9] cargarConfigCuentaV9 error (no bloqueante):', e.message);
+  }
 
   // Guardar cuentaId en S para que lo usen las funciones de guardado
   if (typeof S !== 'undefined') {
@@ -1812,4 +1829,245 @@ async function actualizarFondoEspecialV9(cuentaId, cursoId, cfg, accessToken) {
   if (!Array.isArray(rows) || rows.length === 0)
     throw new Error(`[datos_v9] actualizarFondoEspecialV9: curso ${cursoId} no encontrado o sin permiso (solo el dueño puede actualizar).`);
   return rows[0].fondo_especial || merged;
+}
+
+// ─── B3: Notas V9 ─────────────────────────────────────────────────────────────
+// CRUD completo sobre la tabla `notas`. La tabla tiene RLS:
+//   INSERT/UPDATE/DELETE → solo el dueño de la cuenta (es_dueno).
+//   SELECT              → dueño ve todo; invitados ven notas privada=false de su curso.
+
+/**
+ * Carga todas las notas de la cuenta.
+ * El servidor aplica RLS: invitados reciben solo notas privada=false de su curso.
+ *
+ * @param {string} cuentaId
+ * @param {string} accessToken
+ * @returns {Promise<object[]>}  — filas ordenadas: fijadas primero, luego fecha DESC
+ */
+async function cargarNotasV9(cuentaId, accessToken) {
+  const rows = await _v9Fetch(
+    `/notas?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*&order=fijada.desc,fecha.desc`,
+    { method: 'GET' },
+    accessToken
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+/**
+ * Inserta una nota nueva.
+ *
+ * @param {string} cuentaId
+ * @param {{ id: string, texto: string, color?: string, fijada?: boolean, privada?: boolean, curso_id?: string }} nota
+ * @param {string} accessToken
+ * @returns {Promise<object>}  — fila insertada
+ */
+async function insertarNotaV9(cuentaId, nota, accessToken) {
+  const payload = {
+    cuenta_id: cuentaId,
+    id:        nota.id,
+    texto:     nota.texto,
+    color:     nota.color   || '#FFF9C4',
+    fijada:    nota.fijada  ?? false,
+    privada:   nota.privada ?? true,
+    curso_id:  nota.curso_id || null,
+  };
+  const rows = await _v9Fetch(
+    `/notas`,
+    {
+      method:  'POST',
+      headers: { 'Prefer': 'return=representation' },
+      body:    JSON.stringify(payload),
+    },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error('[datos_v9] insertarNotaV9: sin fila devuelta tras INSERT.');
+  return rows[0];
+}
+
+/**
+ * Actualiza campos de una nota existente (PATCH parcial).
+ *
+ * @param {string} cuentaId
+ * @param {string} notaId
+ * @param {object} campos  — subset de { texto, color, fijada, privada, curso_id }
+ * @param {string} accessToken
+ * @returns {Promise<object>}  — fila actualizada
+ */
+async function actualizarNotaV9(cuentaId, notaId, campos, accessToken) {
+  const rows = await _v9Fetch(
+    `/notas?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(notaId)}`,
+    {
+      method:  'PATCH',
+      headers: { 'Prefer': 'return=representation' },
+      body:    JSON.stringify(campos),
+    },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error(`[datos_v9] actualizarNotaV9: nota ${notaId} no encontrada o sin permiso.`);
+  return rows[0];
+}
+
+/**
+ * Elimina una nota.
+ *
+ * @param {string} cuentaId
+ * @param {string} notaId
+ * @param {string} accessToken
+ */
+async function eliminarNotaV9(cuentaId, notaId, accessToken) {
+  await _v9Fetch(
+    `/notas?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(notaId)}`,
+    {
+      method:  'DELETE',
+      headers: { 'Prefer': 'return=minimal' },
+    },
+    accessToken
+  );
+  // 204 → null devuelto por _v9Fetch; cualquier otro error ya lanza excepción.
+}
+
+// ─── B1: Códigos de invitación V9 ─────────────────────────────────────────────
+// CRUD sobre la tabla `codigos_invitacion`. RLS: solo el dueño de la cuenta.
+
+/**
+ * Carga todos los códigos de invitación de la cuenta.
+ *
+ * @param {string} cuentaId
+ * @param {string} accessToken
+ * @returns {Promise<object[]>}  — filas ordenadas por activo DESC, creado DESC
+ */
+async function cargarCodigosInvitacionV9(cuentaId, accessToken) {
+  const rows = await _v9Fetch(
+    `/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*&order=activo.desc,id.desc`,
+    { method: 'GET' },
+    accessToken
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+/**
+ * Inserta un código de invitación.
+ *
+ * @param {string} cuentaId
+ * @param {{ id: string, codigo: string, tipo?: string, para?: string, notas?: string, vence_el?: string }} ci
+ * @param {string} accessToken
+ * @returns {Promise<object>}
+ */
+async function insertarCodigoInvitacionV9(cuentaId, ci, accessToken) {
+  const payload = {
+    cuenta_id: cuentaId,
+    id:        ci.id,
+    codigo:    ci.codigo,
+    tipo:      ci.tipo    || 'prueba',
+    para:      ci.para    || null,
+    notas:     ci.notas   || null,
+    vence_el:  ci.vence_el || null,
+    activo:    true,
+    usado:     false,
+  };
+  const rows = await _v9Fetch(
+    `/codigos_invitacion`,
+    {
+      method:  'POST',
+      headers: { 'Prefer': 'return=representation' },
+      body:    JSON.stringify(payload),
+    },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error('[datos_v9] insertarCodigoInvitacionV9: sin fila devuelta tras INSERT.');
+  return rows[0];
+}
+
+/**
+ * Actualiza campos de un código de invitación (PATCH parcial).
+ * Uso típico: desactivar (activo=false) o marcar como usado.
+ *
+ * @param {string} cuentaId
+ * @param {string} ciId       — campo `id` del código (PRIMARY KEY junto a cuenta_id)
+ * @param {object} campos     — subset de { activo, usado, usado_por, usado_en, para, notas, vence_el }
+ * @param {string} accessToken
+ * @returns {Promise<object>}
+ */
+async function actualizarCodigoInvitacionV9(cuentaId, ciId, campos, accessToken) {
+  const rows = await _v9Fetch(
+    `/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(ciId)}`,
+    {
+      method:  'PATCH',
+      headers: { 'Prefer': 'return=representation' },
+      body:    JSON.stringify(campos),
+    },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error(`[datos_v9] actualizarCodigoInvitacionV9: código ${ciId} no encontrado.`);
+  return rows[0];
+}
+
+/**
+ * Elimina un código de invitación.
+ *
+ * @param {string} cuentaId
+ * @param {string} ciId
+ * @param {string} accessToken
+ */
+async function eliminarCodigoInvitacionV9(cuentaId, ciId, accessToken) {
+  await _v9Fetch(
+    `/codigos_invitacion?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(ciId)}`,
+    {
+      method:  'DELETE',
+      headers: { 'Prefer': 'return=minimal' },
+    },
+    accessToken
+  );
+}
+
+// ─── B4: Configuración de cuenta V9 ──────────────────────────────────────────
+// La tabla config_cuenta es 1-a-1 con tesorero_cuentas.
+// RLS: solo el dueño puede INSERT/UPDATE/DELETE; invitados pueden SELECT.
+
+/**
+ * Lee la configuración de la cuenta (una sola fila).
+ * Devuelve null si aún no existe.
+ *
+ * @param {string} cuentaId
+ * @param {string} accessToken
+ * @returns {Promise<object|null>}
+ */
+async function cargarConfigCuentaV9(cuentaId, accessToken) {
+  const rows = await _v9Fetch(
+    `/config_cuenta?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*&limit=1`,
+    { method: 'GET' },
+    accessToken
+  );
+  return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+}
+
+/**
+ * Guarda (upsert) la configuración de la cuenta.
+ * Usa Prefer: resolution=merge-duplicates para hacer INSERT-or-UPDATE.
+ *
+ * @param {string} cuentaId
+ * @param {object} cfg  — campos a escribir (moneda, tipo_org, app_url, plantilla_pago, categorias)
+ * @param {string} accessToken
+ * @returns {Promise<object>}  — fila resultante
+ */
+async function guardarConfigCuentaV9(cuentaId, cfg, accessToken) {
+  const payload = { cuenta_id: cuentaId, ...cfg };
+  const rows = await _v9Fetch(
+    `/config_cuenta`,
+    {
+      method:  'POST',
+      headers: {
+        'Prefer': 'return=representation,resolution=merge-duplicates',
+      },
+      body: JSON.stringify(payload),
+    },
+    accessToken
+  );
+  if (!Array.isArray(rows) || rows.length === 0)
+    throw new Error('[datos_v9] guardarConfigCuentaV9: sin fila devuelta tras upsert.');
+  return rows[0];
 }

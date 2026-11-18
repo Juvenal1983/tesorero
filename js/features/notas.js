@@ -1,5 +1,27 @@
-// js/features/notas.js — extraído de la copia de demostración.
-function renderNotas(){
+// js/features/notas.js — Libreta de notas (B3 V9)
+// En modo V9_RELACIONAL las notas se leen y escriben directamente en la tabla
+// `notas` de Supabase vía datos_v9.js.  DB.notas sigue como caché de UI;
+// nunca se persiste al blob legado (saveDB() es no-op en V9_RELACIONAL).
+//
+// RLS: INSERT/UPDATE/DELETE solo para el dueño (es_dueno).
+//       SELECT para invitados: notas privada=false de su curso.
+
+// ── Helpers de acceso a datos ─────────────────────────────────────────────────
+
+function _notasAccessToken() {
+  return (typeof S !== 'undefined' && S.session?.accessToken) || null;
+}
+function _notasCuentaId() {
+  return (typeof S !== 'undefined' && S._v9CuentaId) || null;
+}
+/** ¿Estamos en modo relacional V9? */
+function _notasV9() {
+  return typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL;
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+
+function renderNotas() {
   DB.notas = DB.notas || [];
   const notas = DB.notas;
   const novedadVisto = previewStorage.getItem('notas_novedad_visto');
@@ -14,8 +36,8 @@ function renderNotas(){
       <button type="button" onclick="cerrarBannerNovedad()" style="background:rgba(255,255,255,.2);border:none;color:#fff;border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;white-space:nowrap">Entendido ✓</button>
     </div>` : '';
 
-  const notasFijas = notas.filter(n=>n.fijada);
-  const notasNorm  = notas.filter(n=>!n.fijada);
+  const notasFijas = notas.filter(n => n.fijada);
+  const notasNorm  = notas.filter(n => !n.fijada);
   const ordenadas  = [...notasFijas, ...notasNorm];
 
   const colorOps = ['#FFF9C4','#C8E6C9','#BBDEFB','#FCE4EC','#E1BEE7','#FFE0B2'];
@@ -67,66 +89,150 @@ function renderNotas(){
   </div>`;
 }
 
-function mostrarFormNota(){
+// ── Helpers UI ────────────────────────────────────────────────────────────────
+
+function mostrarFormNota() {
   const f = document.getElementById('form-nota');
-  if(f){ f.style.display='block'; document.getElementById('nota-texto').focus(); }
+  if (f) { f.style.display = 'block'; document.getElementById('nota-texto').focus(); }
 }
 
-function guardarNota(){
-  if(!puedeEscribir()){ showToast('⛔ El rol Visor no puede crear notas','#E24B4A'); return; }
-  DB.notas = DB.notas || [];
-  const texto = (document.getElementById('nota-texto')?.value||'').trim();
-  if(!texto){ alert('Escribe algo antes de guardar.'); return; }
-  const color = document.getElementById('nota-color')?.value || '#FFF9C4';
-  DB.notas.unshift({ id: 'n'+Date.now(), texto, color, fecha: new Date().toISOString(), fijada: false });
-  saveDB();
-  renderPage();
-}
-
-function eliminarNota(id){
-  if(!puedeEscribir()){ showToast('⛔ El rol Visor no puede eliminar notas','#E24B4A'); return; }
-  if(!confirm('¿Eliminar esta nota?')) return;
-  DB.notas = (DB.notas||[]).filter(n=>n.id!==id);
-  saveDB();
-  renderPage();
-}
-
-function fijarNota(id){
-  if(!puedeEscribir()){ showToast('⛔ El rol Visor no puede fijar notas','#E24B4A'); return; }
-  DB.notas = (DB.notas||[]).map(n=> n.id===id ? {...n, fijada:!n.fijada} : n);
-  saveDB();
-  renderPage();
-}
-
-function cerrarBannerNovedad(){
-  previewStorage.setItem('notas_novedad_visto','1');
+function cerrarBannerNovedad() {
+  previewStorage.setItem('notas_novedad_visto', '1');
   const b = document.getElementById('banner-novedad');
-  if(b) b.remove();
+  if (b) b.remove();
 }
 
-function editarNota(id){
-  document.getElementById('texto-'+id).style.display='none';
-  document.getElementById('edit-'+id).style.display='block';
-  document.getElementById('btn-edit-'+id).style.display='none';
-  document.getElementById('btn-save-'+id).style.display='inline-block';
-  document.getElementById('btn-cancel-'+id).style.display='inline-block';
-  document.getElementById('edit-'+id).focus();
+function editarNota(id) {
+  document.getElementById('texto-' + id).style.display = 'none';
+  document.getElementById('edit-'  + id).style.display = 'block';
+  document.getElementById('btn-edit-'  + id).style.display = 'none';
+  document.getElementById('btn-save-'  + id).style.display = 'inline-block';
+  document.getElementById('btn-cancel-'+ id).style.display = 'inline-block';
+  document.getElementById('edit-' + id).focus();
 }
 
-function cancelarEdicionNota(id){
-  document.getElementById('texto-'+id).style.display='block';
-  document.getElementById('edit-'+id).style.display='none';
-  document.getElementById('btn-edit-'+id).style.display='inline-block';
-  document.getElementById('btn-save-'+id).style.display='none';
-  document.getElementById('btn-cancel-'+id).style.display='none';
+function cancelarEdicionNota(id) {
+  document.getElementById('texto-' + id).style.display = 'block';
+  document.getElementById('edit-'  + id).style.display = 'none';
+  document.getElementById('btn-edit-'  + id).style.display = 'inline-block';
+  document.getElementById('btn-save-'  + id).style.display = 'none';
+  document.getElementById('btn-cancel-'+ id).style.display = 'none';
 }
 
-function guardarEdicionNota(id){
-  if(!puedeEscribir()){ showToast('⛔ El rol Visor no puede editar notas','#E24B4A'); return; }
-  const nuevoTexto = (document.getElementById('edit-'+id)?.value||'').trim();
-  if(!nuevoTexto){ alert('La nota no puede estar vacía.'); return; }
-  DB.notas = (DB.notas||[]).map(n=> n.id===id ? {...n, texto:nuevoTexto} : n);
-  saveDB();
-  renderPage();
+// ── Acciones (V9 async + fallback legado) ─────────────────────────────────────
+
+/**
+ * Crear nota nueva.
+ * En V9: INSERT en Supabase → recarga DB.notas → re-render.
+ * Legado: escribe en DB.notas + saveDB().
+ */
+async function guardarNota() {
+  if (!puedeEscribir()) { showToast('⛔ El rol Visor no puede crear notas', '#E24B4A'); return; }
+  const texto = (document.getElementById('nota-texto')?.value || '').trim();
+  if (!texto) { alert('Escribe algo antes de guardar.'); return; }
+  const color   = document.getElementById('nota-color')?.value || '#FFF9C4';
+  const notaId  = 'n' + Date.now();
+
+  if (_notasV9()) {
+    const cuentaId = _notasCuentaId();
+    const token    = _notasAccessToken();
+    if (!cuentaId || !token) { showToast('⛔ Sin sesión activa', '#E24B4A'); return; }
+    try {
+      const nueva = await insertarNotaV9(cuentaId, { id: notaId, texto, color }, token);
+      DB.notas = DB.notas || [];
+      DB.notas.unshift(nueva);
+      document.getElementById('form-nota').style.display = 'none';
+      document.getElementById('nota-texto').value = '';
+      renderPage();
+    } catch (e) {
+      console.error('[notas] guardarNota error:', e.message);
+      showToast('❌ No se pudo guardar la nota', '#E24B4A');
+    }
+  } else {
+    DB.notas = DB.notas || [];
+    DB.notas.unshift({ id: notaId, texto, color, fecha: new Date().toISOString(), fijada: false });
+    saveDB();
+    renderPage();
+  }
 }
 
+/**
+ * Eliminar nota.
+ */
+async function eliminarNota(id) {
+  if (!puedeEscribir()) { showToast('⛔ El rol Visor no puede eliminar notas', '#E24B4A'); return; }
+  if (!confirm('¿Eliminar esta nota?')) return;
+
+  if (_notasV9()) {
+    const cuentaId = _notasCuentaId();
+    const token    = _notasAccessToken();
+    if (!cuentaId || !token) { showToast('⛔ Sin sesión activa', '#E24B4A'); return; }
+    try {
+      await eliminarNotaV9(cuentaId, id, token);
+      DB.notas = (DB.notas || []).filter(n => n.id !== id);
+      renderPage();
+    } catch (e) {
+      console.error('[notas] eliminarNota error:', e.message);
+      showToast('❌ No se pudo eliminar la nota', '#E24B4A');
+    }
+  } else {
+    DB.notas = (DB.notas || []).filter(n => n.id !== id);
+    saveDB();
+    renderPage();
+  }
+}
+
+/**
+ * Fijar / desfijar nota.
+ */
+async function fijarNota(id) {
+  if (!puedeEscribir()) { showToast('⛔ El rol Visor no puede fijar notas', '#E24B4A'); return; }
+  const nota = (DB.notas || []).find(n => n.id === id);
+  if (!nota) return;
+  const nuevoFijada = !nota.fijada;
+
+  if (_notasV9()) {
+    const cuentaId = _notasCuentaId();
+    const token    = _notasAccessToken();
+    if (!cuentaId || !token) { showToast('⛔ Sin sesión activa', '#E24B4A'); return; }
+    try {
+      const actualizada = await actualizarNotaV9(cuentaId, id, { fijada: nuevoFijada }, token);
+      DB.notas = (DB.notas || []).map(n => n.id === id ? { ...n, ...actualizada } : n);
+      renderPage();
+    } catch (e) {
+      console.error('[notas] fijarNota error:', e.message);
+      showToast('❌ No se pudo actualizar la nota', '#E24B4A');
+    }
+  } else {
+    DB.notas = (DB.notas || []).map(n => n.id === id ? { ...n, fijada: nuevoFijada } : n);
+    saveDB();
+    renderPage();
+  }
+}
+
+/**
+ * Guardar edición de texto de una nota.
+ */
+async function guardarEdicionNota(id) {
+  if (!puedeEscribir()) { showToast('⛔ El rol Visor no puede editar notas', '#E24B4A'); return; }
+  const nuevoTexto = (document.getElementById('edit-' + id)?.value || '').trim();
+  if (!nuevoTexto) { alert('La nota no puede estar vacía.'); return; }
+
+  if (_notasV9()) {
+    const cuentaId = _notasCuentaId();
+    const token    = _notasAccessToken();
+    if (!cuentaId || !token) { showToast('⛔ Sin sesión activa', '#E24B4A'); return; }
+    try {
+      const actualizada = await actualizarNotaV9(cuentaId, id, { texto: nuevoTexto }, token);
+      DB.notas = (DB.notas || []).map(n => n.id === id ? { ...n, ...actualizada } : n);
+      renderPage();
+    } catch (e) {
+      console.error('[notas] guardarEdicionNota error:', e.message);
+      showToast('❌ No se pudo guardar la edición', '#E24B4A');
+    }
+  } else {
+    DB.notas = (DB.notas || []).map(n => n.id === id ? { ...n, texto: nuevoTexto } : n);
+    saveDB();
+    renderPage();
+  }
+}

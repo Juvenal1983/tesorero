@@ -4,6 +4,8 @@ function savePlantillaCfg(){
   if(!DB.config) DB.config={};
   DB.config.plantillaPago = document.getElementById('cfg-plantilla').value.trim();
   saveDB();
+  // B4-V9: persistir plantilla_pago en Supabase
+  if(typeof _persistirConfigV9==='function') _persistirConfigV9({ plantilla_pago: DB.config.plantillaPago });
   alert('✅ Plantilla guardada. Se usará en los próximos pagos.');
   go('config');
 }

@@ -149,6 +149,8 @@ function saveAppUrl(){
   if(!DB.config) DB.config={};
   DB.config.appUrl = url;
   saveDB();
+  // B4-V9: persistir app_url en Supabase
+  if(typeof _persistirConfigV9==='function') _persistirConfigV9({ app_url: url });
   alert('✅ URL guardada. Ahora los mensajes de WhatsApp incluirán el link correcto.');
   go('config');
 }

@@ -1,4 +1,10 @@
 // js/features/respaldos.js — extraído de la copia de demostración.
+// B5-V9: en modo V9_RELACIONAL la exportación usa DB (cargada desde Supabase al
+// iniciar sesión). La importación no está disponible en V9 — los datos se gestionan
+// directamente en Supabase.
+
+function _respaldosV9() { return typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL; }
+
 function exportarDatosConFecha(){
   if(!puedeExportarDatos()){ showToast('⛔ Exportación de respaldos no disponible para este rol','#E24B4A'); return; }
   exportarDatos();
@@ -27,6 +33,12 @@ function exportarDatos(){
 
 function importarDatos(e){
   if(!puedeExportarDatos()){ showToast('⛔ Importación de datos no disponible para este rol','#E24B4A'); return; }
+  // B5-V9: en modo relacional los datos viven en Supabase; la importación por JSON
+  // no está disponible porque saveDB() es no-op y los datos no se persistirían.
+  if(_respaldosV9()){
+    alert('⚠️ La importación de respaldo no está disponible en el modo relacional V9.\n\nEn este modo los datos se gestionan directamente en Supabase.\nSi necesitas restaurar datos, utiliza el Panel SQL de Supabase o contacta al soporte.');
+    return;
+  }
   const file = e.target.files[0];
   if(!file) return;
   const reader = new FileReader();
