@@ -5,18 +5,24 @@
  * tras una corrida abortada (el test se detuvo antes de ejecutar su teardown).
  *
  * ── Uso ───────────────────────────────────────────────────────────────────────
- *  Limpiar TODAS las notas E14 de una corrida específica:
+ *  Corrida específica (prefijo exacto "E14-{EXEC_ID}-"):
  *    node scripts/cleanup_e14_notas.js <EXEC_ID>
  *
- *  Limpiar TODAS las notas E14 de cualquier corrida (prefijo E14-):
+ *  Ejemplo — corrida pendiente mwma9888:
+ *    node scripts/cleanup_e14_notas.js mwma9888
+ *
+ *  Sin argumento: todas las notas "E14-" de la cuenta (cualquier corrida):
  *    node scripts/cleanup_e14_notas.js
  *
  * ── Qué hace ──────────────────────────────────────────────────────────────────
- *  1. Inspección: GET para contar notas con el prefijo indicado en la cuenta.
- *  2. Elimina SOLO notas de esa cuenta y ese prefijo (nunca toca notas ajenas).
- *  3. Verifica la eliminación con GET HTTP 200 + array vacío.
+ *  1. Inspección paginada: GET en páginas de 1000 hasta recibir HTTP 200 (fin).
+ *     PostgREST devuelve 206 Partial Content mientras haya más registros;
+ *     aceptar solo la primera respuesta dejaría un conteo incompleto.
+ *  2. DELETE — una sola llamada (PostgREST borra todos los registros del filtro).
+ *     Limitado a la cuenta y prefijo del argumento; nunca toca notas ajenas.
+ *  3. Verificación: exige HTTP 200 con array vacío (0 filas = sin paginación = 200).
  *
- * Producción excluida.
+ * Producción excluida (guard exclusivo de staging).
  */
 
 'use strict';
@@ -37,7 +43,7 @@ if (!SUPA_URL_RAW || !ANON_KEY || !USER_EMAIL || !USER_PASS) {
   process.exit(1);
 }
 
-// ── Guardia de producción ──────────────────────────────────────────────────────
+// ── Guard exclusivo de staging ─────────────────────────────────────────────────
 const PROD_HOST    = 'tmjqzaakzhecbldebyeg.supabase.co';
 const STAGING_HOST = 'rucgmytyxpfowznowxwd.supabase.co';
 
@@ -46,7 +52,7 @@ try { parsedHost = new URL(SUPA_URL_RAW).hostname; } catch (_) {
   console.error('❌  URL inválida:', SUPA_URL_RAW); process.exit(2);
 }
 if (parsedHost === PROD_HOST) {
-  console.error('🚫  PRODUCCIÓN BLOQUEADA. Usa el host de staging.'); process.exit(2);
+  console.error('🚫  PRODUCCIÓN BLOQUEADA. Este script opera solo en staging.'); process.exit(2);
 }
 if (parsedHost !== STAGING_HOST) {
   console.error('⚠️   Host no reconocido:', parsedHost, '— se esperaba', STAGING_HOST); process.exit(2);
@@ -54,15 +60,11 @@ if (parsedHost !== STAGING_HOST) {
 
 const SUPA_URL = SUPA_URL_RAW;
 
-// ── EXEC_ID del argumento (opcional) ──────────────────────────────────────────
-// Con EXEC_ID: limpia solo notas de esa corrida (prefijo exacto "E14-{EXEC_ID}-")
-// Sin EXEC_ID: limpia TODAS las notas E14 de la cuenta (prefijo "E14-")
-const EXEC_ID_ARG = process.argv[2] || null;
-const LIKE_PATTERN = EXEC_ID_ARG
-  ? `E14-${EXEC_ID_ARG}-%`
-  : `E14-%`;
+// ── EXEC_ID del argumento ──────────────────────────────────────────────────────
+const EXEC_ID_ARG   = process.argv[2] || null;
+const LIKE_PATTERN  = EXEC_ID_ARG ? `E14-${EXEC_ID_ARG}-%` : `E14-%`;
 
-// ── HTTP helper ─────────────────────────────────────────────────────────────────
+// ── HTTP helper (una página) ───────────────────────────────────────────────────
 function req(urlPath, opts = {}) {
   return new Promise((resolve, reject) => {
     const url  = new URL(SUPA_URL + urlPath);
@@ -74,8 +76,8 @@ function req(urlPath, opts = {}) {
       'Prefer':        'return=representation',
       ...(opts.headers || {}),
     };
-    if (opts.jwt) hdrs['Authorization'] = 'Bearer ' + opts.jwt;
-    if (body) hdrs['Content-Length'] = String(Buffer.byteLength(body));
+    if (opts.jwt)   hdrs['Authorization'] = 'Bearer ' + opts.jwt;
+    if (body)       hdrs['Content-Length'] = String(Buffer.byteLength(body));
     const r = https.request(
       { hostname: url.hostname, path: url.pathname + url.search,
         method: opts.method || 'GET', headers: hdrs },
@@ -94,19 +96,66 @@ function req(urlPath, opts = {}) {
   });
 }
 
+/**
+ * Paginación completa de un endpoint PostgREST.
+ *
+ * PostgREST devuelve:
+ *   206 Partial Content — hay más registros; esta página no es la última.
+ *   200 OK              — última página (puede tener 0 o más registros).
+ *
+ * Se itera con offset += PAGE hasta que el status sea 200 (fin de datos)
+ * o la página devuelta tenga 0 elementos (protección extra ante servidores
+ * que no emiten 206 correctamente).
+ *
+ * @param {string} jwt         Bearer token
+ * @param {string} basePath    Ruta REST SIN limit/offset (p.ej. "/rest/v1/notas?...")
+ * @param {number} [page=1000] Tamaño de página
+ * @returns {Promise<Array>}   Todos los registros
+ */
+async function fetchAll(jwt, basePath, page = 1000) {
+  const all = [];
+  let offset = 0;
+
+  while (true) {
+    const sep   = basePath.includes('?') ? '&' : '?';
+    const r     = await req(`${basePath}${sep}limit=${page}&offset=${offset}`, {
+      jwt,
+      headers: { 'Range-Unit': 'items', 'Range': `${offset}-${offset + page - 1}` },
+    });
+
+    if (r.status !== 200 && r.status !== 206) {
+      throw new Error(`fetchAll: HTTP ${r.status} en offset ${offset} — ${JSON.stringify(r.body).slice(0, 200)}`);
+    }
+
+    const rows = Array.isArray(r.body) ? r.body : [];
+    all.push(...rows);
+
+    // Fin de datos: status 200 (última página) o página vacía
+    if (r.status === 200 || rows.length === 0) break;
+
+    // 206 → hay más; avanzar al siguiente bloque
+    offset += page;
+  }
+
+  return all;
+}
+
 // ── Main ───────────────────────────────────────────────────────────────────────
 (async () => {
-  console.log('\n══════════════════════════════════════════════════');
+  console.log('\n══════════════════════════════════════════════════════');
   console.log(' cleanup_e14_notas.js — staging:', STAGING_HOST);
-  if (EXEC_ID_ARG) console.log(' EXEC_ID:', EXEC_ID_ARG);
-  console.log(' Patrón a limpiar:', LIKE_PATTERN);
-  console.log('══════════════════════════════════════════════════\n');
+  if (EXEC_ID_ARG)
+    console.log(' EXEC_ID:', EXEC_ID_ARG);
+  else
+    console.log(' Sin EXEC_ID → limpia TODOS los E14- de la cuenta');
+  console.log(' Prefijo exacto:', LIKE_PATTERN);
+  console.log('══════════════════════════════════════════════════════\n');
 
-  // 1. Login
+  // ── 1. Login ────────────────────────────────────────────────────────────────
   process.stdout.write('→ Login REST… ');
   const authR = await req('/auth/v1/token?grant_type=password', {
     method: 'POST',
-    body: { email: USER_EMAIL, password: USER_PASS },
+    body:   { email: USER_EMAIL, password: USER_PASS },
     headers: { Prefer: '' },
   });
   if (authR.status !== 200 || !authR.body?.access_token) {
@@ -116,7 +165,7 @@ function req(urlPath, opts = {}) {
   const jwt = authR.body.access_token;
   console.log('OK');
 
-  // 2. Descubrir cuentaId
+  // ── 2. Descubrir cuentaId ───────────────────────────────────────────────────
   process.stdout.write('→ Descubriendo cuentaId… ');
   let sub;
   try {
@@ -137,36 +186,38 @@ function req(urlPath, opts = {}) {
   const cuentaId = cuentaR.body[0].id;
   console.log('OK —', cuentaId);
 
-  // 3. Inspección: contar notas con el prefijo
-  const pattern  = encodeURIComponent(LIKE_PATTERN);
+  const pattern   = encodeURIComponent(LIKE_PATTERN);
   const cuentaEnc = encodeURIComponent(cuentaId);
+  const baseGET   = `/rest/v1/notas?cuenta_id=eq.${cuentaEnc}&texto=like.${pattern}&select=id,texto&order=texto.asc`;
 
-  process.stdout.write(`→ Inspeccionando notas "${LIKE_PATTERN}"… `);
-  const inspR = await req(
-    `/rest/v1/notas?cuenta_id=eq.${cuentaEnc}&texto=like.${pattern}&select=id,texto&order=texto.asc`,
-    { jwt, headers: { Prefer: 'count=exact' } }
-  );
-  if (inspR.status !== 200) {
-    console.error('❌  GET inspección falló (HTTP', inspR.status + '):', JSON.stringify(inspR.body).slice(0, 200));
-    process.exit(1);
+  // ── 3. Inspección paginada ──────────────────────────────────────────────────
+  // PostgREST devuelve 206 si hay más de una página; fetchAll itera hasta 200.
+  process.stdout.write(`→ Inspeccionando (paginado) "${LIKE_PATTERN}"… `);
+  let notas;
+  try {
+    notas = await fetchAll(jwt, baseGET);
+  } catch (e) {
+    console.error('❌ ', e.message); process.exit(1);
   }
-  const notas = Array.isArray(inspR.body) ? inspR.body : [];
   console.log(`${notas.length} notas encontradas`);
 
   if (notas.length === 0) {
-    console.log('\n✅  No hay notas huérfanas con ese patrón. Nada que limpiar.');
+    console.log('\n✅  No hay notas huérfanas con ese prefijo. Nada que limpiar.');
     process.exit(0);
   }
 
   // Muestra de primeras y últimas 3
-  const muestra = [...notas.slice(0, 3), ...(notas.length > 6 ? notas.slice(-3) : notas.slice(3))];
-  console.log('   Muestra (texto):',
-    muestra.map(n => n.texto).join(' | ') +
-    (notas.length > 6 ? ` … (${notas.length - 6} más)` : '')
-  );
+  const cabeza = notas.slice(0, 3);
+  const cola   = notas.length > 3 ? notas.slice(-3) : [];
+  const linea  = [...cabeza, ...(cola.length ? ['…'] : []), ...cola]
+    .map(n => typeof n === 'string' ? n : n.texto)
+    .join(' | ');
+  console.log('   Muestra:', linea);
 
-  // 4. DELETE — limitado a cuenta + prefijo exacto (nunca toca otras cuentas ni notas)
-  process.stdout.write(`→ Eliminando ${notas.length} notas (DELETE)… `);
+  // ── 4. DELETE ───────────────────────────────────────────────────────────────
+  // PostgREST borra todos los registros que coinciden con el filtro en una sola
+  // llamada; no hace falta paginar el DELETE.
+  process.stdout.write(`\n→ Eliminando ${notas.length} notas (DELETE)… `);
   const delR = await req(
     `/rest/v1/notas?cuenta_id=eq.${cuentaEnc}&texto=like.${pattern}`,
     { method: 'DELETE', jwt, headers: { Prefer: 'return=minimal' } }
@@ -177,14 +228,17 @@ function req(urlPath, opts = {}) {
   }
   console.log('OK (HTTP', delR.status + ')');
 
-  // 5. Verificación: GET HTTP 200 con array vacío
-  process.stdout.write('→ Verificando ausencia (GET)… ');
+  // ── 5. Verificación: exige HTTP 200 + array vacío ──────────────────────────
+  // Con 0 filas PostgREST devuelve 200 (no 206). Si devuelve 206 es un fallo.
+  process.stdout.write('→ Verificando ausencia (GET exige HTTP 200 + [])… ');
   const verR = await req(
     `/rest/v1/notas?cuenta_id=eq.${cuentaEnc}&texto=like.${pattern}&select=id`,
-    { jwt }
+    { jwt, headers: { Prefer: 'return=representation' } }
   );
   if (verR.status !== 200) {
-    console.error('❌  GET verificación falló (HTTP', verR.status + ')');
+    console.error(`❌  Verificación falló: esperaba HTTP 200, got ${verR.status}`);
+    if (verR.status === 206)
+      console.error('    206 Partial — aún quedan registros; el DELETE no eliminó todo.');
     process.exit(1);
   }
   const quedaron = Array.isArray(verR.body) ? verR.body.length : -1;
@@ -192,8 +246,8 @@ function req(urlPath, opts = {}) {
     console.error(`❌  Todavía quedan ${quedaron} notas tras el DELETE.`);
     process.exit(1);
   }
-  console.log('OK — array vacío ✓');
+  console.log('HTTP 200 + [] ✓');
 
-  console.log(`\n✅  Limpieza completa. ${notas.length} notas eliminadas.\n`);
+  console.log(`\n✅  Limpieza completa. ${notas.length} notas eliminadas de la cuenta ${cuentaId}.\n`);
   process.exit(0);
 })();
