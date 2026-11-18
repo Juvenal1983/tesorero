@@ -7,20 +7,19 @@
  *   N01  Servidor local levantado
  *   N02  Login UI completado (_v9CuentaId disponible)
  *   N03  Crear nota vía UI → fila en DB con texto y color correctos
- *   N04  Nota persiste y aparece tras reload
- *   N05  Editar texto → actualizado en DB
+ *   N04  Nota persiste y aparece tras reload (sesión completa + ruta + DB.notas cargadas)
+ *   N05  Editar texto → actualizado en DB (awaita PATCH, verifica por ID exacto)
  *   N06  Fijar nota → fijada=true en DB; re-fijar → fijada=false
- *   N07  Eliminar nota → ausente en DB y UI
- *   N08  Limpieza: fixtures eliminados de staging (en finally)
+ *   N07  Eliminar nota → ausente en DB (awaita DELETE, verifica por ID exacto)
+ *   N08  Limpieza: GET verifica ausencia real de fixture (no solo HTTP 204)
  *
  * Patrón: igual que E8 — login REST para fixtures, login UI para comportamiento,
- * poll REST para verificación, aislamiento por EXEC_ID.
+ * intercepción de red para mutaciones, poll REST para verificación, EXEC_ID para aislamiento.
  *
  * Variables de entorno requeridas (mismo .env que E8):
  *   STAGING_SUPABASE_URL, STAGING_SUPABASE_ANON_KEY (o STAGING_KEY),
  *   STAGING_USER_A_EMAIL (o STAGING_EMAIL), STAGING_USER_A_PASSWORD (o STAGING_PASS)
- * Opcional:
- *   STAGING_CUENTA_ID  — acelera descubrirCuenta
+ * Opcional: STAGING_CUENTA_ID
  * NUNCA apuntar a producción (tmjqzaakzhecbldebyeg).
  */
 
@@ -55,13 +54,10 @@ if (parsedHost === PROD_HOST || parsedHost !== STAGING_HOST) {
 
 // ── Fixtures y constantes ─────────────────────────────────────────────────────
 
-const EXEC_ID  = Date.now().toString(36);
-const NOTA_ID1 = `nota-b3-1-${EXEC_ID}`;
-const NOTA_ID2 = `nota-b3-2-${EXEC_ID}`;
-const TEXTO1   = `Nota de prueba B3 ${EXEC_ID}`;
+const EXEC_ID    = Date.now().toString(36);
+const TEXTO1     = `Nota de prueba B3 ${EXEC_ID}`;
 const TEXTO1_EDIT = `Editada B3 ${EXEC_ID}`;
-const TEXTO2   = `Nota fijada B3 ${EXEC_ID}`;
-const APP_PORT = 8798;
+const APP_PORT   = 8798;
 
 let CUENTA_ID = process.env.STAGING_CUENTA_ID || null;
 
@@ -115,7 +111,7 @@ function supaAnon(urlPath, opts = {}) {
   return _fetch(urlPath, { ...opts, authHeader: null });
 }
 
-// ── Servidor HTTP local (igual que E8: inyecta STAGING_SUPA_URL en <head>) ────
+// ── Servidor HTTP local ───────────────────────────────────────────────────────
 
 function servirApp() {
   const MIME = {
@@ -200,22 +196,66 @@ function interceptDialogs(page) {
   });
 }
 
-/** Navegar a la sección de notas */
+/** Registra todas las respuestas 4xx/5xx con URL y método para diagnóstico. */
+function registrarRespuestasError(page) {
+  page.on('response', async res => {
+    const status = res.status();
+    if (status >= 400) {
+      const method = res.request().method();
+      const url    = res.url();
+      let body = '';
+      try { body = await res.text().then(t => t.slice(0, 120)); } catch(_) {}
+      console.error(`  [net ${status}] ${method} ${url}${body ? ' → ' + body : ''}`);
+    }
+  });
+}
+
+/** Navegar a notas y esperar que la ruta sea 'notas'. */
 async function navegarNotas(page) {
   await page.evaluate(() => { if (typeof go === 'function') go('notas'); });
   await page.waitForFunction(() => window.S?.route === 'notas', { timeout: T_CORTO });
+}
+
+/**
+ * Esperar una respuesta de Supabase para una tabla+método dados.
+ * Retorna { status, body } de la primera respuesta que coincida, o null si
+ * no llega antes del timeout.
+ */
+function esperarRespuestaSupabase(page, tabla, metodo, timeoutMs = T_CORTO) {
+  return new Promise(resolve => {
+    let resolved = false;
+    const handler = async res => {
+      if (resolved) return;
+      const url = res.url();
+      if (url.includes(tabla) && res.request().method() === metodo) {
+        resolved = true;
+        page.off('response', handler);
+        const status = res.status();
+        let body = null;
+        try { body = await res.json(); } catch(_) {}
+        resolve({ status, body });
+      }
+    };
+    page.on('response', handler);
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        page.off('response', handler);
+        resolve(null);
+      }
+    }, timeoutMs);
+  });
 }
 
 // ── Limpieza staging ──────────────────────────────────────────────────────────
 
 async function limpiarNotas(jwt) {
   if (!CUENTA_ID) return;
-  // Elimina todas las notas cuyo id contiene EXEC_ID
   const r = await supaAuth(
-    `/rest/v1/notas?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&id=like.*${EXEC_ID}*`,
+    `/rest/v1/notas?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&texto=like.*${EXEC_ID}*`,
     jwt, { method: 'DELETE', prefer: 'return=minimal' }
   );
-  console.log(`  🧹 limpiarNotas: HTTP ${r.status}`);
+  console.log(`  🧹 DELETE notas por texto: HTTP ${r.status}`);
 }
 
 // ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -227,7 +267,6 @@ async function limpiarNotas(jwt) {
   console.log(`EXEC_ID  : ${EXEC_ID}`);
   console.log(`Staging  : ${SUPA_URL}`);
 
-  // ── Pre: login REST ───────────────────────────────────────────────────────
   console.log('\n[Pre] Login REST');
   let jwt;
   try {
@@ -239,6 +278,7 @@ async function limpiarNotas(jwt) {
   }
 
   let server = null, browser = null;
+  let notaId = null; // ID real de la fila en DB, fijado en N03
 
   try {
     // ── N01: Servidor ─────────────────────────────────────────────────────
@@ -255,6 +295,7 @@ async function limpiarNotas(jwt) {
       if (msg.type() === 'error') console.error(`  [browser] ${msg.text()}`);
     });
     interceptDialogs(page);
+    registrarRespuestasError(page);
 
     await page.goto(`http://localhost:${APP_PORT}/`, { waitUntil: 'load', timeout: T_LARGO });
     await waitAppReady(page).catch(() => { throw new Error('window.S no definido'); });
@@ -276,18 +317,19 @@ async function limpiarNotas(jwt) {
     // ── N03: Crear nota vía UI → verificar DB ─────────────────────────────
     console.log('\n[N03] Crear nota vía UI → fila en DB');
     await navegarNotas(page);
-    // Mostrar formulario
     await page.evaluate(() => { if (typeof mostrarFormNota === 'function') mostrarFormNota(); });
     await page.waitForSelector('#nota-texto', { timeout: T_CORTO });
     await page.fill('#nota-texto', TEXTO1);
-    // Color rojo (#FCE4EC) como segundo color disponible — click en segundo dot
     const colorDots = page.locator('.color-dot');
     if (await colorDots.count() > 1) await colorDots.nth(1).click();
-    // Guardar
-    await page.evaluate(() => { if (typeof guardarNota === 'function') guardarNota(); });
-    await page.waitForTimeout(1500);
 
-    // Poll REST
+    // Capturar POST antes de llamar guardarNota
+    const promesaPost = esperarRespuestaSupabase(page, 'notas', 'POST');
+    await page.evaluate(() => { if (typeof guardarNota === 'function') guardarNota(); });
+    const respPost = await promesaPost;
+    console.log(`  [net] POST notas → ${respPost?.status ?? 'sin respuesta'}`);
+
+    // Poll REST para confirmar fila con ID exacto
     const r03 = await supaAuth(
       `/rest/v1/notas?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&texto=like.*${EXEC_ID}*&select=id,texto,color,fijada`,
       jwt
@@ -297,63 +339,90 @@ async function limpiarNotas(jwt) {
     ok('N03-b: fila insertada en DB', !!fila03);
     ok('N03-c: texto correcto', (fila03?.texto || '').includes(EXEC_ID));
     ok('N03-d: fijada=false por defecto', fila03?.fijada === false);
+    notaId = fila03?.id || null;
+    console.log(`  ID nota: ${notaId}`);
 
     // ── N04: Nota persiste tras reload ────────────────────────────────────
-    console.log('\n[N04] Nota persiste tras reload');
+    console.log('\n[N04] Nota persiste y aparece en UI tras reload');
     await page.reload({ waitUntil: 'load', timeout: T_LARGO });
     await waitAppReady(page);
     await reloginViaUI(page);
+
+    // 1. Sesión completa (S._v9CuentaId disponible)
+    const cuentaIdPost = await page.evaluate(() => window.S?._v9CuentaId || null);
+    ok('N04-a: sesión completa tras reload (_v9CuentaId)', !!cuentaIdPost);
+
+    // 2. Esperar que DB.notas tenga la nota exacta (carga relacional completada)
+    if (notaId) {
+      await page.waitForFunction(
+        id => !!(window.DB?.notas || []).find(n => n.id === id),
+        notaId,
+        { timeout: T_LARGO }
+      ).catch(() => {});
+    }
+
+    // 3. Navegar a notas y verificar ruta
     await navegarNotas(page);
+    const rutaActual = await page.evaluate(() => window.S?.route || '');
+    ok('N04-b: ruta es "notas" tras reload', rutaActual === 'notas');
+
+    // 4. Nota exacta visible en UI
     const html04 = await page.locator('#contenido, main, body').innerHTML().catch(() => '');
-    ok('N04-a: EXEC_ID visible en UI tras reload', html04.includes(EXEC_ID));
+    ok('N04-c: nota exacta visible (EXEC_ID en UI)', html04.includes(EXEC_ID));
+    if (notaId) ok('N04-d: ID de nota presente en UI', html04.includes(notaId));
 
     // ── N05: Editar texto ─────────────────────────────────────────────────
     console.log('\n[N05] Editar texto de nota');
-    // Obtener id de la nota desde DB
-    const r05pre = await supaAuth(
-      `/rest/v1/notas?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&texto=like.*${EXEC_ID}*&select=id&limit=1`,
-      jwt
-    );
-    const notaId05 = Array.isArray(r05pre.body) && r05pre.body.length > 0 ? r05pre.body[0].id : null;
-    ok('N05-a: id de nota encontrado en DB', !!notaId05);
+    ok('N05-a: id de nota disponible', !!notaId);
 
-    if (notaId05) {
-      // Activar edición
-      await page.evaluate(id => { if (typeof editarNota === 'function') editarNota(id); }, notaId05);
-      await page.waitForSelector(`#edit-${notaId05}`, { state: 'visible', timeout: T_CORTO });
-      await page.fill(`#edit-${notaId05}`, TEXTO1_EDIT);
-      await page.evaluate(id => { if (typeof guardarEdicionNota === 'function') guardarEdicionNota(id); }, notaId05);
-      await page.waitForTimeout(1500);
+    if (notaId) {
+      await page.evaluate(id => { if (typeof editarNota === 'function') editarNota(id); }, notaId);
+      await page.waitForSelector(`#edit-${notaId}`, { state: 'visible', timeout: T_CORTO });
+      await page.fill(`#edit-${notaId}`, TEXTO1_EDIT);
 
+      // Capturar PATCH antes de guardar
+      const promesaPatch = esperarRespuestaSupabase(page, 'notas', 'PATCH');
+      await page.evaluate(id => { if (typeof guardarEdicionNota === 'function') guardarEdicionNota(id); }, notaId);
+      const respPatch = await promesaPatch;
+      console.log(`  [net] PATCH notas → ${respPatch?.status ?? 'sin respuesta'}`);
+      ok('N05-b: PATCH HTTP 2xx', respPatch?.status >= 200 && respPatch?.status < 300);
+
+      // Verificar por ID exacto
       const r05 = await supaAuth(
-        `/rest/v1/notas?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&id=eq.${encodeURIComponent(notaId05)}&select=texto`,
+        `/rest/v1/notas?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&id=eq.${encodeURIComponent(notaId)}&select=id,texto`,
         jwt
       );
-      ok('N05-b: texto actualizado en DB', (r05.body?.[0]?.texto || '').includes('Editada B3'));
+      ok('N05-c: texto actualizado en DB (por ID exacto)',
+        (r05.body?.[0]?.texto || '').includes('Editada B3'));
     } else {
-      ok('N05-b: (BLOQUEADO — id no hallado)', false);
+      ok('N05-b: (BLOQUEADO)', false);
+      ok('N05-c: (BLOQUEADO)', false);
     }
 
     // ── N06: Fijar nota ───────────────────────────────────────────────────
     console.log('\n[N06] Fijar nota → fijada=true; re-fijar → false');
-    if (notaId05) {
-      // Primera fijar
-      await page.evaluate(id => { if (typeof fijarNota === 'function') fijarNota(id); }, notaId05);
-      await page.waitForTimeout(1200);
+    if (notaId) {
+      // Primera fijar — awaitar PATCH
+      const promesaFij1 = esperarRespuestaSupabase(page, 'notas', 'PATCH');
+      await page.evaluate(async id => { if (typeof fijarNota === 'function') await fijarNota(id); }, notaId);
+      const rFij1 = await promesaFij1;
+      console.log(`  [net] PATCH fijar(1) → ${rFij1?.status ?? 'sin respuesta'}`);
       const r06a = await supaAuth(
-        `/rest/v1/notas?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&id=eq.${encodeURIComponent(notaId05)}&select=fijada`,
+        `/rest/v1/notas?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&id=eq.${encodeURIComponent(notaId)}&select=fijada`,
         jwt
       );
-      ok('N06-a: fijada=true tras fijar', r06a.body?.[0]?.fijada === true);
+      ok('N06-a: fijada=true tras fijar (por ID exacto)', r06a.body?.[0]?.fijada === true);
 
       // Segunda fijar (desfijar)
-      await page.evaluate(id => { if (typeof fijarNota === 'function') fijarNota(id); }, notaId05);
-      await page.waitForTimeout(1200);
+      const promesaFij2 = esperarRespuestaSupabase(page, 'notas', 'PATCH');
+      await page.evaluate(async id => { if (typeof fijarNota === 'function') await fijarNota(id); }, notaId);
+      const rFij2 = await promesaFij2;
+      console.log(`  [net] PATCH fijar(2) → ${rFij2?.status ?? 'sin respuesta'}`);
       const r06b = await supaAuth(
-        `/rest/v1/notas?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&id=eq.${encodeURIComponent(notaId05)}&select=fijada`,
+        `/rest/v1/notas?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&id=eq.${encodeURIComponent(notaId)}&select=fijada`,
         jwt
       );
-      ok('N06-b: fijada=false tras desfijar', r06b.body?.[0]?.fijada === false);
+      ok('N06-b: fijada=false tras desfijar (por ID exacto)', r06b.body?.[0]?.fijada === false);
     } else {
       ok('N06-a: (BLOQUEADO)', false);
       ok('N06-b: (BLOQUEADO)', false);
@@ -361,30 +430,40 @@ async function limpiarNotas(jwt) {
 
     // ── N07: Eliminar nota ────────────────────────────────────────────────
     console.log('\n[N07] Eliminar nota → ausente en DB');
-    if (notaId05) {
-      await page.evaluate(id => { if (typeof eliminarNota === 'function') eliminarNota(id); }, notaId05);
-      await page.waitForTimeout(1500);
+    if (notaId) {
+      const promesaDel = esperarRespuestaSupabase(page, 'notas', 'DELETE');
+      await page.evaluate(async id => { if (typeof eliminarNota === 'function') await eliminarNota(id); }, notaId);
+      const respDel = await promesaDel;
+      console.log(`  [net] DELETE notas → ${respDel?.status ?? 'sin respuesta'}`);
+      ok('N07-a: DELETE HTTP 2xx', respDel?.status >= 200 && respDel?.status < 300);
+
       const r07 = await supaAuth(
-        `/rest/v1/notas?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&id=eq.${encodeURIComponent(notaId05)}&select=id`,
+        `/rest/v1/notas?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&id=eq.${encodeURIComponent(notaId)}&select=id`,
         jwt
       );
-      ok('N07-a: GET nota eliminada responde 200', r07.status === 200);
-      ok('N07-b: fila ausente en DB', Array.isArray(r07.body) && r07.body.length === 0);
+      ok('N07-b: GET confirma ausencia (por ID exacto)', Array.isArray(r07.body) && r07.body.length === 0);
     } else {
       ok('N07-a: (BLOQUEADO)', false);
       ok('N07-b: (BLOQUEADO)', false);
     }
 
   } finally {
-    // ── N08: Limpieza ─────────────────────────────────────────────────────
-    console.log('\n[N08] Limpieza staging');
+    // ── N08: Limpieza + verificación por GET ──────────────────────────────
+    console.log('\n[N08] Limpieza staging + verificación GET');
     try {
       const jwtPost = await loginTesorero();
       await limpiarNotas(jwtPost);
-      ok('N08: limpieza ejecutada sin excepción', true);
+      // Verificar ausencia real — HTTP 204 no basta
+      const rCheck = await supaAuth(
+        `/rest/v1/notas?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&texto=like.*${EXEC_ID}*&select=id`,
+        jwtPost
+      );
+      console.log(`  [check] GET notas post-limpieza: HTTP ${rCheck.status}, filas: ${Array.isArray(rCheck.body) ? rCheck.body.length : '?'}`);
+      ok('N08-a: fixture ausente en DB tras limpieza (GET)',
+        rCheck.status === 200 && Array.isArray(rCheck.body) && rCheck.body.length === 0);
     } catch (e) {
-      console.error('  ⚠️  limpiarNotas:', e.message);
-      ok('N08: limpieza', false);
+      console.error('  ⚠️  limpieza:', e.message);
+      ok('N08-a: limpieza', false);
     }
     if (browser) await browser.close();
     if (server)  server.close();
