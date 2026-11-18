@@ -1,11 +1,111 @@
 // js/features/administracion.js — extraído de la copia de demostración.
+// ── B6-V9: helpers para identificar la tabla V9 de un usuario ────────────────
+function _b6EsDueno()     { return typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL; }
+function _b6CuentaId()    { return (typeof S !== 'undefined' && S._v9CuentaId) || null; }
+function _b6Token()       { return (typeof _authToken !== 'undefined' && _authToken) ||
+                                   (typeof S !== 'undefined' && S.session?.accessToken) || null; }
+function _b6TablaDeU(u)   { return u._v9Tabla || null; }
+
+/**
+ * PATCH de un usuario en su tabla V9 (usuarios_cuenta o usuarios_externos).
+ * Solo actualiza los campos pasados; no toca los demás.
+ */
+async function _b6PatchUsuario(u, campos) {
+  const tabla    = _b6TablaDeU(u);
+  const cuentaId = _b6CuentaId();
+  const token    = _b6Token();
+  if (!tabla || !cuentaId || !token) return;
+  await _v9Fetch(
+    `/${tabla}?cuenta_id=eq.${encodeURIComponent(cuentaId)}&id=eq.${encodeURIComponent(u.id)}`,
+    { method: 'PATCH',
+      headers: { 'Prefer': 'return=minimal' },
+      body: JSON.stringify(campos) },
+    token
+  );
+}
+
 let _lastCargarUsuarios = 0;
 async function cargarUsuariosDesdeSupabase(forzar=false){
-  // En modo V9_RELACIONAL la tabla usuarios_app no existe en el esquema relacional.
-  // PENDIENTE (B6): migrar administración de usuarios a lectura desde tesorero_membresias.
-  // Por ahora se omite la carga para evitar 404 — la lista renderiza con los datos en caché local.
-  // No se considera migrada hasta tener lectura relacional explícita desde tesorero_membresias.
-  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) return;
+  const esV9 = typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL;
+  if (esV9) {
+    // B6-V9: leer usuarios_cuenta (acceso delegado) + usuarios_externos (invitados)
+    const cuentaId = _b6CuentaId();
+    const token    = _b6Token();
+    if (!cuentaId || !token) return;
+    const ahora = Date.now();
+    if (!forzar && (ahora - _lastCargarUsuarios) < 5*60*1000) return;
+    _lastCargarUsuarios = ahora;
+    try {
+      const yo = S.session;
+
+      // 1. usuarios_cuenta (delegados con rol)
+      const ucRows = await _v9Fetch(
+        `/usuarios_cuenta?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*`, {}, token
+      );
+      if (Array.isArray(ucRows)) {
+        if (!DB.usuariosExternos) DB.usuariosExternos = [];
+        ucRows.forEach(u => {
+          if (u.auth_id === yo?.authId) return; // excluir al propietario
+          const mapped = {
+            id:             u.id,
+            email:          u.email,
+            nombre:         u.nombre,
+            invitado:       true,
+            desactivado:    u.desactivado,
+            fechaRegistro:  u.fecha_registro,
+            planAnual:      !!u.plan_anual,
+            planAnualHasta: u.plan_anual_hasta || null,
+            // VIP: plan_anual=true sin fecha de vencimiento
+            planVIP:        !!u.plan_anual && !u.plan_anual_hasta,
+            rol:            u.rol || 'visor',
+            _v9Tabla:       'usuarios_cuenta',
+          };
+          const idx = DB.usuariosExternos.findIndex(x => x.id === u.id);
+          if (idx >= 0) DB.usuariosExternos[idx] = { ...DB.usuariosExternos[idx], ...mapped };
+          else DB.usuariosExternos.push(mapped);
+        });
+      }
+
+      // 2. usuarios_externos (invitados por código)
+      const extRows = await _v9Fetch(
+        `/usuarios_externos?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=*`, {}, token
+      );
+      if (Array.isArray(extRows)) {
+        if (!DB.usuariosExternos) DB.usuariosExternos = [];
+        extRows.forEach(u => {
+          const mapped = {
+            id:             u.id,
+            email:          u.email,
+            nombre:         u.nombre,
+            invitado:       true,
+            desactivado:    u.desactivado,
+            fechaRegistro:  u.fecha_registro,
+            planAnual:      !!u.plan_anual,
+            planAnualHasta: u.plan_anual_hasta || null,
+            planVIP:        !!u.plan_anual && !u.plan_anual_hasta,
+            codigoUsado:    u.codigo_usado || null,
+            ultimaActividad:u.ultima_actividad || null,
+            _v9Tabla:       'usuarios_externos',
+          };
+          const idx = DB.usuariosExternos.findIndex(x => x.id === u.id);
+          if (idx >= 0) DB.usuariosExternos[idx] = { ...DB.usuariosExternos[idx], ...mapped };
+          else DB.usuariosExternos.push(mapped);
+        });
+      }
+
+      // Ordenar por última actividad
+      DB.usuariosExternos.sort((a,b) => {
+        if (!a.ultimaActividad) return 1;
+        if (!b.ultimaActividad) return -1;
+        return new Date(b.ultimaActividad) - new Date(a.ultimaActividad);
+      });
+      const el = document.getElementById('lista-usuarios-admin');
+      if (el) el.innerHTML = renderUsuariosAdmin();
+    } catch (e) {
+      console.error('[B6] cargarUsuariosDesdeSupabase V9:', e.message);
+    }
+    return;
+  }
   // Caché de 5 minutos — evita lecturas repetidas a Supabase
   const ahora = Date.now();
   if(!forzar && (ahora - _lastCargarUsuarios) < 5*60*1000) return;
@@ -138,6 +238,12 @@ async function toggleUsuarioAdmin(uid){
   u.desactivado=!u.desactivado;
   const ext=(DB.usuariosExternos||[]).find(x=>x.id===uid);
   if(ext) ext.desactivado=u.desactivado;
+  if(_b6EsDueno()) {
+    // B6-V9: PATCH en usuarios_cuenta o usuarios_externos según origen
+    await _b6PatchUsuario(u, { desactivado: u.desactivado }).catch(e =>
+      console.error('[B6] toggleUsuarioAdmin:', e.message)
+    );
+  } else {
   // Actualizar en usuarios_app (tabla liviana)
   await sbFetch('/rest/v1/usuarios_app?id=eq.'+encodeURIComponent(uid),{
     method:'PATCH',
@@ -158,6 +264,7 @@ async function toggleUsuarioAdmin(uid){
       });
     });
   }
+  } // end else legado
   saveDB();
   const el=document.getElementById('lista-usuarios-admin');
   if(el) el.innerHTML=renderUsuariosAdmin();
@@ -218,7 +325,17 @@ function activarVIPAdmin(uid){
 }
 
 async function syncUsuarioApp(u){
-  // Mantener usuarios_app sincronizado cuando el owner cambia el plan
+  if(_b6EsDueno()){
+    // B6-V9: plan_anual + plan_anual_hasta en la tabla V9 correcta.
+    // VIP se representa como plan_anual=true con plan_anual_hasta=null (sin vencimiento).
+    await _b6PatchUsuario(u, {
+      plan_anual:      u.planAnual || u.planVIP || false,
+      plan_anual_hasta: u.planVIP ? null : (u.planAnualHasta || null),
+      desactivado:     u.desactivado || false,
+    }).catch(e => console.error('[B6] syncUsuarioApp:', e.message));
+    return;
+  }
+  // Legado: mantener usuarios_app sincronizado
   try{
     await sbFetch('/rest/v1/usuarios_app?id=eq.'+encodeURIComponent(u.id),{
       method: 'PATCH',

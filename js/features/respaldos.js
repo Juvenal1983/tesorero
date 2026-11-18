@@ -174,12 +174,129 @@ function exportarDatos(){
 
 // ── Importación ───────────────────────────────────────────────────────────────
 
+// ── B5-V9: restauración completa desde JSON a Supabase ───────────────────────
+//
+// Orden FK-seguro de upsert:
+//   cursos → alumnos → apoderados → cuotas → planes_pago → abonos → pagos
+//   → movimientos → fondo_movimientos → actividades → notas
+//   → codigos_invitacion → config_cuenta
+//
+// Cada colección se envía en trozos de 100 filas con
+//   POST /rest/v1/{tabla}  +  Prefer: resolution=merge-duplicates,return=minimal
+// Los registros existentes se actualizan; no se eliminan registros ausentes.
+
+const _B5_ORDEN = [
+  'cursos','alumnos','apoderados','cuotas','planes_pago','abonos',
+  'pagos','movimientos','fondo_movimientos','actividades',
+  'notas','codigos_invitacion','config_cuenta',
+];
+const _B5_CHUNK = 100;
+
+async function _b5UpsertColeccion(tabla, filas, token) {
+  const errores = [];
+  for (let i = 0; i < filas.length; i += _B5_CHUNK) {
+    const trozo = filas.slice(i, i + _B5_CHUNK);
+    await _v9Fetch(`/${tabla}`, {
+      method:  'POST',
+      headers: { 'Prefer': 'resolution=merge-duplicates,return=minimal' },
+      body:    JSON.stringify(trozo),
+    }, token);
+  }
+  return errores;
+}
+
+async function _importarDatosV9(e) {
+  if (!puedeExportarDatos()) {
+    showToast('⛔ Importación de datos no disponible para este rol','#E24B4A'); return;
+  }
+  const file = e.target.files[0];
+  if (!file) return;
+
+  const msgEl = document.getElementById('import-msg');
+  const setMsg = (txt, ok) => {
+    if (!msgEl) return;
+    msgEl.innerHTML = `<div class="alert ${ok?'ag':'ar'}">${txt}</div>`;
+    msgEl.style.display = '';
+  };
+
+  setMsg('⏳ Leyendo archivo…', true);
+
+  let backup;
+  try {
+    const text = await file.text();
+    backup = JSON.parse(text);
+  } catch (err) {
+    setMsg('❌ Archivo inválido: ' + err.message, false);
+    return;
+  }
+
+  if (backup.version !== 'v9-completo') {
+    setMsg(
+      '❌ Este archivo no es un respaldo V9 (version: ' + (backup.version||'desconocida') + ').<br>' +
+      'Para respaldos anteriores usa el Panel SQL de Supabase.',
+      false
+    );
+    return;
+  }
+
+  const cuentaId = _respCuentaId();
+  const token    = _respToken();
+  if (!cuentaId || !token) { setMsg('❌ Sin sesión activa.', false); return; }
+
+  // Guardia de seguridad: el respaldo debe pertenecer a esta cuenta.
+  if (backup.cuentaId !== cuentaId) {
+    setMsg(
+      '❌ El respaldo pertenece a otra cuenta (' + backup.cuentaId + ').<br>' +
+      'No se puede restaurar en esta cuenta.',
+      false
+    );
+    return;
+  }
+
+  const cols  = backup.colecciones || {};
+  const total = _B5_ORDEN.reduce((s, k) => s + (Array.isArray(cols[k]) ? cols[k].length : 0), 0);
+  const fecha = backup.fecha ? backup.fecha.slice(0,10) : '?';
+
+  if (!confirm(
+    '¿Restaurar ' + total + ' registros desde el respaldo del ' + fecha + '?\n\n' +
+    'Los registros existentes se actualizarán; no se eliminarán registros ausentes.'
+  )) return;
+
+  setMsg('⏳ Restaurando datos…', true);
+
+  const erroresPorTabla = {};
+  let restaurados = 0;
+
+  for (const tabla of _B5_ORDEN) {
+    const filas = Array.isArray(cols[tabla]) ? cols[tabla] : [];
+    if (!filas.length) continue;
+    try {
+      await _b5UpsertColeccion(tabla, filas, token);
+      restaurados += filas.length;
+    } catch (err) {
+      erroresPorTabla[tabla] = err.message;
+      console.error('[B5] ' + tabla + ':', err.message);
+    }
+  }
+
+  const nErrores = Object.keys(erroresPorTabla).length;
+  if (nErrores === 0) {
+    setMsg('✅ Restauración completa: ' + restaurados + '/' + total + ' registros restaurados.', true);
+  } else {
+    const detalle = Object.entries(erroresPorTabla)
+      .slice(0,3).map(([t,m])=>t+': '+m).join('<br>');
+    setMsg(
+      '⚠️ Restaurado con errores (' + restaurados + '/' + total + ' registros).<br>' + detalle,
+      false
+    );
+  }
+  setTimeout(() => { if (msgEl) msgEl.style.display = 'none'; }, 8000);
+}
+
 function importarDatos(e){
   if(!puedeExportarDatos()){ showToast('⛔ Importación de datos no disponible para este rol','#E24B4A'); return; }
-  // B5-V9 PENDIENTE: la restauración completa (JSON → Supabase, todas las tablas)
-  // aún no está implementada. Bloquear para evitar falso guardado.
   if(_respaldosV9()){
-    alert('⚠️ La importación de respaldo no está disponible aún en el modo relacional V9.\n\nSe requiere implementar la restauración completa a Supabase.\nSi necesitas restaurar datos urgentemente, usa el Panel SQL de Supabase.');
+    _importarDatosV9(e);
     return;
   }
   const file = e.target.files[0];
