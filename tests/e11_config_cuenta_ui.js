@@ -273,7 +273,10 @@ async function loginTesorero() {
 }
 
 async function descubrirCuenta(jwt) {
-  const r = await supaAuth('/rest/v1/tesorero_cuentas?select=id&limit=1', jwt);
+  // Ordena por id.asc para un resultado determinista.
+  // Si el usuario tiene acceso a varias cuentas la primera puede no coincidir
+  // con la que resuelve la UI; en ese caso set STAGING_CUENTA_ID en .env.
+  const r = await supaAuth('/rest/v1/tesorero_cuentas?select=id&order=id.asc&limit=1', jwt);
   if (r.status !== 200 || !Array.isArray(r.body) || r.body.length === 0)
     throw new Error('descubrirCuenta: ' + JSON.stringify(r.body));
   return r.body[0].id;
@@ -310,13 +313,24 @@ async function navegarConfig(page) {
   await page.waitForFunction(() => window.S?.route === 'config', { timeout: T_CORTO });
 }
 
-function esperarRespuestaSupabase(page, tabla, metodo, timeoutMs = T_CORTO) {
+/**
+ * Espera la primera respuesta de Supabase que coincida con tabla + método +
+ * (opcionalmente) un fragmento que debe aparecer en la URL.
+ *
+ * @param {Page}   page
+ * @param {string} tabla      — fragmento a buscar en la URL (ej. 'config_cuenta')
+ * @param {string} metodo     — 'POST' | 'PATCH' | 'GET' | 'DELETE'
+ * @param {number} timeoutMs
+ * @param {string} [urlFrag]  — fragmento adicional (ej. el cuenta_id) que la URL debe contener
+ */
+function esperarRespuestaSupabase(page, tabla, metodo, timeoutMs = T_CORTO, urlFrag = null) {
   return new Promise(resolve => {
     let resolved = false;
     const handler = async res => {
       if (resolved) return;
       const url = res.url();
       if (url.includes(tabla) && res.request().method() === metodo) {
+        if (urlFrag && !url.includes(urlFrag)) return; // cuenta incorrecta — ignorar
         resolved = true;
         page.off('response', handler);
         const status = res.status();
@@ -411,6 +425,20 @@ function esperarRespuestaSupabase(page, tabla, metodo, timeoutMs = T_CORTO) {
       throw new Error('Login UI no completó');
     }
 
+    // ── Validar coherencia de cuenta REST ↔ UI ────────────────────────────
+    // Si el usuario tiene acceso a varias cuentas, descubrirCuenta puede
+    // resolver una distinta a la que la app usó al hacer login.
+    // Detectar la discrepancia ANTES de cualquier escritura.
+    const cuentaUI = await page.evaluate(() => window.S?._v9CuentaId ?? null);
+    if (!cuentaUI) throw new Error('_v9CuentaId no disponible en window.S tras login');
+    if (cuentaUI !== CUENTA_ID) {
+      throw new Error(
+        `Discrepancia de cuenta: REST descubrió "${CUENTA_ID}" pero la UI usó "${cuentaUI}".\n` +
+        `  → Fija STAGING_CUENTA_ID=${cuentaUI} en .env para usar la misma cuenta en ambos lados.`
+      );
+    }
+    console.log(`  Cuenta REST = Cuenta UI = ${CUENTA_ID} ✓`);
+
     // ── C03: Cargar config_cuenta desde Supabase ──────────────────────────
     console.log('\n[C03] Cargar config_cuenta desde Supabase');
     const rCfg = await supaAuth(
@@ -436,7 +464,7 @@ function esperarRespuestaSupabase(page, tabla, metodo, timeoutMs = T_CORTO) {
 
     // guardarConfigCuentaV9 usa POST con Prefer: resolution=merge-duplicates (upsert),
     // no PATCH. El listener debe coincidir con POST.
-    const promesaPostCfg = esperarRespuestaSupabase(page, 'config_cuenta', 'POST', T_CORTO);
+    const promesaPostCfg = esperarRespuestaSupabase(page, 'config_cuenta', 'POST', T_CORTO, CUENTA_ID);
     await fInputPlantilla.fill(plantillaTest);
     await page.evaluate(() => {
       if (typeof savePlantillaCfg === 'function') savePlantillaCfg();
@@ -471,7 +499,7 @@ function esperarRespuestaSupabase(page, tabla, metodo, timeoutMs = T_CORTO) {
     if (await fPass.count() > 0)  await fPass.fill('');
     if (await fPass2.count() > 0) await fPass2.fill('');
 
-    const promesaPatchCuenta = esperarRespuestaSupabase(page, 'tesorero_cuentas', 'PATCH', T_CORTO);
+    const promesaPatchCuenta = esperarRespuestaSupabase(page, 'tesorero_cuentas', 'PATCH', T_CORTO, CUENTA_ID);
     await fNombre.fill(nombreTest);
     await page.evaluate(() => {
       if (typeof saveCuenta === 'function') saveCuenta();
