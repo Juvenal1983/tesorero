@@ -237,13 +237,10 @@ function _normalizarAbono(fila) {
 }
 
 async function _b5UpsertColeccion(tabla, filas, token) {
+  // Las filas llegan ya normalizadas a snake_case desde _importarDatosV9 (Paso 1).
   const errores = [];
-  // Normalizar camelCase→snake_case para colecciones exportadas con _mapPlanPago/_mapAbono
-  let filasNorm = filas;
-  if (tabla === 'planes_pago') filasNorm = filas.map(_normalizarPlanPago);
-  if (tabla === 'abonos')      filasNorm = filas.map(_normalizarAbono);
-  for (let i = 0; i < filasNorm.length; i += _B5_CHUNK) {
-    const trozo = filasNorm.slice(i, i + _B5_CHUNK);
+  for (let i = 0; i < filas.length; i += _B5_CHUNK) {
+    const trozo = filas.slice(i, i + _B5_CHUNK);
     await _v9Fetch(`/${tabla}`, {
       method:  'POST',
       headers: { 'Prefer': 'resolution=merge-duplicates,return=minimal' },
@@ -302,18 +299,44 @@ async function _importarDatosV9(e) {
     return;
   }
 
-  const cols = backup.colecciones || {};
+  // ── Paso 1: Normalizar TODAS las filas a snake_case antes de validar o escribir.
+  // planes_pago y abonos se exportan con _mapPlanPago/_mapAbono (camelCase);
+  // cualquier otra colección que llegue con camelCase se normaliza igual.
+  const colsBruto = backup.colecciones || {};
+  const cols = {};
+  for (const tabla of _B5_ORDEN) {
+    const filas = Array.isArray(colsBruto[tabla]) ? colsBruto[tabla] : [];
+    if (tabla === 'planes_pago') cols[tabla] = filas.map(_normalizarPlanPago);
+    else if (tabla === 'abonos') cols[tabla] = filas.map(_normalizarAbono);
+    else cols[tabla] = filas;
+  }
 
-  // Guardia por registro: cada fila debe pertenecer a esta cuenta.
+  // ── Paso 2: Guardia por registro — después de normalizar.
+  // Rechaza:
+  //   a) filas que tengan cuenta_id ajeno (distinto de cuentaId de sesión)
+  //   b) filas que tengan cuentaId camelCase ajeno (normalización no eliminó el conflicto)
+  //   c) filas de tablas con FK cuenta_id que llegan sin ese campo (ausente/null)
   // Detecta manipulación o mezcla de cuentas antes de escribir cualquier dato.
   // La RLS previene cross-account en staging, pero no sustituye validar el destino.
+  const _TABLAS_CON_CUENTA = new Set([
+    'alumnos','apoderados','cuotas','planes_pago','abonos',
+    'pagos','movimientos','fondo_movimientos','actividades',
+    'notas','codigos_invitacion',
+  ]);
   const _filasAjenas = [];
-  for (const _tabla of _B5_ORDEN) {
-    const _filas = Array.isArray(cols[_tabla]) ? cols[_tabla] : [];
-    for (const _fila of _filas) {
-      if (Object.prototype.hasOwnProperty.call(_fila, 'cuenta_id') &&
-          _fila.cuenta_id !== cuentaId) {
-        _filasAjenas.push(_tabla + '[' + (_fila.id || '?') + '] → ' + _fila.cuenta_id);
+  for (const tabla of _B5_ORDEN) {
+    if (!_TABLAS_CON_CUENTA.has(tabla)) continue;
+    const filas = cols[tabla] || [];
+    for (const fila of filas) {
+      // Detectar cuenta_id ausente o nulo
+      if (!Object.prototype.hasOwnProperty.call(fila, 'cuenta_id') || fila.cuenta_id == null) {
+        _filasAjenas.push(tabla + '[' + (fila.id || '?') + '] → cuenta_id ausente');
+        if (_filasAjenas.length >= 3) break;
+        continue;
+      }
+      // Detectar cuenta_id ajeno
+      if (fila.cuenta_id !== cuentaId) {
+        _filasAjenas.push(tabla + '[' + (fila.id || '?') + '] → ' + fila.cuenta_id);
         if (_filasAjenas.length >= 3) break;
       }
     }
@@ -321,7 +344,7 @@ async function _importarDatosV9(e) {
   }
   if (_filasAjenas.length > 0) {
     setMsg(
-      '❌ Registros con cuenta_id ajeno detectados. Importación cancelada.<br>' +
+      '❌ Registros con cuenta_id ajeno o ausente detectados. Importación cancelada.<br>' +
       _filasAjenas.map(f => '&nbsp;• ' + f).join('<br>'),
       false
     );

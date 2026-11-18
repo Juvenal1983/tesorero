@@ -4,33 +4,37 @@
  * Suite Playwright E13 — Restauración V9 (B5-import) + Administración usuarios (B6)
  *
  * Estrategia de fixtures:
- *   - Fixture propio: 1 curso, 1 cuota, 2 alumnos, 1 plan_pago con 2 abonos,
- *     1 pago directo, 1 usuario_externo. Se crean al inicio, se limpian al final.
- *   - `respaldoFixture` se construye SOLO con esos registros y sus dependencias;
- *     R06/R07/R09/R10 no reimportan el respaldo completo de la cuenta.
- *   - `dispararImportacion` espera la señal TERMINAL del DOM (✅/⚠️/❌), no el ⏳.
- *   - `eliminarFixtures` exige HTTP 200 + body array + length === 0 en cada GET.
- *   - Si un fixture no puede crearse los tests dependientes se bloquean y se cuentan.
+ *   - Fixture OBLIGATORIO: 1 curso, 1 cuota, 2 alumnos, 1 plan_pago, 2 abonos,
+ *     1 pago directo. Si cualquiera de estos falla, toda la suite aborta.
+ *   - usuario_externo: obligatorio para R11-R12; si falla, esos tests se bloquean.
+ *   - `respaldoFixture` se construye con SOLO los registros fixture y sus dependencias.
+ *   - `dispararImportacion` espera mensaje TERMINAL (✅/⚠️/❌), nunca ⏳.
+ *   - `eliminarFixtures` exige HTTP 200 + array + length === 0 en cada GET.
+ *   - V9_RELACIONAL: `const` global de script clásico — no es propiedad automática de
+ *     window; se lee con `typeof V9_RELACIONAL` directamente en page.evaluate.
  *   - Producción excluida.
  *
  * Tests:
  *   R01  Servidor local levantado y staging alcanzable
- *   R02  Login UI + V9_RELACIONAL activo (binding real, no window.V9_RELACIONAL en módulo)
+ *   R02  Login UI + V9_RELACIONAL activo (binding real, no window.V9_RELACIONAL)
  *   R03  exportarDatosCompletosV9 → JSON descargado con estructura válida
- *   R04  Cursos, cuotas, alumnos, planes_pago, abonos y pagos fixture en el respaldo
- *   R04x planes_pago y abonos exportados con campos SQL (snake_case) o normalizados
- *   R05  Límite de paginación (1000 filas) documentado — colecciones que lo alcancen
- *   R06  Eliminar fixture → importar respaldo-fixture → GET por ID exacto; completo ó error
+ *   R04  Todos los IDs fixture en el respaldo (cursos, cuotas, alumnos, planes, abonos, pagos)
+ *   R04x planes_pago en respaldo contiene id y cuenta (camelCase o snake_case)
+ *   R05  Límite de paginación (1000 filas) documentado
+ *   R06  Eliminar fixture → importar respaldo-fixture → GET por ID exacto para TODOS los IDs;
+ *        aprueba solo con ✅ + todos los IDs restaurados (planes y abonos incluidos)
  *   R07  Importar mismo respaldo-fixture segunda vez → idempotente (counts exactos)
- *   R08  Importar con cuentaId ajeno en encabezado → rechazado con mensaje UI
- *   R09  Registro con cuenta_id ajeno en lote → guardia por-registro cancela antes de escribir
- *   R10  FK inválida → mensaje terminal de error en UI (no vacío, no "completa")
- *   R11  B6: cargarUsuariosDesdeSupabase popula DB.usuariosExternos (binding real, no window.DB)
+ *   R08  cuentaId ajeno en encabezado → rechazado con mensaje UI
+ *   R09  registro snake_case con cuenta_id ajeno → guardia cancela antes de escribir
+ *   R09b plan camelCase con cuentaId ajeno → normalización + guardia → cero escrituras
+ *   R10  FK inválida → mensaje terminal ⚠️/❌ en UI (no vacío, no ⏳, no ✅)
+ *   R11  B6: cargarUsuariosDesdeSupabase popula DB.usuariosExternos (binding real)
  *   R12  B6: toggleUsuarioAdmin hace PATCH en la tabla V9 correcta
  *   R13  Limpieza: todos los fixtures eliminados, GET exige HTTP 200 + array + length 0
  *
  * Pendientes (fuera de esta suite):
  *   - Paginación real (exportar >1000 filas sin truncar) — bloquea publicación
+ *   - B5/B6 no declarados completos hasta que estos tests pasen íntegramente
  *   - Restauración de sesión / recordar acceso (sin implementar en V9)
  *   - Comparación funcional completa con app original
  */
@@ -65,7 +69,6 @@ let parsedHost;
 try { parsedHost = new URL(SUPA_URL).hostname; } catch(_) { process.exit(2); }
 if (parsedHost === PROD_HOST || parsedHost !== STAGING_HOST) {
   console.error('❌ URL no autorizada:', parsedHost);
-  console.error('   Este test solo corre contra staging.');
   process.exit(2);
 }
 
@@ -177,10 +180,8 @@ window.STAGING_SUPA_KEY = ${JSON.stringify(ANON_KEY)};
 
 async function loginTesorero() {
   const r = await _fetch('/auth/v1/token?grant_type=password', {
-    method: 'POST',
-    body: { email: USER_EMAIL, password: USER_PASS },
-    prefer: '',
-    authHeader: null,
+    method: 'POST', body: { email: USER_EMAIL, password: USER_PASS },
+    prefer: '', authHeader: null,
   });
   if (r.status !== 200 || !r.body?.access_token)
     throw new Error(`Login REST fallido: ${JSON.stringify(r.body)}`);
@@ -199,8 +200,7 @@ async function descubrirCuenta(jwt) {
   const sub = jwtSub(jwt);
   if (!sub) throw new Error('descubrirCuenta: no se pudo extraer sub del JWT');
   const r = await supaAuth(
-    `/rest/v1/tesorero_cuentas?auth_id=eq.${encodeURIComponent(sub)}&select=id&limit=1`,
-    jwt
+    `/rest/v1/tesorero_cuentas?auth_id=eq.${encodeURIComponent(sub)}&select=id&limit=1`, jwt
   );
   if (r.status !== 200 || !Array.isArray(r.body) || r.body.length === 0)
     throw new Error(`descubrirCuenta: auth_id=${sub} → ${JSON.stringify(r.body)}`);
@@ -215,8 +215,7 @@ async function waitAppReady(page) {
 
 function instalarManejadorDialogos(page, estado) {
   page.on('dialog', async d => {
-    const tipo = d.type();
-    const msg  = d.message();
+    const tipo = d.type(), msg = d.message();
     console.log(`    [dialog] ${tipo}: ${msg.slice(0, 120)}`);
     estado.ultimoDialog = { type: tipo, message: msg };
     await d.accept().catch(() => {});
@@ -227,8 +226,7 @@ function registrarRespuestasError(page) {
   page.on('response', async res => {
     const status = res.status();
     if (status >= 400) {
-      const method = res.request().method();
-      const url    = res.url();
+      const method = res.request().method(), url = res.url();
       let body = '';
       try { body = await res.text().then(t => t.slice(0, 160)); } catch(_) {}
       console.error(`  [net ${status}] ${method} ${url}${body ? '\n    → ' + body : ''}`);
@@ -242,18 +240,15 @@ async function navegarConfig(page) {
 }
 
 /**
- * Dispara importarDatos en la página pasando el contenido JSON dado.
- * El confirm() es aceptado por el manejador de diálogos ya instalado.
+ * Dispara importarDatos con el JSON dado y espera el mensaje TERMINAL.
  *
- * ESPERA EL MENSAJE TERMINAL: aguarda hasta que #export-msg contenga un
- * texto que empiece con ✅, ⚠️ o ❌ (no ⏳). Timeout: 30 s.
- *
- * Devuelve el texto del mensaje terminal, o null si no aparece en el plazo.
+ * Terminal = #export-msg visible con texto que NO empiece con '⏳'.
+ * Limpia el mensaje anterior antes de disparar para evitar lecturas residuales.
+ * Timeout: 30 s.
  */
 async function dispararImportacion(page, jsonContent) {
   const jsonStr = typeof jsonContent === 'string' ? jsonContent : JSON.stringify(jsonContent);
 
-  // Limpiar mensaje previo para detectar el nuevo limpiamente
   await page.evaluate(() => {
     const el = document.getElementById('export-msg');
     if (el) { el.style.display = 'none'; el.innerHTML = ''; }
@@ -268,25 +263,19 @@ async function dispararImportacion(page, jsonContent) {
     importarDatos({ target: { files: dt.files } });
   }, jsonStr);
 
-  // Esperar mensaje TERMINAL (✅ / ⚠️ / ❌) — no el ⏳ de inicio
   let msgTexto = null;
   try {
     await page.waitForFunction(() => {
       const el = document.getElementById('export-msg');
       if (!el || el.style.display === 'none') return false;
       const txt = el.innerText.trim();
-      if (!txt) return false;
-      // ⏳ es el mensaje de progreso, no terminal; esperar reemplazo
-      if (txt.startsWith('⏳')) return false;
-      return true;
+      return txt.length > 0 && !txt.startsWith('⏳');
     }, { timeout: 30_000 });
     msgTexto = await page.evaluate(() => {
       const el = document.getElementById('export-msg');
       return el ? el.innerText.trim() : null;
     });
   } catch (_) {
-    // Sin mensaje terminal en DOM tras 30 s
-    // Intentar leer lo que haya (podría ser ⏳ o vacío)
     msgTexto = await page.evaluate(() => {
       const el = document.getElementById('export-msg');
       return el ? el.innerText.trim() : null;
@@ -299,14 +288,13 @@ async function dispararImportacion(page, jsonContent) {
 // ── Gestión de fixtures ───────────────────────────────────────────────────────
 
 /**
- * Inserta fixture completo:
- *   1 curso, 1 cuota, 2 alumnos, 1 plan_pago (con 2 abonos), 1 pago, 1 usuario_externo
+ * Inserta fixture COMPLETO y OBLIGATORIO:
+ *   1 curso, 1 cuota, 2 alumnos, 1 plan_pago, 2 abonos, 1 pago directo
  *
- * fixtureCreados se llena en tiempo real (por referencia).
- * Lanza si falla curso/cuota/alumnos/pago (prerequisito para R06-R10).
- * Para plan_pago, abonos y usuario_externo: registra error y no lanza (R11-R12 se bloquean).
+ * LANZA si CUALQUIERA de estos falla — no hay advertencias, toda la suite depende de ellos.
+ * usuario_externo es el único no fatal (R11-R12 lo bloquean si falla).
  */
-async function insertarFixtures(jwt, cuentaId, fixtureCreados) {
+async function insertarFixtures(jwt, cuentaId, fc) {
   const uid = () => crypto.randomUUID();
   const hoy = new Date().toISOString().slice(0, 10);
 
@@ -318,24 +306,20 @@ async function insertarFixtures(jwt, cuentaId, fixtureCreados) {
     prefer: 'return=representation',
   });
   if (rC.status < 200 || rC.status >= 300)
-    throw new Error(`insertarFixtures: curso falló HTTP ${rC.status}: ${JSON.stringify(rC.body)}`);
-  fixtureCreados.cursos.push(cursoId);
-  console.log(`  [fixture] curso ${cursoId.slice(0,8)}… insertado`);
+    throw new Error(`fixture curso HTTP ${rC.status}: ${JSON.stringify(rC.body)}`);
+  fc.cursos.push(cursoId);
 
-  // Cuota para ese curso (necesaria como FK para planes_pago)
+  // Cuota (obligatoria como FK para planes_pago)
   const cuotaId = uid();
   const rQ = await supaAuth('/rest/v1/cuotas', jwt, {
     method: 'POST',
-    body: {
-      id: cuotaId, cuenta_id: cuentaId, curso_id: cursoId,
-      nombre: `FixtureCuota-E13-${EXEC_ID}`, monto: 10000, activa: true,
-    },
+    body: { id: cuotaId, cuenta_id: cuentaId, curso_id: cursoId,
+            nombre: `FixtureCuota-E13-${EXEC_ID}`, monto: 10000, activa: true },
     prefer: 'return=representation',
   });
   if (rQ.status < 200 || rQ.status >= 300)
-    throw new Error(`insertarFixtures: cuota falló HTTP ${rQ.status}: ${JSON.stringify(rQ.body)}`);
-  fixtureCreados.cuotas.push(cuotaId);
-  console.log(`  [fixture] cuota ${cuotaId.slice(0,8)}… insertada`);
+    throw new Error(`fixture cuota HTTP ${rQ.status}: ${JSON.stringify(rQ.body)}`);
+  fc.cuotas.push(cuotaId);
 
   // 2 alumnos
   let primerAlumnoId = null;
@@ -343,110 +327,91 @@ async function insertarFixtures(jwt, cuentaId, fixtureCreados) {
     const alumnoId = uid();
     const rA = await supaAuth('/rest/v1/alumnos', jwt, {
       method: 'POST',
-      body: {
-        id: alumnoId, cuenta_id: cuentaId, curso_id: cursoId,
-        nombres: `FixtureAlumno${j}-E13`, apellidos: EXEC_ID, estado: 'activo',
-      },
+      body: { id: alumnoId, cuenta_id: cuentaId, curso_id: cursoId,
+              nombres: `FixtureAlumno${j}-E13`, apellidos: EXEC_ID, estado: 'activo' },
       prefer: 'return=representation',
     });
     if (rA.status < 200 || rA.status >= 300)
-      throw new Error(`insertarFixtures: alumno ${j} falló HTTP ${rA.status}: ${JSON.stringify(rA.body)}`);
-    fixtureCreados.alumnos.push(alumnoId);
+      throw new Error(`fixture alumno ${j} HTTP ${rA.status}: ${JSON.stringify(rA.body)}`);
+    fc.alumnos.push(alumnoId);
     if (j === 1) primerAlumnoId = alumnoId;
   }
-  console.log(`  [fixture] 2 alumnos insertados`);
 
-  // Plan de pago para el primer alumno (FK: alumno_id + cuota_id)
+  // Plan de pago (obligatorio)
   const planId = uid();
   const rPl = await supaAuth('/rest/v1/planes_pago', jwt, {
     method: 'POST',
-    body: {
-      id: planId, cuenta_id: cuentaId, alumno_id: primerAlumnoId,
-      cuota_id: cuotaId, monto_total: 10000, activo: true,
-      periodo: `FixtureE13-${EXEC_ID}`,
-    },
+    body: { id: planId, cuenta_id: cuentaId, alumno_id: primerAlumnoId,
+            cuota_id: cuotaId, monto_total: 10000, activo: true,
+            periodo: `FixtureE13-${EXEC_ID}` },
     prefer: 'return=representation',
   });
-  if (rPl.status >= 200 && rPl.status < 300) {
-    fixtureCreados.planes_pago.push(planId);
-    console.log(`  [fixture] plan_pago ${planId.slice(0,8)}… insertado`);
+  if (rPl.status < 200 || rPl.status >= 300)
+    throw new Error(`fixture plan_pago HTTP ${rPl.status}: ${JSON.stringify(rPl.body)}`);
+  fc.planes_pago.push(planId);
 
-    // 2 abonos para ese plan
-    for (let j = 1; j <= 2; j++) {
-      const abonoId = uid();
-      const rAb = await supaAuth('/rest/v1/abonos', jwt, {
-        method: 'POST',
-        body: {
-          id: abonoId, cuenta_id: cuentaId, alumno_id: primerAlumnoId,
-          cuota_id: cuotaId, plan_id: planId,
-          monto: 5000, fecha: hoy, pagado: false, estado: 'registrado',
-        },
-        prefer: 'return=representation',
-      });
-      if (rAb.status >= 200 && rAb.status < 300) {
-        fixtureCreados.abonos.push(abonoId);
-      } else {
-        console.warn(`  [fixture] abono ${j} no creado: HTTP ${rAb.status}`);
-      }
-    }
-    console.log(`  [fixture] ${fixtureCreados.abonos.length} abono(s) insertado(s)`);
-  } else {
-    fixtureCreados.errorPlanPago = `HTTP ${rPl.status}: ${JSON.stringify(rPl.body).slice(0, 120)}`;
-    console.warn(`  [fixture] plan_pago NO creado: ${fixtureCreados.errorPlanPago}`);
+  // 2 abonos (obligatorios)
+  for (let j = 1; j <= 2; j++) {
+    const abonoId = uid();
+    const rAb = await supaAuth('/rest/v1/abonos', jwt, {
+      method: 'POST',
+      body: { id: abonoId, cuenta_id: cuentaId, alumno_id: primerAlumnoId,
+              cuota_id: cuotaId, plan_id: planId,
+              monto: 5000, fecha: hoy, pagado: false, estado: 'registrado' },
+      prefer: 'return=representation',
+    });
+    if (rAb.status < 200 || rAb.status >= 300)
+      throw new Error(`fixture abono ${j} HTTP ${rAb.status}: ${JSON.stringify(rAb.body)}`);
+    fc.abonos.push(abonoId);
   }
 
-  // Pago directo
+  // Pago directo (obligatorio)
   const pagoId = uid();
   const rPg = await supaAuth('/rest/v1/pagos', jwt, {
     method: 'POST',
-    body: {
-      id: pagoId, cuenta_id: cuentaId, alumno_id: primerAlumnoId,
-      monto: 9900, fecha: hoy, medio: 'efectivo', estado: 'pagado',
-      periodo: `FixtureE13-${EXEC_ID}`, obs: `Fixture E13 ${EXEC_ID}`,
-    },
+    body: { id: pagoId, cuenta_id: cuentaId, alumno_id: primerAlumnoId,
+            monto: 9900, fecha: hoy, medio: 'efectivo', estado: 'pagado',
+            periodo: `FixtureE13-${EXEC_ID}`, obs: `Fixture E13 ${EXEC_ID}` },
     prefer: 'return=representation',
   });
   if (rPg.status < 200 || rPg.status >= 300)
-    throw new Error(`insertarFixtures: pago falló HTTP ${rPg.status}: ${JSON.stringify(rPg.body)}`);
-  fixtureCreados.pagos.push(pagoId);
-  console.log(`  [fixture] pago ${pagoId.slice(0,8)}… insertado`);
+    throw new Error(`fixture pago HTTP ${rPg.status}: ${JSON.stringify(rPg.body)}`);
+  fc.pagos.push(pagoId);
 
-  // Usuario externo (para B6) — no fatal si falla
+  console.log(`  [fixture] cursos=${fc.cursos.length} cuotas=${fc.cuotas.length} alumnos=${fc.alumnos.length} planes=${fc.planes_pago.length} abonos=${fc.abonos.length} pagos=${fc.pagos.length}`);
+
+  // Usuario externo — único no fatal
   const ueId = uid();
   const rU = await supaAuth('/rest/v1/usuarios_externos', jwt, {
     method: 'POST',
-    body: {
-      id: ueId, cuenta_id: cuentaId,
-      email: `fixture_e13_${EXEC_ID}@test.local`,
-      nombre: `FixtureUsuarioE13-${EXEC_ID}`, desactivado: false,
-    },
+    body: { id: ueId, cuenta_id: cuentaId,
+            email: `fixture_e13_${EXEC_ID}@test.local`,
+            nombre: `FixtureUsuarioE13-${EXEC_ID}`, desactivado: false },
     prefer: 'return=representation',
   });
   if (rU.status >= 200 && rU.status < 300) {
-    fixtureCreados.usuariosExternos.push(ueId);
+    fc.usuariosExternos.push(ueId);
     console.log(`  [fixture] usuario_externo ${ueId.slice(0,8)}… insertado`);
   } else {
-    fixtureCreados.errorUsuarioExterno =
-      `HTTP ${rU.status}: ${JSON.stringify(rU.body).slice(0, 120)}`;
-    console.warn(`  [fixture] usuario_externo NO creado: ${fixtureCreados.errorUsuarioExterno}`);
+    fc.errorUsuarioExterno = `HTTP ${rU.status}: ${JSON.stringify(rU.body).slice(0, 120)}`;
+    console.warn(`  [fixture] usuario_externo NO creado: ${fc.errorUsuarioExterno}`);
   }
 }
 
 /**
- * Construye un respaldo mínimo con SOLO los registros fixture.
+ * Construye respaldo-fixture con SOLO los registros fixture y sus dependencias.
  * Extrae filas del respaldo completo filtrando por IDs fixture.
- * Los planes_pago y abonos se incluyen en snake_case (columnas SQL),
- * porque la normalización se hace en _b5UpsertColeccion pero también
- * queremos verificar que el respaldo completo los exporta correctamente.
+ * Los planes_pago y abonos se incluyen tal cual vienen del respaldo
+ * (camelCase o snake_case — _importarDatosV9 los normalizará en Paso 1).
  */
-function construirRespaldoFixture(cuentaId, fixtureCreados, respaldoCompleto) {
+function construirRespaldoFixture(cuentaId, fc, respaldoCompleto) {
   const cols = respaldoCompleto?.colecciones || {};
-  const cursoIds  = new Set(fixtureCreados.cursos);
-  const cuotaIds  = new Set(fixtureCreados.cuotas);
-  const alumnoIds = new Set(fixtureCreados.alumnos);
-  const planIds   = new Set(fixtureCreados.planes_pago);
-  const abonoIds  = new Set(fixtureCreados.abonos);
-  const pagoIds   = new Set(fixtureCreados.pagos);
+  const cursoIds  = new Set(fc.cursos);
+  const cuotaIds  = new Set(fc.cuotas);
+  const alumnoIds = new Set(fc.alumnos);
+  const planIds   = new Set(fc.planes_pago);
+  const abonoIds  = new Set(fc.abonos);
+  const pagoIds   = new Set(fc.pagos);
 
   return {
     version:  'v9-completo',
@@ -474,12 +439,10 @@ function construirRespaldoFixture(cuentaId, fixtureCreados, respaldoCompleto) {
 /**
  * Elimina todos los fixtures y verifica eliminación por GET.
  * Exige: HTTP 200 + array + length === 0.
- * Devuelve número de fallos.
  */
-async function eliminarFixtures(jwt, cuentaId, fixtureCreados) {
+async function eliminarFixtures(jwt, cuentaId, fc) {
   let fallos = 0;
-
-  async function eliminarYVerificar(tabla, id) {
+  async function del1(tabla, id) {
     try {
       const rDel = await supaAuth(
         `/rest/v1/${tabla}?id=eq.${encodeURIComponent(id)}&cuenta_id=eq.${encodeURIComponent(cuentaId)}`,
@@ -491,7 +454,7 @@ async function eliminarFixtures(jwt, cuentaId, fixtureCreados) {
       }
       const rGet = await supaAuth(`/rest/v1/${tabla}?id=eq.${encodeURIComponent(id)}&select=id`, jwt);
       if (rGet.status !== 200) {
-        console.error(`  [cleanup] ${tabla} ${id.slice(0,8)}… GET verificación HTTP ${rGet.status}`);
+        console.error(`  [cleanup] ${tabla} ${id.slice(0,8)}… GET HTTP ${rGet.status}`);
         fallos++;
       } else if (!Array.isArray(rGet.body)) {
         console.error(`  [cleanup] ${tabla} ${id.slice(0,8)}… GET no devolvió array`);
@@ -500,22 +463,21 @@ async function eliminarFixtures(jwt, cuentaId, fixtureCreados) {
         console.error(`  [cleanup] ${tabla} ${id.slice(0,8)}… sigue en DB`);
         fallos++;
       } else {
-        console.log(`  [cleanup] ${tabla} ${id.slice(0,8)}… eliminado ✓`);
+        console.log(`  [cleanup] ${tabla} ${id.slice(0,8)}… ✓`);
       }
     } catch (e) {
       console.error(`  [cleanup] ${tabla} ${id.slice(0,8)}… excepción: ${e.message}`);
       fallos++;
     }
   }
-
   // Orden FK-safe inverso
-  for (const id of fixtureCreados.usuariosExternos) await eliminarYVerificar('usuarios_externos', id);
-  for (const id of fixtureCreados.abonos)           await eliminarYVerificar('abonos',            id);
-  for (const id of fixtureCreados.planes_pago)       await eliminarYVerificar('planes_pago',       id);
-  for (const id of fixtureCreados.pagos)             await eliminarYVerificar('pagos',             id);
-  for (const id of fixtureCreados.alumnos)           await eliminarYVerificar('alumnos',           id);
-  for (const id of fixtureCreados.cuotas)            await eliminarYVerificar('cuotas',            id);
-  for (const id of fixtureCreados.cursos)            await eliminarYVerificar('cursos',            id);
+  for (const id of fc.usuariosExternos) await del1('usuarios_externos', id);
+  for (const id of fc.abonos)           await del1('abonos',            id);
+  for (const id of fc.planes_pago)       await del1('planes_pago',       id);
+  for (const id of fc.pagos)             await del1('pagos',             id);
+  for (const id of fc.alumnos)           await del1('alumnos',           id);
+  for (const id of fc.cuotas)            await del1('cuotas',            id);
+  for (const id of fc.cursos)            await del1('cursos',            id);
   return fallos;
 }
 
@@ -544,10 +506,10 @@ async function existeEnDB(jwt, tabla, id) {
     process.exit(3);
   }
 
-  const fixtureCreados = {
+  // fixtureCreados (fc) — se llena en insertarFixtures
+  const fc = {
     cursos: [], cuotas: [], alumnos: [], planes_pago: [], abonos: [], pagos: [],
-    usuariosExternos: [],
-    errorPlanPago: null, errorUsuarioExterno: null,
+    usuariosExternos: [], errorUsuarioExterno: null,
   };
 
   let server           = null;
@@ -559,7 +521,7 @@ async function existeEnDB(jwt, tabla, id) {
 
   try {
     // ── R01 ───────────────────────────────────────────────────────────────────
-    console.log('\n[R01] Servidor HTTP local (app real contra staging)');
+    console.log('\n[R01] Servidor HTTP local');
     server = await servirApp();
     ok('R01: servidor levantado', true);
 
@@ -567,14 +529,10 @@ async function existeEnDB(jwt, tabla, id) {
     console.log('\n[R02] Login UI + V9_RELACIONAL activo');
     browser = await chromium.launch({ headless: true });
     const ctx = await browser.newContext({
-      viewport: { width: 390, height: 844 },
-      deviceScaleFactor: 2,
-      acceptDownloads: true,
+      viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, acceptDownloads: true,
     });
     const page = await ctx.newPage();
-    page.on('console', msg => {
-      if (msg.type() === 'error') console.error(`  [browser] ${msg.text()}`);
-    });
+    page.on('console', msg => { if (msg.type() === 'error') console.error(`  [browser] ${msg.text()}`); });
     instalarManejadorDialogos(page, dialogState);
     registrarRespuestasError(page);
 
@@ -589,51 +547,36 @@ async function existeEnDB(jwt, tabla, id) {
         () => window.S?.session !== null && window.S?.session !== undefined && !!window.S?._v9CuentaId,
         { timeout: T_LARGO }
       );
-      ok('R02-a: login completado (_v9CuentaId disponible)', true);
     } catch (_) {
       ok('R02-a: login completado', false);
       throw new Error('Login UI no completó');
     }
+    ok('R02-a: login completado (_v9CuentaId disponible)', true);
 
     const cuentaUI = await page.evaluate(() => window.S?._v9CuentaId ?? null);
-    if (!cuentaUI) throw new Error('_v9CuentaId no disponible en window.S tras login');
-    if (cuentaUI !== CUENTA_ID) {
-      throw new Error(
-        `Discrepancia de cuenta: REST="${CUENTA_ID}" UI="${cuentaUI}".\n` +
-        `  → Fija STAGING_CUENTA_ID=${cuentaUI} en .env.`
-      );
-    }
-    console.log(`  Cuenta REST = Cuenta UI = ${CUENTA_ID} ✓`);
+    if (!cuentaUI) throw new Error('_v9CuentaId no disponible');
+    if (cuentaUI !== CUENTA_ID)
+      throw new Error(`Discrepancia de cuenta: REST="${CUENTA_ID}" UI="${cuentaUI}". Fija STAGING_CUENTA_ID=${cuentaUI}.`);
+    console.log(`  Cuenta REST = UI = ${CUENTA_ID} ✓`);
 
-    // R02-b: V9_RELACIONAL — config.js lo declara como `const` a nivel de script,
-    // por lo que está en window en la mayoría de entornos, pero lo evaluamos
-    // directamente (no como propiedad de window) para coincidir con el scope de los módulos.
+    // R02-b: V9_RELACIONAL es `const` global en config.js (script clásico).
+    // Un `const` a nivel de script clásico NO se convierte en propiedad de window
+    // automáticamente; se lee directamente con `typeof V9_RELACIONAL`.
     const v9Activo = await page.evaluate(() => {
-      try {
-        // Intentar acceder como variable de scope (const declarada en script)
-        // eslint-disable-next-line no-undef
-        return typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL === true;
-      } catch(_) { return false; }
+      try { return typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL === true; }
+      catch(_) { return false; }
     });
-    ok('R02-b: V9_RELACIONAL activo en la app', v9Activo);
+    ok('R02-b: V9_RELACIONAL activo (leído directamente, no vía window)', v9Activo);
     if (!v9Activo) {
-      // Diagnóstico: verificar que las funciones V9 existen aunque la variable
-      // no sea accesible desde el contexto evaluate
-      const tieneExport = await page.evaluate(
-        () => typeof exportarDatosCompletosV9 === 'function'
-      );
-      nota('R02-b diagnóstico', `V9_RELACIONAL no encontrado en scope evaluate; exportarDatosCompletosV9 existe: ${tieneExport}`);
-      nota('R02-b', 'B6 NO se omite por esto — se probará independientemente');
+      nota('R02-b diagnóstico', 'V9_RELACIONAL no visible en scope evaluate de Playwright');
+      nota('R02-b', 'B6 se probará según existencia de cargarUsuariosDesdeSupabase, no de V9_RELACIONAL');
     }
 
-    // Insertar fixtures
-    console.log('\n[Pre] Insertar fixtures propios');
-    await insertarFixtures(jwt, CUENTA_ID, fixtureCreados);
-    console.log(`  Resumen: cursos=${fixtureCreados.cursos.length}, cuotas=${fixtureCreados.cuotas.length}, alumnos=${fixtureCreados.alumnos.length}, planes=${fixtureCreados.planes_pago.length}, abonos=${fixtureCreados.abonos.length}, pagos=${fixtureCreados.pagos.length}, usuarios_ext=${fixtureCreados.usuariosExternos.length}`);
-    if (fixtureCreados.errorPlanPago)
-      nota('Pre', `plan_pago no creado (R04x, R06 planes): ${fixtureCreados.errorPlanPago}`);
-    if (fixtureCreados.errorUsuarioExterno)
-      nota('Pre', `usuario_externo no creado (R11-R12 se bloquearán): ${fixtureCreados.errorUsuarioExterno}`);
+    // Insertar fixtures OBLIGATORIOS — aborta si falla cualquiera
+    console.log('\n[Pre] Insertar fixtures (obligatorios: curso, cuota, 2 alumnos, plan, 2 abonos, pago)');
+    await insertarFixtures(jwt, CUENTA_ID, fc);
+    if (fc.errorUsuarioExterno)
+      nota('Pre', `usuario_externo no creado (R11-R12 se bloquearán): ${fc.errorUsuarioExterno}`);
 
     // ── R03 ───────────────────────────────────────────────────────────────────
     console.log('\n[R03] exportarDatosCompletosV9 → JSON descargado');
@@ -651,112 +594,75 @@ async function existeEnDB(jwt, tabla, id) {
       await download.saveAs(tmpFile);
       capturado = fs.readFileSync(tmpFile, 'utf8');
     } catch (e) {
-      console.error(`  [R03] Error capturando descarga: ${e.message}`);
+      console.error(`  [R03] Error: ${e.message}`);
     } finally {
       if (tmpFile) try { fs.unlinkSync(tmpFile); } catch(_) {}
     }
-
-    ok('R03-a: archivo de respaldo descargado', !!capturado);
+    ok('R03-a: archivo descargado', !!capturado);
 
     if (capturado) {
-      try {
-        respaldoCompleto = JSON.parse(capturado);
-        ok('R03-b: JSON válido', true);
-      } catch (e) {
-        ok('R03-b: JSON válido', false);
-        console.error('  Parse error:', e.message);
-      }
-    } else {
-      ok('R03-b: JSON válido', false);
-    }
+      try { respaldoCompleto = JSON.parse(capturado); ok('R03-b: JSON válido', true); }
+      catch (e) { ok('R03-b: JSON válido', false); console.error('  Parse error:', e.message); }
+    } else { ok('R03-b: JSON válido', false); }
 
     if (respaldoCompleto) {
       ok('R03-c: version = "v9-completo"', respaldoCompleto.version === 'v9-completo');
       ok('R03-d: cuentaId coincide', respaldoCompleto.cuentaId === CUENTA_ID);
-      ok('R03-e: campo "colecciones" presente',
-        typeof respaldoCompleto.colecciones === 'object' && respaldoCompleto.colecciones !== null);
-
       const COLS_ESPERADAS = [
         'cursos','alumnos','apoderados','cuotas','planes_pago','abonos',
-        'pagos','movimientos','fondo_movimientos','actividades',
-        'notas','codigos_invitacion','config_cuenta',
+        'pagos','movimientos','fondo_movimientos','actividades','notas','codigos_invitacion','config_cuenta',
       ];
-      let todasPresentes = true;
-      for (const col of COLS_ESPERADAS) {
-        if (!Array.isArray(respaldoCompleto.colecciones[col])) {
-          console.error(`  [R03-f] colección ausente: "${col}"`);
-          todasPresentes = false;
-        }
-      }
-      ok('R03-f: todas las colecciones esperadas', todasPresentes);
+      ok('R03-e: todas las colecciones presentes',
+        COLS_ESPERADAS.every(c => Array.isArray(respaldoCompleto.colecciones?.[c])));
 
-      respaldoFixture = construirRespaldoFixture(CUENTA_ID, fixtureCreados, respaldoCompleto);
+      respaldoFixture = construirRespaldoFixture(CUENTA_ID, fc, respaldoCompleto);
       const nFix = Object.values(respaldoFixture.colecciones)
         .reduce((s, a) => s + (Array.isArray(a) ? a.length : 0), 0);
       console.log(`  respaldoFixture: ${nFix} registros totales`);
     }
 
     // ── R04 ───────────────────────────────────────────────────────────────────
-    console.log('\n[R04] Fixtures propios aparecen en el respaldo (IDs exactos)');
+    console.log('\n[R04] Todos los IDs fixture en el respaldo');
     if (!respaldoCompleto) {
       skip('R04', 'R03 no obtuvo JSON');
     } else {
       const cols = respaldoCompleto.colecciones || {};
-      ok('R04-a: curso fixture en respaldo',
-        fixtureCreados.cursos.every(id => (cols.cursos||[]).some(c => c.id === id)));
-      ok('R04-b: cuota fixture en respaldo',
-        fixtureCreados.cuotas.every(id => (cols.cuotas||[]).some(c => c.id === id)));
-      ok('R04-c: alumnos fixture en respaldo',
-        fixtureCreados.alumnos.every(id => (cols.alumnos||[]).some(a => a.id === id)));
-      ok('R04-d: pago fixture en respaldo',
-        fixtureCreados.pagos.every(id => (cols.pagos||[]).some(p => p.id === id)));
+      ok('R04-a: cursos',       fc.cursos     .every(id => (cols.cursos     ||[]).some(r => r.id === id)));
+      ok('R04-b: cuotas',       fc.cuotas     .every(id => (cols.cuotas     ||[]).some(r => r.id === id)));
+      ok('R04-c: alumnos',      fc.alumnos    .every(id => (cols.alumnos    ||[]).some(r => r.id === id)));
+      ok('R04-d: planes_pago',  fc.planes_pago.every(id => (cols.planes_pago||[]).some(r => r.id === id)));
+      ok('R04-e: abonos',       fc.abonos     .every(id => (cols.abonos     ||[]).some(r => r.id === id)));
+      ok('R04-f: pagos',        fc.pagos      .every(id => (cols.pagos      ||[]).some(r => r.id === id)));
 
-      if (fixtureCreados.planes_pago.length > 0) {
-        ok('R04-e: plan_pago fixture en respaldo',
-          fixtureCreados.planes_pago.every(id => (cols.planes_pago||[]).some(p => p.id === id)));
-        if (fixtureCreados.abonos.length > 0) {
-          ok('R04-f: abonos fixture en respaldo',
-            fixtureCreados.abonos.every(id => (cols.abonos||[]).some(a => a.id === id)));
-        }
-
-        // R04x: formato de exportación de planes_pago
-        const planEnRespaldo = (cols.planes_pago||[]).find(p => p.id === fixtureCreados.planes_pago[0]);
-        if (planEnRespaldo) {
-          const tieneSnake  = 'cuenta_id'  in planEnRespaldo;
-          const tieneCamel  = 'cuentaId'   in planEnRespaldo;
-          const tieneMonto  = 'monto_total' in planEnRespaldo || 'montoTotal' in planEnRespaldo;
-          nota('R04x formato plan_pago',
-            `snake_case=${tieneSnake}, camelCase=${tieneCamel}, monto presente=${tieneMonto}`);
-          nota('R04x campos plan_pago', Object.keys(planEnRespaldo).join(', '));
-          if (tieneCamel && !tieneSnake) {
-            nota('R04x', 'plan_pago exportado en camelCase → la normalización en _b5UpsertColeccion lo convierte al importar');
-          }
-          ok('R04x: plan_pago tiene id y alguna forma de cuenta', !!(planEnRespaldo.id && (tieneSnake || tieneCamel)));
-        } else {
-          nota('R04x', 'plan_pago fixture no encontrado en respaldo para inspección de formato');
-        }
+      // R04x: inspeccionar formato de planes_pago en el respaldo
+      const planEnRespaldo = (cols.planes_pago||[]).find(p => p.id === fc.planes_pago[0]);
+      if (planEnRespaldo) {
+        const tieneSnake = 'cuenta_id'   in planEnRespaldo;
+        const tieneCamel = 'cuentaId'    in planEnRespaldo;
+        const tieneMonto = 'monto_total' in planEnRespaldo || 'montoTotal' in planEnRespaldo;
+        nota('R04x formato plan_pago',
+          `snake=${tieneSnake} camel=${tieneCamel} monto=${tieneMonto} campos=[${Object.keys(planEnRespaldo).join(',')}]`);
+        ok('R04x: plan_pago tiene id y alguna forma de cuenta_id en el respaldo',
+          !!(planEnRespaldo.id && (tieneSnake || tieneCamel)));
       } else {
-        nota('R04-e', 'plan_pago no creado como fixture (error en inserción)');
+        nota('R04x', 'plan_pago fixture no encontrado en respaldo para inspección');
       }
 
-      const alumnosFixture = (cols.alumnos||[]).filter(a => fixtureCreados.alumnos.includes(a.id));
+      const alumnosFix = (cols.alumnos||[]).filter(a => fc.alumnos.includes(a.id));
       ok('R04-g: alumnos fixture tienen cuenta_id correcto',
-        alumnosFixture.length > 0 && alumnosFixture.every(a => a.cuenta_id === CUENTA_ID));
+        alumnosFix.every(a => a.cuenta_id === CUENTA_ID));
     }
 
     // ── R05 ───────────────────────────────────────────────────────────────────
-    console.log('\n[R05] Límite de paginación (1000 filas)');
+    console.log('\n[R05] Límite de paginación');
     if (!respaldoCompleto) {
       skip('R05', 'R03 no obtuvo JSON');
     } else {
-      const cols = respaldoCompleto.colecciones || {};
       let algunaAlLimite = false;
-      for (const [nombre, arr] of Object.entries(cols)) {
+      for (const [nombre, arr] of Object.entries(respaldoCompleto.colecciones || {})) {
         if (Array.isArray(arr) && arr.length >= 1000) {
           console.error(`  ⚠️  "${nombre}" tiene ${arr.length} registros — posible truncación`);
           algunaAlLimite = true;
-        } else if (Array.isArray(arr) && arr.length >= 900) {
-          console.warn(`  ⚠️  "${nombre}" tiene ${arr.length} registros (cerca del límite 1000)`);
         }
       }
       ok('R05: ninguna colección alcanza 1000 filas en staging', !algunaAlLimite);
@@ -764,14 +670,14 @@ async function existeEnDB(jwt, tabla, id) {
     }
 
     // ── R06 ───────────────────────────────────────────────────────────────────
-    console.log('\n[R06] Eliminar fixture → importar respaldo-fixture → GET por ID exacto');
-    if (!respaldoFixture || fixtureCreados.alumnos.length === 0) {
-      skip('R06', 'requiere respaldoFixture y fixtures creados');
+    console.log('\n[R06] Eliminar fixture → importar respaldo-fixture → restauración completa');
+    if (!respaldoFixture) {
+      skip('R06', 'requiere respaldoFixture');
       skip('R07', 'requiere R06');
     } else {
-      // Crear brecha: eliminar alumnos, pagos, abonos y planes_pago fixture
+      // Crear brecha: eliminar en orden FK-safe inverso
       let errorEliminar = null;
-      const eliminarBrecha = async (tabla, ids) => {
+      const delBrecha = async (tabla, ids) => {
         for (const id of ids) {
           if (errorEliminar) return;
           const r = await supaAuth(
@@ -781,22 +687,23 @@ async function existeEnDB(jwt, tabla, id) {
           if (r.status >= 300) errorEliminar = `${tabla} ${id.slice(0,8)} HTTP ${r.status}`;
         }
       };
-      await eliminarBrecha('abonos',     fixtureCreados.abonos);
-      await eliminarBrecha('planes_pago', fixtureCreados.planes_pago);
-      await eliminarBrecha('pagos',       fixtureCreados.pagos);
-      await eliminarBrecha('alumnos',     fixtureCreados.alumnos);
+      await delBrecha('abonos',      fc.abonos);
+      await delBrecha('planes_pago', fc.planes_pago);
+      await delBrecha('pagos',       fc.pagos);
+      await delBrecha('alumnos',     fc.alumnos);
 
       if (errorEliminar) {
-        ok('R06-a: fixture eliminado para crear brecha', false);
+        ok('R06-a: brecha creada',  false);
         console.error(`  Error en eliminación: ${errorEliminar}`);
         skip('R06-b/c/d', 'eliminación previa falló');
         skip('R07', 'requiere R06 exitoso');
       } else {
         ok('R06-a: fixture eliminado (brecha creada)', true);
 
-        for (const id of fixtureCreados.alumnos) {
+        // Verificar ausencia de alumnos antes de importar
+        for (const id of fc.alumnos) {
           const existe = await existeEnDB(jwt, 'alumnos', id);
-          ok(`R06-b: alumno fixture ${id.slice(0,8)}… ausente en DB antes de importar`, !existe);
+          ok(`R06-b: alumno ${id.slice(0,8)}… ausente antes de importar`, !existe);
         }
 
         console.log('  Importando respaldo-fixture…');
@@ -805,37 +712,27 @@ async function existeEnDB(jwt, tabla, id) {
         const msgImport = await dispararImportacion(page, respaldoFixture);
         console.log(`  Mensaje UI: ${msgImport || '(vacío/timeout)'}`);
 
-        // Verificar restauración exacta por GET individual
-        let alumnosRestaurados = 0;
-        for (const id of fixtureCreados.alumnos) {
-          const existe = await existeEnDB(jwt, 'alumnos', id);
-          ok(`R06-c: alumno fixture ${id.slice(0,8)}… restaurado (GET por ID)`, existe);
-          if (existe) alumnosRestaurados++;
-        }
-        let pagosRestaurados = 0;
-        for (const id of fixtureCreados.pagos) {
-          const existe = await existeEnDB(jwt, 'pagos', id);
-          ok(`R06-d: pago fixture ${id.slice(0,8)}… restaurado (GET por ID)`, existe);
-          if (existe) pagosRestaurados++;
-        }
-        // planes_pago y abonos si existen en fixture
-        for (const id of fixtureCreados.planes_pago) {
-          const existe = await existeEnDB(jwt, 'planes_pago', id);
-          ok(`R06-e: plan_pago fixture ${id.slice(0,8)}… restaurado`, existe);
-        }
-        for (const id of fixtureCreados.abonos) {
-          const existe = await existeEnDB(jwt, 'abonos', id);
-          ok(`R06-f: abono fixture ${id.slice(0,8)}… restaurado`, existe);
+        // Verificar restauración exacta por GET individual (todos los IDs)
+        let todosPresentes = true;
+        for (const [tabla, ids] of [
+          ['alumnos',    fc.alumnos],
+          ['pagos',      fc.pagos],
+          ['planes_pago',fc.planes_pago],
+          ['abonos',     fc.abonos],
+        ]) {
+          for (const id of ids) {
+            const existe = await existeEnDB(jwt, tabla, id);
+            ok(`R06-c: ${tabla} fixture ${id.slice(0,8)}… restaurado (GET por ID)`, existe);
+            if (!existe) todosPresentes = false;
+          }
         }
 
-        const restauracionCompleta =
-          alumnosRestaurados === fixtureCreados.alumnos.length &&
-          pagosRestaurados   === fixtureCreados.pagos.length;
-        ok('R06-g: restauración completa (todos los IDs presentes)', restauracionCompleta);
-
-        const msgTerminal = msgImport &&
-          (msgImport.startsWith('✅') || msgImport.startsWith('⚠️') || msgImport.startsWith('❌'));
-        ok('R06-h: UI mostró mensaje terminal (no vacío, no ⏳)', msgTerminal);
+        // R06 aprueba SOLO con ✅ en el mensaje Y todos los IDs presentes
+        const msgEsExito = !!(msgImport && msgImport.startsWith('✅'));
+        ok('R06-d: restauración completa — todos los IDs presentes', todosPresentes);
+        ok('R06-e: UI muestra ✅ (no solo cualquier mensaje terminal)', msgEsExito);
+        if (!msgEsExito && msgImport)
+          nota('R06-e', `mensaje real: "${msgImport.slice(0, 100)}"`);
 
         // ── R07 ──────────────────────────────────────────────────────────────
         console.log('\n[R07] Importar mismo respaldo-fixture segunda vez → idempotente');
@@ -846,13 +743,13 @@ async function existeEnDB(jwt, tabla, id) {
           const r = await supaAuth(`/rest/v1/${tabla}?or=(${filter})&select=id`, jwt);
           return (r.status === 200 && Array.isArray(r.body)) ? r.body.length : null;
         };
-
         const countAntes = {
-          alumnos:    await contarPorIds('alumnos',    fixtureCreados.alumnos),
-          pagos:      await contarPorIds('pagos',      fixtureCreados.pagos),
-          planes_pago:await contarPorIds('planes_pago',fixtureCreados.planes_pago),
+          alumnos:     await contarPorIds('alumnos',     fc.alumnos),
+          pagos:       await contarPorIds('pagos',       fc.pagos),
+          planes_pago: await contarPorIds('planes_pago', fc.planes_pago),
+          abonos:      await contarPorIds('abonos',      fc.abonos),
         };
-        console.log(`  Antes: alumnos=${countAntes.alumnos}, pagos=${countAntes.pagos}, planes=${countAntes.planes_pago}`);
+        console.log(`  Antes: alumnos=${countAntes.alumnos} pagos=${countAntes.pagos} planes=${countAntes.planes_pago} abonos=${countAntes.abonos}`);
 
         dialogState.ultimoDialog = null;
         await navegarConfig(page);
@@ -860,217 +757,178 @@ async function existeEnDB(jwt, tabla, id) {
         console.log(`  Mensaje 2ª importación: ${msgImport2 || '(vacío/timeout)'}`);
 
         const countDespues = {
-          alumnos:    await contarPorIds('alumnos',    fixtureCreados.alumnos),
-          pagos:      await contarPorIds('pagos',      fixtureCreados.pagos),
-          planes_pago:await contarPorIds('planes_pago',fixtureCreados.planes_pago),
+          alumnos:     await contarPorIds('alumnos',     fc.alumnos),
+          pagos:       await contarPorIds('pagos',       fc.pagos),
+          planes_pago: await contarPorIds('planes_pago', fc.planes_pago),
+          abonos:      await contarPorIds('abonos',      fc.abonos),
         };
-        console.log(`  Después: alumnos=${countDespues.alumnos}, pagos=${countDespues.pagos}, planes=${countDespues.planes_pago}`);
+        console.log(`  Después: alumnos=${countDespues.alumnos} pagos=${countDespues.pagos} planes=${countDespues.planes_pago} abonos=${countDespues.abonos}`);
 
-        ok('R07-a: alumnos no se duplican', countAntes.alumnos !== null && countDespues.alumnos === countAntes.alumnos);
-        ok('R07-b: pagos no se duplican',   countAntes.pagos   !== null && countDespues.pagos   === countAntes.pagos);
-        if (fixtureCreados.planes_pago.length > 0)
-          ok('R07-c: planes_pago no se duplican', countAntes.planes_pago !== null && countDespues.planes_pago === countAntes.planes_pago);
-
-        for (const id of fixtureCreados.alumnos) {
-          const existe = await existeEnDB(jwt, 'alumnos', id);
-          ok(`R07-d: alumno fixture ${id.slice(0,8)}… existe tras 2ª importación`, existe);
-        }
-
-        const msgTerminal2 = msgImport2 &&
-          (msgImport2.startsWith('✅') || msgImport2.startsWith('⚠️') || msgImport2.startsWith('❌'));
-        ok('R07-e: UI mostró mensaje terminal en 2ª importación', msgTerminal2);
+        ok('R07-a: alumnos no duplicados',    countAntes.alumnos     !== null && countDespues.alumnos     === countAntes.alumnos);
+        ok('R07-b: pagos no duplicados',      countAntes.pagos       !== null && countDespues.pagos       === countAntes.pagos);
+        ok('R07-c: planes_pago no duplicados',countAntes.planes_pago !== null && countDespues.planes_pago === countAntes.planes_pago);
+        ok('R07-d: abonos no duplicados',     countAntes.abonos      !== null && countDespues.abonos      === countAntes.abonos);
+        ok('R07-e: UI muestra ✅ en 2ª importación', !!(msgImport2 && msgImport2.startsWith('✅')));
       }
     }
 
     // ── R08 ───────────────────────────────────────────────────────────────────
-    console.log('\n[R08] Importar con cuentaId ajeno en encabezado → rechazado');
-    if (!respaldoFixture) {
-      skip('R08', 'requiere respaldoFixture');
-    } else {
+    console.log('\n[R08] cuentaId ajeno en encabezado → rechazado');
+    if (!respaldoFixture) { skip('R08', 'requiere respaldoFixture'); } else {
       const backupAjeno = JSON.parse(JSON.stringify(respaldoFixture));
       backupAjeno.cuentaId = 'cuenta-ajena-00000000-0000-0000-0000-000000000000';
-
       dialogState.ultimoDialog = null;
       await navegarConfig(page);
       const msgAjeno = await dispararImportacion(page, backupAjeno);
-      console.log(`  Mensaje UI: ${msgAjeno || '(vacío/timeout)'}`);
-
-      const rechazadoEnMsg = msgAjeno &&
-        (msgAjeno.includes('otra cuenta') || msgAjeno.includes('ajeno') ||
-         msgAjeno.includes('cuentaId') || msgAjeno.startsWith('❌'));
-      ok('R08-a: cuentaId ajeno es rechazado', rechazadoEnMsg || !!dialogState.ultimoDialog?.message);
-      ok('R08-b: rechazo aparece en DOM', rechazadoEnMsg);
+      console.log(`  Mensaje: ${msgAjeno || '(vacío/timeout)'}`);
+      const rechazado = !!(msgAjeno && (msgAjeno.includes('otra cuenta') || msgAjeno.includes('ajeno') || msgAjeno.startsWith('❌')));
+      ok('R08-a: cuentaId ajeno rechazado', rechazado || !!dialogState.ultimoDialog?.message);
+      ok('R08-b: rechazo en DOM', rechazado);
     }
 
     // ── R09 ───────────────────────────────────────────────────────────────────
-    console.log('\n[R09] Registro con cuenta_id ajeno → guardia por-registro cancela antes de escribir');
-    if (!respaldoFixture) {
-      skip('R09', 'requiere respaldoFixture');
-    } else {
-      const backupCuentaAjena = JSON.parse(JSON.stringify(respaldoFixture));
-      backupCuentaAjena.colecciones.alumnos.push({
-        id:        crypto.randomUUID(),
-        cuenta_id: 'cuenta-ajena-99999999-0000-0000-0000-000000000000',
-        curso_id:  fixtureCreados.cursos[0],
-        nombres:   'CorruptoR09',
-        apellidos: EXEC_ID,
-        estado:    'activo',
+    console.log('\n[R09] registro snake_case con cuenta_id ajeno → guardia por-registro');
+    if (!respaldoFixture) { skip('R09', 'requiere respaldoFixture'); } else {
+      const backupAjeno9 = JSON.parse(JSON.stringify(respaldoFixture));
+      backupAjeno9.colecciones.alumnos.push({
+        id: crypto.randomUUID(), cuenta_id: 'cuenta-ajena-99999999-0000-0000-0000-000000000000',
+        curso_id: fc.cursos[0], nombres: 'CorruptoR09', apellidos: EXEC_ID, estado: 'activo',
       });
-
       dialogState.ultimoDialog = null;
       await navegarConfig(page);
-      const msgCuentaAjena = await dispararImportacion(page, backupCuentaAjena);
-      console.log(`  Mensaje UI: ${msgCuentaAjena || '(vacío/timeout)'}`);
-
-      const rechazado = msgCuentaAjena &&
-        (msgCuentaAjena.includes('cuenta_id ajeno') || msgCuentaAjena.includes('ajeno') ||
-         msgCuentaAjena.includes('cancelada') || msgCuentaAjena.startsWith('❌'));
-      ok('R09-a: registro ajeno cancela importación', rechazado);
-      ok('R09-b: rechazo visible en DOM', rechazado);
-
+      const msg9 = await dispararImportacion(page, backupAjeno9);
+      console.log(`  Mensaje: ${msg9 || '(vacío/timeout)'}`);
+      const rechazado9 = !!(msg9 && (msg9.includes('ajeno') || msg9.includes('cancelada') || msg9.startsWith('❌')));
+      ok('R09-a: registro ajeno cancela importación', rechazado9);
+      ok('R09-b: rechazo en DOM antes de cualquier escritura', rechazado9);
       const rCorrupto = await supaAuth(
-        `/rest/v1/alumnos?apellidos=eq.${encodeURIComponent(EXEC_ID)}&nombres=eq.CorruptoR09&select=id`,
-        jwt
+        `/rest/v1/alumnos?apellidos=eq.${encodeURIComponent(EXEC_ID)}&nombres=eq.CorruptoR09&select=id`, jwt
       );
-      const escritoAjeno = rCorrupto.status === 200 &&
-                           Array.isArray(rCorrupto.body) && rCorrupto.body.length > 0;
-      ok('R09-c: registro ajeno NO fue escrito en DB', !escritoAjeno);
+      ok('R09-c: CorruptoR09 NO escrito en DB', rCorrupto.status === 200 && Array.isArray(rCorrupto.body) && rCorrupto.body.length === 0);
+    }
+
+    // ── R09b: plan camelCase de otra cuenta → normalización + guardia → cero escrituras ─
+    console.log('\n[R09b] plan camelCase con cuentaId ajeno → guardia post-normalización → cero escrituras');
+    if (!respaldoFixture) { skip('R09b', 'requiere respaldoFixture'); } else {
+      const ajenoId = crypto.randomUUID();
+      const backupCamelAjeno = JSON.parse(JSON.stringify(respaldoFixture));
+      // Añadir plan con cuentaId camelCase ajeno (como lo exportaría _mapPlanPago)
+      backupCamelAjeno.colecciones.planes_pago.push({
+        id:         ajenoId,
+        cuentaId:   'cuenta-ajena-camel-0000-0000-000000000000',   // ← camelCase ajeno
+        alumnoId:   fc.alumnos[0],
+        cuotaId:    fc.cuotas[0],
+        montoTotal: 1,
+        activo:     true,
+        periodo:    `R09b-${EXEC_ID}`,
+      });
+      dialogState.ultimoDialog = null;
+      await navegarConfig(page);
+      const msg9b = await dispararImportacion(page, backupCamelAjeno);
+      console.log(`  Mensaje: ${msg9b || '(vacío/timeout)'}`);
+      const rechazado9b = !!(msg9b && (msg9b.includes('ajeno') || msg9b.includes('cancelada') || msg9b.startsWith('❌')));
+      ok('R09b-a: plan camelCase ajeno rechazado (guardia post-normalización)', rechazado9b);
+      // Verificar cero escrituras: el plan ajeno no llegó a DB
+      const rPlanAjeno = await supaAuth(`/rest/v1/planes_pago?id=eq.${encodeURIComponent(ajenoId)}&select=id`, jwt);
+      ok('R09b-b: plan ajeno NO escrito en DB (cero escrituras en toda la importación)',
+        rPlanAjeno.status === 200 && Array.isArray(rPlanAjeno.body) && rPlanAjeno.body.length === 0);
     }
 
     // ── R10 ───────────────────────────────────────────────────────────────────
-    console.log('\n[R10] FK inválida → mensaje terminal de error en UI');
-    console.log('  NOTA: Cada POST es transacción independiente. Un chunk anterior ya confirmado no revierte.');
-    if (!respaldoFixture) {
-      skip('R10', 'requiere respaldoFixture');
-    } else {
-      const backupFKInvalida = JSON.parse(JSON.stringify(respaldoFixture));
-      const cursoFalsoId = crypto.randomUUID();
-      backupFKInvalida.colecciones.alumnos.push({
-        id:        crypto.randomUUID(),
-        cuenta_id: CUENTA_ID,
-        curso_id:  cursoFalsoId,       // FK a curso inexistente
-        nombres:   'FKInvalidaR10',
-        apellidos: EXEC_ID,
-        estado:    'activo',
+    console.log('\n[R10] FK inválida → mensaje terminal ⚠️/❌ en UI');
+    if (!respaldoFixture) { skip('R10', 'requiere respaldoFixture'); } else {
+      const backupFK = JSON.parse(JSON.stringify(respaldoFixture));
+      backupFK.colecciones.alumnos.push({
+        id: crypto.randomUUID(), cuenta_id: CUENTA_ID,
+        curso_id: crypto.randomUUID(),   // FK a curso inexistente
+        nombres: 'FKInvalidaR10', apellidos: EXEC_ID, estado: 'activo',
       });
-
       dialogState.ultimoDialog = null;
       await navegarConfig(page);
-      const msgFK = await dispararImportacion(page, backupFKInvalida);
-      console.log(`  Mensaje UI: ${msgFK || '(vacío/timeout)'}`);
-
-      // Exigir mensaje terminal no vacío
-      const tieneTerminal = !!(msgFK && msgFK.length > 0 && !msgFK.startsWith('⏳'));
-      ok('R10-a: UI muestra mensaje terminal (no vacío, no ⏳)', tieneTerminal);
-
-      const anuncia_completa = msgFK && msgFK.startsWith('✅') && !msgFK.includes('⚠️');
-      const reporta_error    = msgFK && (msgFK.startsWith('⚠️') || msgFK.startsWith('❌'));
-      ok('R10-b: error de FK reportado en UI (⚠️ o ❌)', reporta_error);
-      ok('R10-c: UI NO anuncia restauración completa cuando hay FK inválida', !anuncia_completa);
-
+      const msgFK = await dispararImportacion(page, backupFK);
+      console.log(`  Mensaje: ${msgFK || '(vacío/timeout)'}`);
+      ok('R10-a: UI muestra mensaje terminal no vacío y no ⏳',
+        !!(msgFK && msgFK.length > 0 && !msgFK.startsWith('⏳')));
+      ok('R10-b: mensaje es ⚠️ o ❌ (error reportado)',
+        !!(msgFK && (msgFK.startsWith('⚠️') || msgFK.startsWith('❌'))));
+      ok('R10-c: UI NO anuncia ✅ restauración completa con FK inválida',
+        !(msgFK && msgFK.startsWith('✅')));
       nota('R10-d comportamiento de chunks',
-        'Si la FK inválida está en un chunk posterior a registros válidos, los anteriores ya confirmados no revierten.');
+        'La transacción es por chunk (100 filas); chunks anteriores a la FK inválida ya confirmados no revierten.');
     }
 
     // ── R11 ───────────────────────────────────────────────────────────────────
     console.log('\n[R11] B6: cargarUsuariosDesdeSupabase popula DB.usuariosExternos');
-    // No omitir B6 por V9_RELACIONAL — probar independientemente si las funciones existen
     const tieneB6 = await page.evaluate(() => typeof cargarUsuariosDesdeSupabase === 'function');
     if (!tieneB6) {
       skip('R11', 'cargarUsuariosDesdeSupabase no disponible en la app');
       skip('R12', 'requiere cargarUsuariosDesdeSupabase');
-    } else if (fixtureCreados.usuariosExternos.length === 0) {
-      skip('R11', `usuario_externo fixture no creado: ${fixtureCreados.errorUsuarioExterno || 'error'}`);
+    } else if (fc.usuariosExternos.length === 0) {
+      skip('R11', `usuario_externo fixture no creado: ${fc.errorUsuarioExterno || 'error desconocido'}`);
       skip('R12', 'requiere fixture usuario_externo creado');
     } else {
       await page.evaluate(() => { if (typeof go === 'function') go('config'); });
       await page.waitForTimeout(500);
-
       await page.evaluate(async () => {
-        if (typeof cargarUsuariosDesdeSupabase === 'function')
-          await cargarUsuariosDesdeSupabase(true);
+        if (typeof cargarUsuariosDesdeSupabase === 'function') await cargarUsuariosDesdeSupabase(true);
       });
       await page.waitForTimeout(2000);
 
-      // Acceder al binding real de DB, no window.DB
-      // (DB declarado con `let` puede no estar en window en algunos entornos)
+      // Leer DB directamente (binding `let`, no window.DB)
       const ueEnDB = await page.evaluate(() => {
-        try {
-          // DB está en scope del módulo; en V9 debe ser un array tras carga
-          if (typeof DB === 'undefined') return -1;
-          return Array.isArray(DB.usuariosExternos) ? DB.usuariosExternos.length : -2;
-        } catch(e) { return -3; }
+        try { return typeof DB === 'undefined' ? -1 : (Array.isArray(DB.usuariosExternos) ? DB.usuariosExternos.length : -2); }
+        catch(e) { return -3; }
       });
       console.log(`  DB.usuariosExternos.length = ${ueEnDB}`);
-      ok('R11-a: DB.usuariosExternos es array tras cargarUsuariosDesdeSupabase', ueEnDB >= 0);
+      ok('R11-a: DB.usuariosExternos es array', ueEnDB >= 0);
 
-      const idFixtureUser = fixtureCreados.usuariosExternos[0];
+      const idFU = fc.usuariosExternos[0];
       const encontrado = await page.evaluate((id) => {
-        try {
-          if (typeof DB === 'undefined' || !Array.isArray(DB.usuariosExternos)) return false;
-          return DB.usuariosExternos.some(u => u.id === id);
-        } catch(e) { return false; }
-      }, idFixtureUser);
-      ok(`R11-b: usuario externo fixture ${idFixtureUser.slice(0,8)}… en DB.usuariosExternos`, encontrado);
+        try { return typeof DB !== 'undefined' && Array.isArray(DB.usuariosExternos) && DB.usuariosExternos.some(u => u.id === id); }
+        catch(e) { return false; }
+      }, idFU);
+      ok(`R11-b: fixture ${idFU.slice(0,8)}… en DB.usuariosExternos`, encontrado);
 
       if (encontrado) {
         const v9Tabla = await page.evaluate((id) => {
-          try {
-            const u = DB.usuariosExternos?.find(u => u.id === id);
-            return u ? (u._v9Tabla || null) : null;
-          } catch(e) { return null; }
-        }, idFixtureUser);
-        ok('R11-c: usuario externo fixture tiene _v9Tabla', !!v9Tabla);
-        ok('R11-d: _v9Tabla es "usuarios_externos"', v9Tabla === 'usuarios_externos');
-        console.log(`  _v9Tabla: ${v9Tabla}`);
+          try { const u = DB.usuariosExternos?.find(u => u.id === id); return u ? (u._v9Tabla || null) : null; }
+          catch(e) { return null; }
+        }, idFU);
+        ok('R11-c: _v9Tabla presente', !!v9Tabla);
+        ok('R11-d: _v9Tabla = "usuarios_externos"', v9Tabla === 'usuarios_externos');
       }
 
       // ── R12 ──────────────────────────────────────────────────────────────
       console.log('\n[R12] B6: toggleUsuarioAdmin hace PATCH en la tabla V9 correcta');
       if (!encontrado) {
-        skip('R12', 'fixture no aparece en DB.usuariosExternos');
+        skip('R12', 'fixture no en DB.usuariosExternos');
       } else {
-        const idFixtureUser = fixtureCreados.usuariosExternos[0];
         const rAntes = await supaAuth(
-          `/rest/v1/usuarios_externos?id=eq.${encodeURIComponent(idFixtureUser)}&select=id,desactivado`,
-          jwt
+          `/rest/v1/usuarios_externos?id=eq.${encodeURIComponent(idFU)}&select=id,desactivado`, jwt
         );
-        ok('R12-a: GET estado inicial HTTP 200 + array',
-          rAntes.status === 200 && Array.isArray(rAntes.body));
-
-        const desactivadoAntes = rAntes.body?.[0]?.desactivado ?? null;
-        console.log(`  Estado inicial desactivado=${desactivadoAntes}`);
+        ok('R12-a: GET estado inicial HTTP 200 + array', rAntes.status === 200 && Array.isArray(rAntes.body));
+        const desActivAntes = rAntes.body?.[0]?.desactivado ?? null;
+        console.log(`  Estado inicial desactivado=${desActivAntes}`);
 
         const toggleOk = await page.evaluate(async (uid) => {
-          try {
-            if (typeof toggleUsuarioAdmin !== 'function') return false;
-            await toggleUsuarioAdmin(uid);
-            return true;
-          } catch(e) {
-            console.error('[R12] toggleUsuarioAdmin error:', e.message);
-            return false;
-          }
-        }, idFixtureUser);
-        ok('R12-b: toggleUsuarioAdmin ejecutado sin excepción', toggleOk);
+          try { if (typeof toggleUsuarioAdmin !== 'function') return false; await toggleUsuarioAdmin(uid); return true; }
+          catch(e) { console.error('[R12]', e.message); return false; }
+        }, idFU);
+        ok('R12-b: toggleUsuarioAdmin sin excepción', toggleOk);
 
         await page.waitForTimeout(1500);
-
         const rDespues = await supaAuth(
-          `/rest/v1/usuarios_externos?id=eq.${encodeURIComponent(idFixtureUser)}&select=id,desactivado`,
-          jwt
+          `/rest/v1/usuarios_externos?id=eq.${encodeURIComponent(idFU)}&select=id,desactivado`, jwt
         );
-        ok('R12-c: GET estado posterior HTTP 200 + array',
-          rDespues.status === 200 && Array.isArray(rDespues.body));
+        ok('R12-c: GET posterior HTTP 200 + array', rDespues.status === 200 && Array.isArray(rDespues.body));
+        const desActivDespues = rDespues.body?.[0]?.desactivado ?? null;
+        console.log(`  Estado después desactivado=${desActivDespues}`);
+        ok('R12-d: desactivado cambió en DB (PATCH V9 efectivo)', desActivDespues !== null && desActivDespues !== desActivAntes);
 
-        const desactivadoDespues = rDespues.body?.[0]?.desactivado ?? null;
-        console.log(`  Estado después desactivado=${desactivadoDespues}`);
-        ok('R12-d: estado desactivado cambió en DB (PATCH V9 efectivo)',
-          desactivadoDespues !== null && desactivadoDespues !== desactivadoAntes);
-
-        if (desactivadoDespues !== desactivadoAntes) {
+        if (desActivDespues !== desActivAntes) {
           await supaAuth(
-            `/rest/v1/usuarios_externos?id=eq.${encodeURIComponent(idFixtureUser)}&cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}`,
-            jwt, { method: 'PATCH', body: { desactivado: desactivadoAntes }, prefer: 'return=minimal' }
+            `/rest/v1/usuarios_externos?id=eq.${encodeURIComponent(idFU)}&cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}`,
+            jwt, { method: 'PATCH', body: { desactivado: desActivAntes }, prefer: 'return=minimal' }
           );
           console.log('  Toggle revertido ✓');
         }
@@ -1084,45 +942,26 @@ async function existeEnDB(jwt, tabla, id) {
   } finally {
     if (browser) await browser.close().catch(() => {});
     if (server)  server.close();
-
-    const totalFixtures = [
-      ...fixtureCreados.cursos, ...fixtureCreados.cuotas,
-      ...fixtureCreados.alumnos, ...fixtureCreados.planes_pago,
-      ...fixtureCreados.abonos, ...fixtureCreados.pagos,
-      ...fixtureCreados.usuariosExternos,
-    ].length;
-
-    if (jwt && CUENTA_ID && totalFixtures > 0) {
-      console.log(`\n[R13/finally] Eliminar todos los fixtures (${totalFixtures} registros)`);
-      fallosCleanup = await eliminarFixtures(jwt, CUENTA_ID, fixtureCreados).catch(e => {
-        console.error('  [finally] eliminarFixtures excepción:', e.message);
-        return 99;
+    const totalFix = [...fc.cursos,...fc.cuotas,...fc.alumnos,...fc.planes_pago,...fc.abonos,...fc.pagos,...fc.usuariosExternos].length;
+    if (jwt && CUENTA_ID && totalFix > 0) {
+      console.log(`\n[R13/finally] Eliminar ${totalFix} fixtures`);
+      fallosCleanup = await eliminarFixtures(jwt, CUENTA_ID, fc).catch(e => {
+        console.error('  [finally] eliminarFixtures:', e.message); return 99;
       });
     }
   }
 
-  // R13 siempre se evalúa
-  const totalFixtures = [
-    ...fixtureCreados.cursos, ...fixtureCreados.cuotas,
-    ...fixtureCreados.alumnos, ...fixtureCreados.planes_pago,
-    ...fixtureCreados.abonos, ...fixtureCreados.pagos,
-    ...fixtureCreados.usuariosExternos,
-  ].length;
-  if (totalFixtures > 0)
-    ok(`R13: limpieza completa (${totalFixtures} fixtures, ${fallosCleanup} fallos)`, fallosCleanup === 0);
+  // R13
+  const totalFix = [...fc.cursos,...fc.cuotas,...fc.alumnos,...fc.planes_pago,...fc.abonos,...fc.pagos,...fc.usuariosExternos].length;
+  if (totalFix > 0)
+    ok(`R13: limpieza completa (${totalFix} fixtures, ${fallosCleanup} fallos)`, fallosCleanup === 0);
 
   // ── Resumen ───────────────────────────────────────────────────────────────
   console.log(`\n${'─'.repeat(60)}`);
   console.log(`📊 E13: ${pass} ✅  ${fail} ❌  ${blocked} ⏭ (bloqueados)`);
-  if (blockedList.length) {
-    console.log('\nBloqueados:');
-    blockedList.forEach(f => console.log('  •', f));
-  }
-  if (failures.length) {
-    console.log('\nFallas:');
-    failures.forEach(f => console.log('  •', f));
-  }
-  console.log('\nPendientes conocidos (fuera de esta suite):');
+  if (blockedList.length) { console.log('\nBloqueados:'); blockedList.forEach(f => console.log('  •', f)); }
+  if (failures.length)    { console.log('\nFallas:');    failures.forEach(f => console.log('  •', f)); }
+  console.log('\nPendientes conocidos:');
   console.log('  • Paginación: exportar >1000 filas sin truncar — bloquea publicación');
   console.log('  • B5/B6 no declarados completos hasta que estos tests pasen íntegramente');
   console.log('  • Restauración de sesión / recordar acceso (sin implementar en V9)');
