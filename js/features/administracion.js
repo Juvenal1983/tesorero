@@ -1,6 +1,9 @@
 // js/features/administracion.js — extraído de la copia de demostración.
 let _lastCargarUsuarios = 0;
 async function cargarUsuariosDesdeSupabase(forzar=false){
+  // En modo V9_RELACIONAL la tabla usuarios_app no existe en el esquema relacional.
+  // La gestión de miembros delegados se hace a través de tesorero_membresias.
+  if (typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL) return;
   // Caché de 5 minutos — evita lecturas repetidas a Supabase
   const ahora = Date.now();
   if(!forzar && (ahora - _lastCargarUsuarios) < 5*60*1000) return;

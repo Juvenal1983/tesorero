@@ -373,9 +373,20 @@ async function limpiarCodigos(jwt) {
     await waitAppReady(page);
     await reloginViaUI(page);
 
-    // 1. Sesión completa (_v9CuentaId disponible)
+    // 1. Esperar _v9CuentaId === CUENTA_ID explícitamente, con o sin re-login.
+    //    reloginViaUI solo espera cuando hay formulario visible; si la sesión
+    //    persiste retorna de inmediato y la inicialización V9 puede seguir corriendo.
+    //    _authToken se asigna ANTES de que _v9CuentaId quede fijado (arranque.js),
+    //    por lo que esta espera garantiza también que _invToken() devuelva algo válido
+    //    cuando llegue I05 (evita el fallback local sin PATCH).
+    await page.waitForFunction(
+      cuentaId => window.S?._v9CuentaId === cuentaId,
+      CUENTA_ID,
+      { timeout: T_LARGO }
+    ).catch(() => {});
     const cuentaIdPost = await page.evaluate(() => window.S?._v9CuentaId || null);
-    ok('I04-a: sesión completa tras reload (_v9CuentaId)', !!cuentaIdPost);
+    ok('I04-a: sesión completa tras reload (_v9CuentaId === CUENTA_ID)',
+      cuentaIdPost === CUENTA_ID);
 
     // 2. Ruta activa es 'config'
     await navegarConfig(page);
