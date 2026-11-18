@@ -8,24 +8,20 @@
  *   C02  Login UI completado (_v9CuentaId disponible)
  *   C03  Cargar config_cuenta desde Supabase (GET → estructura válida)
  *   C04  Guardar plantilla_pago via UI real (#cfg-plantilla) → PATCH → verifica en DB
- *   C05  Restaurar plantilla_pago original → verifica en DB
- *   C06  saveCuenta V9: nombre persiste en tesorero_cuentas vía formulario real → PATCH → GET
- *   C07  saveCuenta V9: restaurar nombre original
+ *   C05  Restauración plantilla_pago → GET confirma valor original exacto
+ *   C06  saveCuenta V9: nombre persiste en tesorero_cuentas vía formulario real
+ *   C07  Restauración nombre → GET confirma valor original exacto
  *
  * Notas de diseño:
- *   - C04 y C06 exigen los controles de formulario reales (#cfg-plantilla,
- *     #cfg-usr-nombre). Si no están presentes en la ruta "config", el caso
- *     falla explícitamente: no se usa fallback directo al helper.
- *   - Los valores originales se leen antes del try (incluido NULL explícito).
- *   - La restauración (C05/C07) se hace en el bloque finally vía REST,
- *     independiente de si hubo excepción durante la prueba.
- *   - GET de verificación tras cada restauración confirma el estado real.
+ *   - Lectura de valores originales: exige HTTP 200 y fila existente.
+ *     Distingue fila inexistente, campo NULL y error de consulta.
+ *     Un valor desconocido (error de lectura) NO se trata como NULL.
+ *   - C04 y C06 exigen controles de formulario reales; sin fallback al helper.
+ *   - restaurarPlantilla / restaurarNombre devuelven { ok, actual, esperado }.
+ *     C05/C07 usan ese resultado en ok() — una restauración fallida cuenta como FAIL.
+ *   - Restauración en finally siempre, incluso tras excepción.
  *
- * Producción excluida. Administración de usuarios (B6) permanece pendiente.
- *
- * Variables de entorno requeridas (mismo .env que E8–E10):
- *   STAGING_SUPABASE_URL, STAGING_SUPABASE_ANON_KEY (o STAGING_KEY),
- *   STAGING_USER_A_EMAIL (o STAGING_EMAIL), STAGING_USER_A_PASSWORD (o STAGING_PASS)
+ * Producción excluida. B6 (administración de usuarios) pendiente.
  */
 
 'use strict';
@@ -71,6 +67,9 @@ function ok(label, cond) {
 const T_CORTO = 12_000;
 const T_LARGO = 30_000;
 
+// Sentinel para distinguir "campo NULL en DB" de "valor no leído por error"
+const UNREAD = Symbol('UNREAD');
+
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 function _fetch(urlPath, opts = {}) {
@@ -109,6 +108,115 @@ function supaAuth(urlPath, jwt, opts = {}) {
 }
 function supaAnon(urlPath, opts = {}) {
   return _fetch(urlPath, { ...opts, authHeader: null });
+}
+
+// ── Lectura segura de valores originales ─────────────────────────────────────
+// Lanza si HTTP != 200 o la fila no existe.
+// Devuelve el valor exacto del campo (null si era NULL en DB).
+// No convierte un error en null — usa el sentinel UNREAD para indicar
+// que el valor no fue leído correctamente.
+
+async function leerNombreOriginal(jwt, cuentaId) {
+  const r = await supaAuth(
+    `/rest/v1/tesorero_cuentas?id=eq.${encodeURIComponent(cuentaId)}&select=nombre`,
+    jwt
+  );
+  if (r.status !== 200)
+    throw new Error(`leerNombreOriginal: HTTP ${r.status} — ${JSON.stringify(r.body)}`);
+  if (!Array.isArray(r.body) || r.body.length === 0)
+    throw new Error(`leerNombreOriginal: fila no encontrada para cuenta ${cuentaId}`);
+  // El campo puede ser null; Object.prototype.hasOwnProperty confirma que existe
+  if (!Object.prototype.hasOwnProperty.call(r.body[0], 'nombre'))
+    throw new Error('leerNombreOriginal: columna "nombre" ausente en la respuesta');
+  return r.body[0].nombre;  // null | string
+}
+
+async function leerPlantillaOriginal(jwt, cuentaId) {
+  const r = await supaAuth(
+    `/rest/v1/config_cuenta?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=plantilla_pago`,
+    jwt
+  );
+  if (r.status !== 200)
+    throw new Error(`leerPlantillaOriginal: HTTP ${r.status} — ${JSON.stringify(r.body)}`);
+  if (!Array.isArray(r.body) || r.body.length === 0)
+    throw new Error(`leerPlantillaOriginal: fila no encontrada para cuenta ${cuentaId}`);
+  if (!Object.prototype.hasOwnProperty.call(r.body[0], 'plantilla_pago'))
+    throw new Error('leerPlantillaOriginal: columna "plantilla_pago" ausente en la respuesta');
+  return r.body[0].plantilla_pago;  // null | string
+}
+
+// ── Restauración verificada ───────────────────────────────────────────────────
+// Devuelve { ok: boolean, actual, esperado } — nunca lanza.
+// Si el valor original es UNREAD no se restaura (no sabemos qué restaurar).
+
+async function restaurarPlantilla(jwt, cuentaId, valorOriginal) {
+  if (valorOriginal === UNREAD) {
+    console.error('  [finally] restaurarPlantilla: valor original no fue leído — omitida');
+    return { ok: false, actual: UNREAD, esperado: UNREAD };
+  }
+  try {
+    const r = await supaAuth(
+      `/rest/v1/config_cuenta?cuenta_id=eq.${encodeURIComponent(cuentaId)}`,
+      jwt, { method: 'PATCH', body: { plantilla_pago: valorOriginal }, prefer: '' }
+    );
+    if (r.status < 200 || r.status >= 300) {
+      console.error(`  [finally] restaurarPlantilla PATCH falló: HTTP ${r.status}`);
+      return { ok: false, actual: null, esperado: valorOriginal };
+    }
+    // GET de verificación
+    const rGet = await supaAuth(
+      `/rest/v1/config_cuenta?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=plantilla_pago`,
+      jwt
+    );
+    if (rGet.status !== 200 || !Array.isArray(rGet.body) || rGet.body.length === 0) {
+      console.error(`  [finally] restaurarPlantilla GET falló: HTTP ${rGet.status}`);
+      return { ok: false, actual: null, esperado: valorOriginal };
+    }
+    const actual   = rGet.body[0].plantilla_pago;
+    const esperado = valorOriginal;
+    const confirmed = actual === esperado;
+    if (confirmed) console.log(`  [finally] plantilla_pago restaurada ✓`);
+    else           console.error(`  [finally] plantilla_pago no coincide: esperado ${JSON.stringify(esperado)}, actual ${JSON.stringify(actual)}`);
+    return { ok: confirmed, actual, esperado };
+  } catch (e) {
+    console.error(`  [finally] restaurarPlantilla excepción: ${e.message}`);
+    return { ok: false, actual: null, esperado: valorOriginal };
+  }
+}
+
+async function restaurarNombre(jwt, cuentaId, valorOriginal) {
+  if (valorOriginal === UNREAD) {
+    console.error('  [finally] restaurarNombre: valor original no fue leído — omitida');
+    return { ok: false, actual: UNREAD, esperado: UNREAD };
+  }
+  try {
+    const r = await supaAuth(
+      `/rest/v1/tesorero_cuentas?id=eq.${encodeURIComponent(cuentaId)}`,
+      jwt, { method: 'PATCH', body: { nombre: valorOriginal }, prefer: '' }
+    );
+    if (r.status < 200 || r.status >= 300) {
+      console.error(`  [finally] restaurarNombre PATCH falló: HTTP ${r.status}`);
+      return { ok: false, actual: null, esperado: valorOriginal };
+    }
+    // GET de verificación
+    const rGet = await supaAuth(
+      `/rest/v1/tesorero_cuentas?id=eq.${encodeURIComponent(cuentaId)}&select=nombre`,
+      jwt
+    );
+    if (rGet.status !== 200 || !Array.isArray(rGet.body) || rGet.body.length === 0) {
+      console.error(`  [finally] restaurarNombre GET falló: HTTP ${rGet.status}`);
+      return { ok: false, actual: null, esperado: valorOriginal };
+    }
+    const actual   = rGet.body[0].nombre;
+    const esperado = valorOriginal;
+    const confirmed = actual === esperado;
+    if (confirmed) console.log(`  [finally] nombre restaurado ✓`);
+    else           console.error(`  [finally] nombre no coincide: esperado ${JSON.stringify(esperado)}, actual ${JSON.stringify(actual)}`);
+    return { ok: confirmed, actual, esperado };
+  } catch (e) {
+    console.error(`  [finally] restaurarNombre excepción: ${e.message}`);
+    return { ok: false, actual: null, esperado: valorOriginal };
+  }
 }
 
 // ── Servidor HTTP local ───────────────────────────────────────────────────────
@@ -153,7 +261,7 @@ window.STAGING_SUPA_KEY = ${JSON.stringify(ANON_KEY)};
   });
 }
 
-// ── Login REST y descubrimiento ───────────────────────────────────────────────
+// ── Login REST ────────────────────────────────────────────────────────────────
 
 async function loginTesorero() {
   const r = await supaAnon('/auth/v1/token?grant_type=password', {
@@ -224,51 +332,6 @@ function esperarRespuestaSupabase(page, tabla, metodo, timeoutMs = T_CORTO) {
   });
 }
 
-// ── Restauración REST (usada en finally) ─────────────────────────────────────
-
-async function restaurarPlantilla(jwt, cuentaId, valorOriginal) {
-  // Si el valor original era NULL, enviar null explícitamente.
-  const payload = { plantilla_pago: valorOriginal === undefined ? null : valorOriginal };
-  const r = await supaAuth(
-    `/rest/v1/config_cuenta?cuenta_id=eq.${encodeURIComponent(cuentaId)}`,
-    jwt, { method: 'PATCH', body: payload }
-  );
-  if (r.status < 200 || r.status >= 300)
-    console.error(`  [finally] restaurarPlantilla falló: ${r.status}`);
-  // GET de verificación
-  const rGet = await supaAuth(
-    `/rest/v1/config_cuenta?cuenta_id=eq.${encodeURIComponent(cuentaId)}&select=plantilla_pago`,
-    jwt
-  );
-  const actual = rGet.body?.[0]?.plantilla_pago;
-  const esperado = valorOriginal === undefined ? null : valorOriginal;
-  if (actual !== esperado)
-    console.error(`  [finally] plantilla_pago no restaurada: esperado ${JSON.stringify(esperado)}, actual ${JSON.stringify(actual)}`);
-  else
-    console.log(`  [finally] plantilla_pago restaurada ✓`);
-}
-
-async function restaurarNombre(jwt, cuentaId, valorOriginal) {
-  const payload = { nombre: valorOriginal === undefined ? null : valorOriginal };
-  const r = await supaAuth(
-    `/rest/v1/tesorero_cuentas?id=eq.${encodeURIComponent(cuentaId)}`,
-    jwt, { method: 'PATCH', body: payload }
-  );
-  if (r.status < 200 || r.status >= 300)
-    console.error(`  [finally] restaurarNombre falló: ${r.status}`);
-  // GET de verificación
-  const rGet = await supaAuth(
-    `/rest/v1/tesorero_cuentas?id=eq.${encodeURIComponent(cuentaId)}&select=id,nombre`,
-    jwt
-  );
-  const actual = rGet.body?.[0]?.nombre;
-  const esperado = valorOriginal === undefined ? null : valorOriginal;
-  if (actual !== esperado)
-    console.error(`  [finally] nombre no restaurado: esperado ${JSON.stringify(esperado)}, actual ${JSON.stringify(actual)}`);
-  else
-    console.log(`  [finally] nombre restaurado ✓`);
-}
-
 // ── MAIN ──────────────────────────────────────────────────────────────────────
 
 (async () => {
@@ -288,25 +351,29 @@ async function restaurarNombre(jwt, cuentaId, valorOriginal) {
     console.error('❌ Setup falló:', e.message); process.exit(3);
   }
 
-  // Leer valores originales ANTES del try para poder restaurarlos en finally.
-  // No se usa || '' ni valor por defecto: se preserva NULL.
-  const rCuentaOrig = await supaAuth(
-    `/rest/v1/tesorero_cuentas?id=eq.${encodeURIComponent(CUENTA_ID)}&select=id,nombre,email`,
-    jwt
-  );
-  const nombreOriginal = rCuentaOrig.body?.[0]?.nombre;   // puede ser null
-  console.log(`  Nombre original en DB: ${JSON.stringify(nombreOriginal)}`);
+  // Leer valores originales con validación estricta ANTES del try.
+  // Si la lectura falla, se aborta: no sabemos qué restaurar.
+  // Si el campo es NULL, se guarda null (no '').
+  let nombreOriginal   = UNREAD;
+  let plantillaOriginal = UNREAD;
 
-  const rCfgOrig = await supaAuth(
-    `/rest/v1/config_cuenta?cuenta_id=eq.${encodeURIComponent(CUENTA_ID)}&select=plantilla_pago`,
-    jwt
-  );
-  const plantillaOriginal = rCfgOrig.body?.[0]?.plantilla_pago;  // puede ser null
-  console.log(`  Plantilla original en DB: ${JSON.stringify((plantillaOriginal || '').slice(0, 60))}`);
+  try {
+    nombreOriginal    = await leerNombreOriginal(jwt, CUENTA_ID);
+    plantillaOriginal = await leerPlantillaOriginal(jwt, CUENTA_ID);
+  } catch (e) {
+    console.error('❌ No se pudieron leer los valores originales:', e.message);
+    process.exit(3);
+  }
+  console.log(`  Nombre original en DB    : ${JSON.stringify(nombreOriginal)}`);
+  console.log(`  Plantilla original en DB : ${JSON.stringify((plantillaOriginal ?? '').toString().slice(0, 60))}`);
 
-  // Flags para saber qué restaurar en finally
+  // Flags: qué se modificó (para restaurar en finally)
   let plantillaModificada = false;
   let nombreModificado    = false;
+
+  // Resultados de restauración (usados en ok() después del finally)
+  let resRestaurarPlantilla = null;
+  let resRestaurarNombre    = null;
 
   let server = null, browser = null;
 
@@ -357,15 +424,14 @@ async function restaurarNombre(jwt, cuentaId, valorOriginal) {
     console.log(`  config: ${JSON.stringify(cfgFila)}`);
 
     // ── C04: Guardar plantilla_pago via formulario real ───────────────────
-    console.log('\n[C04] Guardar plantilla_pago via UI real (#cfg-plantilla) → PATCH → verifica en DB');
+    console.log('\n[C04] Guardar plantilla_pago via UI real (#cfg-plantilla) → PATCH → DB');
     await navegarConfig(page);
 
     const plantillaTest = `Test-${EXEC_ID}: Estimado apoderado, adjunto su comprobante.`;
 
-    // Exigir el control real. Si no existe, el caso falla aquí sin fallback.
     const fInputPlantilla = page.locator('#cfg-plantilla');
     const tieneInput = await fInputPlantilla.count() > 0;
-    ok('C04: control #cfg-plantilla presente en ruta config', tieneInput);
+    ok('C04-a: control #cfg-plantilla presente en ruta config', tieneInput);
     if (!tieneInput) throw new Error('C04: #cfg-plantilla ausente — ¿la ruta config no está activa?');
 
     const promesaPatchCfg = esperarRespuestaSupabase(page, 'config_cuenta', 'PATCH', T_CORTO);
@@ -376,11 +442,8 @@ async function restaurarNombre(jwt, cuentaId, valorOriginal) {
     plantillaModificada = true;
 
     const patchCfg = await promesaPatchCfg;
-    if (patchCfg) {
-      console.log(`  [net] PATCH ${patchCfg.url} → ${patchCfg.status}`);
-    } else {
-      console.error('  [net] PATCH config_cuenta: sin respuesta en T_CORTO');
-    }
+    if (patchCfg) console.log(`  [net] PATCH ${patchCfg.url} → ${patchCfg.status}`);
+    else          console.error('  [net] PATCH config_cuenta: sin respuesta en T_CORTO');
     ok('C04-b: PATCH config_cuenta HTTP 2xx', patchCfg?.status >= 200 && patchCfg?.status < 300);
 
     const rC04 = await supaAuth(
@@ -391,18 +454,16 @@ async function restaurarNombre(jwt, cuentaId, valorOriginal) {
     ok('C04-c: plantilla_pago persiste en DB', rC04.body?.[0]?.plantilla_pago === plantillaTest);
 
     // ── C06: saveCuenta V9 → nombre persiste vía formulario real ─────────
-    console.log('\n[C06] saveCuenta V9 → nombre persiste en tesorero_cuentas vía formulario real');
+    console.log('\n[C06] saveCuenta V9 → nombre persiste en tesorero_cuentas');
     await navegarConfig(page);
 
     const nombreTest = `Test-${EXEC_ID.slice(0, 6)} Tesorero`;
 
-    // Exigir los controles reales. Si no existen, el caso falla aquí sin fallback.
     const fNombre = page.locator('#cfg-usr-nombre');
     const tieneFormCuenta = await fNombre.count() > 0;
-    ok('C06: control #cfg-usr-nombre presente en ruta config', tieneFormCuenta);
+    ok('C06-a: control #cfg-usr-nombre presente en ruta config', tieneFormCuenta);
     if (!tieneFormCuenta) throw new Error('C06: #cfg-usr-nombre ausente — ¿la ruta config no está activa?');
 
-    // Verificar también los campos de contraseña (deben estar limpios)
     const fPass  = page.locator('#cfg-usr-pass');
     const fPass2 = page.locator('#cfg-usr-pass2');
     if (await fPass.count() > 0)  await fPass.fill('');
@@ -416,15 +477,12 @@ async function restaurarNombre(jwt, cuentaId, valorOriginal) {
     nombreModificado = true;
 
     const patchCuenta = await promesaPatchCuenta;
-    if (patchCuenta) {
-      console.log(`  [net] PATCH ${patchCuenta.url} → ${patchCuenta.status}`);
-    } else {
-      console.error('  [net] PATCH tesorero_cuentas: sin respuesta en T_CORTO');
-    }
+    if (patchCuenta) console.log(`  [net] PATCH ${patchCuenta.url} → ${patchCuenta.status}`);
+    else             console.error('  [net] PATCH tesorero_cuentas: sin respuesta en T_CORTO');
     ok('C06-b: PATCH tesorero_cuentas HTTP 2xx', patchCuenta?.status >= 200 && patchCuenta?.status < 300);
 
     const rC06 = await supaAuth(
-      `/rest/v1/tesorero_cuentas?id=eq.${encodeURIComponent(CUENTA_ID)}&select=id,nombre`,
+      `/rest/v1/tesorero_cuentas?id=eq.${encodeURIComponent(CUENTA_ID)}&select=nombre`,
       jwt
     );
     console.log(`  [rest] nombre en DB: "${rC06.body?.[0]?.nombre}"`);
@@ -434,27 +492,24 @@ async function restaurarNombre(jwt, cuentaId, valorOriginal) {
     if (browser) await browser.close().catch(() => {});
     if (server)  server.close();
 
-    // ── C05/C07: Restaurar valores originales (siempre, incluso tras excepción) ──
+    // Restaurar siempre — resultado se usa en ok() después del bloque finally
     if (jwt && CUENTA_ID) {
       if (plantillaModificada) {
         console.log('\n[C05/finally] Restaurar plantilla_pago original');
-        await restaurarPlantilla(jwt, CUENTA_ID, plantillaOriginal).catch(e =>
-          console.error('  [finally] restaurarPlantilla error:', e.message)
-        );
+        resRestaurarPlantilla = await restaurarPlantilla(jwt, CUENTA_ID, plantillaOriginal);
       }
       if (nombreModificado) {
         console.log('\n[C07/finally] Restaurar nombre original');
-        await restaurarNombre(jwt, CUENTA_ID, nombreOriginal).catch(e =>
-          console.error('  [finally] restaurarNombre error:', e.message)
-        );
+        resRestaurarNombre = await restaurarNombre(jwt, CUENTA_ID, nombreOriginal);
       }
     }
   }
 
-  // Registrar C05/C07 en el conteo (la restauración fue verificada en finally con log)
-  // Aquí solo contamos si llegamos al finally sin excepción previa en C04/C06.
-  if (plantillaModificada) ok('C05: plantilla_pago restaurada en finally', true);
-  if (nombreModificado)    ok('C07: nombre restaurado en finally', true);
+  // C05/C07 usan el resultado verificado de la restauración
+  if (plantillaModificada)
+    ok('C05: plantilla_pago restaurada y verificada por GET', resRestaurarPlantilla?.ok === true);
+  if (nombreModificado)
+    ok('C07: nombre restaurado y verificado por GET', resRestaurarNombre?.ok === true);
 
   console.log(`\n${'─'.repeat(56)}`);
   console.log(`📊 E11 Config Cuenta V9: ${pass} ✅  ${fail} ❌`);

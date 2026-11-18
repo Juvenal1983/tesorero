@@ -4,12 +4,14 @@
  * Suite Playwright B5 — Respaldo/Restauración V9
  *
  * Estrategia de fixtures:
- *   Antes de lanzar el browser se insertan vía REST dos cursos propios
- *   del test (identificados por EXEC_ID), con alumnos y pagos conocidos.
- *   Las aserciones de respaldo comparan IDs exactos y conteos, no solo
- *   "colección no vacía del staging existente".
- *   El bloque finally elimina todos los fixtures independiente de si
- *   hubo excepción.
+ *   - `fixtureCreados` vive fuera del try/finally y registra cada registro
+ *     insertado en tiempo real (cursos, alumnos, pagos).
+ *   - Toda la preparación (inserción + browser) está dentro del try/finally.
+ *   - `eliminarFixtures` hace un GET de verificación por cada registro;
+ *     devuelve el número de fallos. Cualquier fallo cuenta como FAIL en el
+ *     resumen final (no solo se imprime).
+ *   - Si `insertarFixtures` falla a mitad, `fixtureCreados` contiene lo ya
+ *     insertado y el finally lo limpia.
  *
  * Verifica:
  *   R01  Servidor local levantado
@@ -17,26 +19,23 @@
  *   R03  exportarDatosCompletosV9 → JSON descargado con estructura válida
  *   R04  Respaldo incluye los dos cursos fixture (por ID exacto)
  *   R05  Alumnos y pagos fixture aparecen en el respaldo (IDs exactos)
- *   R06  Integridad: cuenta_id correcto en alumnos y pagos; alumnos tienen curso_id
- *   R07  Colecciones complementarias presentes en el respaldo (actividades, abonos, notas, etc.)
+ *   R06  Integridad: cuenta_id y curso_id en alumnos y pagos fixture
+ *   R07  Colecciones complementarias presentes (actividades, abonos, notas, etc.)
  *   R08  importarDatos en V9 bloquea con alert explícito — no modifica caché
+ *   R09  Limpieza: todos los fixtures eliminados y verificados por GET
  *
  * Notas:
- *   - Importación/restauración (B5) sigue pendiente de implementar.
- *     Comprobar el bloqueo (R08) no es suficiente para cerrar B5.
+ *   - B5 (importación/restauración) sigue PENDIENTE de implementar.
+ *     R08 comprueba el bloqueo; eso no cierra B5.
  *   - Producción excluida.
- *
- * Variables de entorno requeridas:
- *   STAGING_SUPABASE_URL, STAGING_SUPABASE_ANON_KEY (o STAGING_KEY),
- *   STAGING_USER_A_EMAIL (o STAGING_EMAIL), STAGING_USER_A_PASSWORD (o STAGING_PASS)
  */
 
 'use strict';
 
-const path  = require('path');
-const http  = require('http');
-const https = require('https');
-const fs    = require('fs');
+const path   = require('path');
+const http   = require('http');
+const https  = require('https');
+const fs     = require('fs');
 const crypto = require('crypto');
 const { chromium } = require('playwright');
 
@@ -73,7 +72,7 @@ function ok(label, cond) {
 }
 
 const T_CORTO = 12_000;
-const T_LARGO = 60_000;   // exportación completa puede tardar más
+const T_LARGO = 60_000;
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
@@ -207,21 +206,14 @@ async function navegarConfig(page) {
 }
 
 // ── Gestión de fixtures ───────────────────────────────────────────────────────
+//
+// fixtureCreados se pasa por referencia y se va llenando durante la inserción.
+// Si insertarFixtures lanza a mitad, el finally del caller puede limpiar lo
+// que ya fue insertado.
 
-/**
- * Inserta fixtures propios: 2 cursos, 2 alumnos por curso, 1 pago por curso.
- * Todos llevan EXEC_ID en el nombre para identificarlos y limpiarlos.
- * Devuelve los IDs generados para verificación posterior.
- */
-async function insertarFixtures(jwt, cuentaId) {
+async function insertarFixtures(jwt, cuentaId, fixtureCreados) {
   const uid = () => crypto.randomUUID();
   const hoy = new Date().toISOString().slice(0, 10);
-
-  const fixtures = {
-    cursos:  [],
-    alumnos: [],
-    pagos:   [],
-  };
 
   for (let i = 1; i <= 2; i++) {
     const cursoId = uid();
@@ -238,8 +230,9 @@ async function insertarFixtures(jwt, cuentaId) {
       prefer: 'return=representation',
     });
     if (r.status < 200 || r.status >= 300)
-      throw new Error(`insertarFixtures: curso ${i} falló: ${JSON.stringify(r.body)}`);
-    fixtures.cursos.push(cursoId);
+      throw new Error(`insertarFixtures: curso ${i} falló HTTP ${r.status}: ${JSON.stringify(r.body)}`);
+    // Registrar inmediatamente — antes de intentar los siguientes registros
+    fixtureCreados.cursos.push(cursoId);
     console.log(`  [fixture] curso ${i} insertado: ${cursoId}`);
 
     for (let j = 1; j <= 2; j++) {
@@ -257,8 +250,8 @@ async function insertarFixtures(jwt, cuentaId) {
         prefer: 'return=representation',
       });
       if (rA.status < 200 || rA.status >= 300)
-        throw new Error(`insertarFixtures: alumno ${j} en curso ${i} falló: ${JSON.stringify(rA.body)}`);
-      fixtures.alumnos.push(alumnoId);
+        throw new Error(`insertarFixtures: alumno ${j} en curso ${i} falló HTTP ${rA.status}: ${JSON.stringify(rA.body)}`);
+      fixtureCreados.alumnos.push(alumnoId);
     }
     console.log(`  [fixture] 2 alumnos insertados en curso ${i}`);
 
@@ -277,57 +270,115 @@ async function insertarFixtures(jwt, cuentaId) {
       prefer: 'return=representation',
     });
     if (rP.status < 200 || rP.status >= 300)
-      throw new Error(`insertarFixtures: pago en curso ${i} falló: ${JSON.stringify(rP.body)}`);
-    fixtures.pagos.push(pagoId);
+      throw new Error(`insertarFixtures: pago en curso ${i} falló HTTP ${rP.status}: ${JSON.stringify(rP.body)}`);
+    fixtureCreados.pagos.push(pagoId);
     console.log(`  [fixture] pago insertado en curso ${i}: ${pagoId}`);
   }
-
-  return fixtures;
 }
 
 /**
- * Elimina todos los fixtures creados por este EXEC_ID.
- * Usa DELETE vía REST con filtro por nombre/descripción + EXEC_ID.
- * Los errores se logean pero no se relancean.
+ * Elimina todos los fixtures y verifica por GET que fueron eliminados.
+ * Devuelve el número de fallos (0 = limpieza completa).
+ * No lanza — el caller usa el conteo para decidir.
  */
-async function eliminarFixtures(jwt, cuentaId, fixtures) {
-  if (!fixtures) return;
+async function eliminarFixtures(jwt, cuentaId, fixtureCreados) {
+  let fallos = 0;
 
-  // Eliminar pagos
-  for (const id of fixtures.pagos || []) {
-    const r = await supaAuth(
-      `/rest/v1/pagos?id=eq.${encodeURIComponent(id)}&cuenta_id=eq.${encodeURIComponent(cuentaId)}`,
-      jwt, { method: 'DELETE', prefer: '' }
-    ).catch(e => ({ status: 0, error: e.message }));
-    if (r.status >= 200 && r.status < 300)
-      console.log(`  [fixture cleanup] pago ${id} eliminado`);
-    else
-      console.error(`  [fixture cleanup] pago ${id} falló: ${r.status}`);
+  // Eliminar y verificar pagos
+  for (const id of fixtureCreados.pagos) {
+    try {
+      const rDel = await supaAuth(
+        `/rest/v1/pagos?id=eq.${encodeURIComponent(id)}&cuenta_id=eq.${encodeURIComponent(cuentaId)}`,
+        jwt, { method: 'DELETE', prefer: '' }
+      );
+      if (rDel.status < 200 || rDel.status >= 300) {
+        console.error(`  [cleanup] pago ${id} DELETE falló: HTTP ${rDel.status}`);
+        fallos++;
+        continue;
+      }
+      // GET de verificación
+      const rGet = await supaAuth(
+        `/rest/v1/pagos?id=eq.${encodeURIComponent(id)}&select=id`,
+        jwt
+      );
+      if (rGet.status !== 200 || !Array.isArray(rGet.body)) {
+        console.error(`  [cleanup] pago ${id} GET verificación falló: HTTP ${rGet.status}`);
+        fallos++;
+      } else if (rGet.body.length > 0) {
+        console.error(`  [cleanup] pago ${id} sigue en DB después de DELETE`);
+        fallos++;
+      } else {
+        console.log(`  [cleanup] pago ${id} eliminado ✓`);
+      }
+    } catch (e) {
+      console.error(`  [cleanup] pago ${id} excepción: ${e.message}`);
+      fallos++;
+    }
   }
 
-  // Eliminar alumnos
-  for (const id of fixtures.alumnos || []) {
-    const r = await supaAuth(
-      `/rest/v1/alumnos?id=eq.${encodeURIComponent(id)}&cuenta_id=eq.${encodeURIComponent(cuentaId)}`,
-      jwt, { method: 'DELETE', prefer: '' }
-    ).catch(e => ({ status: 0, error: e.message }));
-    if (r.status >= 200 && r.status < 300)
-      console.log(`  [fixture cleanup] alumno ${id} eliminado`);
-    else
-      console.error(`  [fixture cleanup] alumno ${id} falló: ${r.status}`);
+  // Eliminar y verificar alumnos
+  for (const id of fixtureCreados.alumnos) {
+    try {
+      const rDel = await supaAuth(
+        `/rest/v1/alumnos?id=eq.${encodeURIComponent(id)}&cuenta_id=eq.${encodeURIComponent(cuentaId)}`,
+        jwt, { method: 'DELETE', prefer: '' }
+      );
+      if (rDel.status < 200 || rDel.status >= 300) {
+        console.error(`  [cleanup] alumno ${id} DELETE falló: HTTP ${rDel.status}`);
+        fallos++;
+        continue;
+      }
+      const rGet = await supaAuth(
+        `/rest/v1/alumnos?id=eq.${encodeURIComponent(id)}&select=id`,
+        jwt
+      );
+      if (rGet.status !== 200 || !Array.isArray(rGet.body)) {
+        console.error(`  [cleanup] alumno ${id} GET verificación falló: HTTP ${rGet.status}`);
+        fallos++;
+      } else if (rGet.body.length > 0) {
+        console.error(`  [cleanup] alumno ${id} sigue en DB después de DELETE`);
+        fallos++;
+      } else {
+        console.log(`  [cleanup] alumno ${id} eliminado ✓`);
+      }
+    } catch (e) {
+      console.error(`  [cleanup] alumno ${id} excepción: ${e.message}`);
+      fallos++;
+    }
   }
 
-  // Eliminar cursos
-  for (const id of fixtures.cursos || []) {
-    const r = await supaAuth(
-      `/rest/v1/cursos?id=eq.${encodeURIComponent(id)}&cuenta_id=eq.${encodeURIComponent(cuentaId)}`,
-      jwt, { method: 'DELETE', prefer: '' }
-    ).catch(e => ({ status: 0, error: e.message }));
-    if (r.status >= 200 && r.status < 300)
-      console.log(`  [fixture cleanup] curso ${id} eliminado`);
-    else
-      console.error(`  [fixture cleanup] curso ${id} falló: ${r.status}`);
+  // Eliminar y verificar cursos
+  for (const id of fixtureCreados.cursos) {
+    try {
+      const rDel = await supaAuth(
+        `/rest/v1/cursos?id=eq.${encodeURIComponent(id)}&cuenta_id=eq.${encodeURIComponent(cuentaId)}`,
+        jwt, { method: 'DELETE', prefer: '' }
+      );
+      if (rDel.status < 200 || rDel.status >= 300) {
+        console.error(`  [cleanup] curso ${id} DELETE falló: HTTP ${rDel.status}`);
+        fallos++;
+        continue;
+      }
+      const rGet = await supaAuth(
+        `/rest/v1/cursos?id=eq.${encodeURIComponent(id)}&select=id`,
+        jwt
+      );
+      if (rGet.status !== 200 || !Array.isArray(rGet.body)) {
+        console.error(`  [cleanup] curso ${id} GET verificación falló: HTTP ${rGet.status}`);
+        fallos++;
+      } else if (rGet.body.length > 0) {
+        console.error(`  [cleanup] curso ${id} sigue en DB después de DELETE`);
+        fallos++;
+      } else {
+        console.log(`  [cleanup] curso ${id} eliminado ✓`);
+      }
+    } catch (e) {
+      console.error(`  [cleanup] curso ${id} excepción: ${e.message}`);
+      fallos++;
+    }
   }
+
+  return fallos;
 }
 
 // ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -349,20 +400,21 @@ async function eliminarFixtures(jwt, cuentaId, fixtures) {
     console.error('❌ Setup falló:', e.message); process.exit(3);
   }
 
-  // Insertar fixtures ANTES del browser
-  console.log('\n[Pre] Insertar fixtures propios (2 cursos, 4 alumnos, 2 pagos)');
-  let fixtures = null;
-  try {
-    fixtures = await insertarFixtures(jwt, CUENTA_ID);
-    console.log(`  Fixtures insertados: cursos=${fixtures.cursos.length}, alumnos=${fixtures.alumnos.length}, pagos=${fixtures.pagos.length}`);
-  } catch (e) {
-    console.error('❌ insertarFixtures falló:', e.message); process.exit(3);
-  }
+  // fixtureCreados vive FUERA del try/finally para que el finally siempre pueda
+  // limpiar lo que se haya insertado, incluso si insertarFixtures lanzó a mitad.
+  const fixtureCreados = { cursos: [], alumnos: [], pagos: [] };
 
-  let server = null, browser = null;
+  let server      = null;
+  let browser     = null;
   let respaldoJSON = null;
+  let fallosCleanup = 0;
 
   try {
+    // Insertar fixtures DENTRO del try (si falla parcialmente, finally limpia)
+    console.log('\n[Pre] Insertar fixtures propios (2 cursos, 4 alumnos, 2 pagos)');
+    await insertarFixtures(jwt, CUENTA_ID, fixtureCreados);
+    console.log(`  Fixtures insertados: cursos=${fixtureCreados.cursos.length}, alumnos=${fixtureCreados.alumnos.length}, pagos=${fixtureCreados.pagos.length}`);
+
     // ── R01: Servidor ─────────────────────────────────────────────────────
     console.log('\n[R01] Servidor HTTP local');
     server = await servirApp();
@@ -396,7 +448,6 @@ async function eliminarFixtures(jwt, cuentaId, fixtures) {
       throw new Error('Login UI no completó');
     }
 
-    // Esperar que _v9CuentaId coincida
     await page.waitForFunction(
       cuentaId => window.S?._v9CuentaId === cuentaId,
       CUENTA_ID,
@@ -406,21 +457,18 @@ async function eliminarFixtures(jwt, cuentaId, fixtures) {
     // ── R03: Exportar respaldo completo ───────────────────────────────────
     console.log('\n[R03] exportarDatosCompletosV9 → capturar JSON');
 
-    // Interceptar el click de <a download> para leer el blob sin descarga real
     await page.evaluate(() => {
       window.__respaldoCapturado = null;
       const _origCreate = document.createElement.bind(document);
       document.createElement = function(tag) {
         const el = _origCreate(tag);
         if (tag.toLowerCase() === 'a') {
-          const _origClick = el.click.bind(el);
           el.click = function() {
             if (el.href && el.href.startsWith('blob:')) {
               fetch(el.href)
                 .then(r => r.text())
                 .then(txt => { window.__respaldoCapturado = txt; });
             }
-            // No llamar _origClick para evitar la descarga real
           };
         }
         return el;
@@ -429,12 +477,10 @@ async function eliminarFixtures(jwt, cuentaId, fixtures) {
 
     await navegarConfig(page);
 
-    // Llamar directamente a exportarDatosCompletosV9 (async)
     await page.evaluate(async () => {
       if (typeof exportarDatosCompletosV9 === 'function') await exportarDatosCompletosV9();
     });
 
-    // Esperar que el blob haya sido capturado
     const capturado = await page.waitForFunction(
       () => window.__respaldoCapturado !== null,
       { timeout: T_LARGO }
@@ -458,79 +504,67 @@ async function eliminarFixtures(jwt, cuentaId, fixtures) {
     if (respaldoJSON) {
       ok('R03-c: version = "v9-completo"', respaldoJSON.version === 'v9-completo');
       ok('R03-d: cuentaId coincide', respaldoJSON.cuentaId === CUENTA_ID);
-      ok('R03-e: campo "colecciones" presente', typeof respaldoJSON.colecciones === 'object' && respaldoJSON.colecciones !== null);
+      ok('R03-e: campo "colecciones" presente',
+        typeof respaldoJSON.colecciones === 'object' && respaldoJSON.colecciones !== null);
       console.log(`  Claves colecciones: ${Object.keys(respaldoJSON.colecciones || {}).join(', ')}`);
     } else {
-      ok('R03-c: version = "v9-completo"', false);
-      ok('R03-d: cuentaId coincide', false);
-      ok('R03-e: campo "colecciones" presente', false);
+      ok('R03-c: version', false);
+      ok('R03-d: cuentaId', false);
+      ok('R03-e: colecciones', false);
     }
 
-    // ── R04: Cursos fixture presentes en el respaldo (IDs exactos) ────────
-    console.log('\n[R04] Respaldo incluye los dos cursos fixture (por ID exacto)');
+    // ── R04: Cursos fixture presentes en el respaldo ──────────────────────
+    console.log('\n[R04] Cursos fixture presentes en el respaldo (IDs exactos)');
     const colecciones = respaldoJSON?.colecciones || {};
     const cursosEnRespaldo = Array.isArray(colecciones.cursos) ? colecciones.cursos : [];
     console.log(`  Cursos en respaldo: ${cursosEnRespaldo.length}`);
-    for (const cursoId of fixtures.cursos) {
+    for (const cursoId of fixtureCreados.cursos) {
       const encontrado = cursosEnRespaldo.some(c => c.id === cursoId);
-      console.log(`  Curso fixture ${cursoId}: ${encontrado ? '✓' : '✗'}`);
-      ok(`R04: curso fixture ${cursoId.slice(0,8)}… presente en respaldo`, encontrado);
+      console.log(`  Curso fixture ${cursoId.slice(0,8)}…: ${encontrado ? '✓' : '✗'}`);
+      ok(`R04: curso fixture ${cursoId.slice(0,8)}… en respaldo`, encontrado);
     }
 
-    // ── R05: Alumnos y pagos fixture en el respaldo (IDs exactos) ─────────
+    // ── R05: Alumnos y pagos fixture en el respaldo ───────────────────────
     console.log('\n[R05] Alumnos y pagos fixture en el respaldo (IDs exactos)');
     const alumnosEnRespaldo = Array.isArray(colecciones.alumnos) ? colecciones.alumnos : [];
     const pagosEnRespaldo   = Array.isArray(colecciones.pagos)   ? colecciones.pagos   : [];
 
     let alumnosFixtureOk = true;
-    for (const alumnoId of fixtures.alumnos) {
-      const encontrado = alumnosEnRespaldo.some(a => a.id === alumnoId);
-      if (!encontrado) alumnosFixtureOk = false;
+    for (const id of fixtureCreados.alumnos) {
+      if (!alumnosEnRespaldo.some(a => a.id === id)) { alumnosFixtureOk = false; break; }
     }
-    ok(`R05-a: ${fixtures.alumnos.length} alumnos fixture presentes en respaldo`, alumnosFixtureOk);
+    ok(`R05-a: ${fixtureCreados.alumnos.length} alumnos fixture en respaldo`, alumnosFixtureOk);
 
     let pagosFixtureOk = true;
-    for (const pagoId of fixtures.pagos) {
-      const encontrado = pagosEnRespaldo.some(p => p.id === pagoId);
-      if (!encontrado) pagosFixtureOk = false;
+    for (const id of fixtureCreados.pagos) {
+      if (!pagosEnRespaldo.some(p => p.id === id)) { pagosFixtureOk = false; break; }
     }
-    ok(`R05-b: ${fixtures.pagos.length} pagos fixture presentes en respaldo`, pagosFixtureOk);
-
-    console.log(`  Alumnos en respaldo: ${alumnosEnRespaldo.length} (${fixtures.alumnos.length} fixture)`);
-    console.log(`  Pagos en respaldo:   ${pagosEnRespaldo.length} (${fixtures.pagos.length} fixture)`);
+    ok(`R05-b: ${fixtureCreados.pagos.length} pagos fixture en respaldo`, pagosFixtureOk);
+    console.log(`  Alumnos en respaldo: ${alumnosEnRespaldo.length} (${fixtureCreados.alumnos.length} fixture)`);
+    console.log(`  Pagos en respaldo:   ${pagosEnRespaldo.length} (${fixtureCreados.pagos.length} fixture)`);
 
     // ── R06: Integridad de colecciones ────────────────────────────────────
-    console.log('\n[R06] Integridad: cuenta_id y curso_id en alumnos y pagos');
-
-    // Verificar solo sobre los fixtures (no todo el staging)
-    const alumnosFixture = alumnosEnRespaldo.filter(a => fixtures.alumnos.includes(a.id));
-    const alumnosSinCuentaId = alumnosFixture.filter(a => a.cuenta_id !== CUENTA_ID);
-    const alumnosSinCursoId  = alumnosFixture.filter(a => !a.curso_id);
+    console.log('\n[R06] Integridad: cuenta_id y curso_id en alumnos y pagos fixture');
+    const alumnosFixture = alumnosEnRespaldo.filter(a => fixtureCreados.alumnos.includes(a.id));
     ok('R06-a: alumnos fixture tienen cuenta_id correcto',
-      alumnosFixture.length > 0 && alumnosSinCuentaId.length === 0);
+      alumnosFixture.length > 0 && alumnosFixture.every(a => a.cuenta_id === CUENTA_ID));
     ok('R06-b: alumnos fixture tienen curso_id',
-      alumnosFixture.length > 0 && alumnosSinCursoId.length === 0);
+      alumnosFixture.length > 0 && alumnosFixture.every(a => !!a.curso_id));
 
-    const pagosFixture = pagosEnRespaldo.filter(p => fixtures.pagos.includes(p.id));
-    const pagosSinCuentaId = pagosFixture.filter(p => p.cuenta_id !== CUENTA_ID);
+    const pagosFixture = pagosEnRespaldo.filter(p => fixtureCreados.pagos.includes(p.id));
     ok('R06-c: pagos fixture tienen cuenta_id correcto',
-      pagosFixture.length > 0 && pagosSinCuentaId.length === 0);
+      pagosFixture.length > 0 && pagosFixture.every(p => p.cuenta_id === CUENTA_ID));
 
-    console.log(`  alumnos fixture: ${alumnosFixture.length}/${fixtures.alumnos.length} OK`);
-    console.log(`  pagos fixture:   ${pagosFixture.length}/${fixtures.pagos.length} OK`);
-
-    // ── R07: Colecciones complementarias presentes ────────────────────────
-    console.log('\n[R07] Colecciones complementarias presentes en el respaldo');
-    // actividades y abonos son nuevas en esta versión (pueden estar vacías si no hay datos)
+    // ── R07: Colecciones complementarias ──────────────────────────────────
+    console.log('\n[R07] Colecciones complementarias presentes');
     const colsCompl = ['cuotas', 'movimientos', 'notas', 'codigos_invitacion', 'actividades', 'abonos'];
     for (const col of colsCompl) {
       const arr = colecciones[col];
-      const presente = Array.isArray(arr);
-      console.log(`  ${col}: ${presente ? arr.length + ' registros' : 'ausente'}`);
-      ok(`R07: colección "${col}" presente en respaldo`, presente);
+      console.log(`  ${col}: ${Array.isArray(arr) ? arr.length + ' registros' : 'ausente'}`);
+      ok(`R07: colección "${col}" presente`, Array.isArray(arr));
     }
 
-    // ── R08: importarDatos en V9 bloquea con alert ────────────────────────
+    // ── R08: importarDatos en V9 bloquea ──────────────────────────────────
     console.log('\n[R08] importarDatos en V9 → alert bloqueante, DB sin modificar');
 
     let alertTexto = null;
@@ -540,9 +574,9 @@ async function eliminarFixtures(jwt, cuentaId, fixtures) {
       await d.accept();
     });
 
-    const estadoAntes = await page.evaluate(() => {
-      return JSON.stringify((typeof DB !== 'undefined' && DB?.alumnos?.length) || 0);
-    });
+    const estadoAntes = await page.evaluate(() =>
+      JSON.stringify((typeof DB !== 'undefined' && DB?.alumnos?.length) || 0)
+    );
 
     await page.evaluate(() => {
       if (typeof importarDatos !== 'function') return;
@@ -551,14 +585,13 @@ async function eliminarFixtures(jwt, cuentaId, fixtures) {
       const file = new File([blob], 'test.json', { type: 'application/json' });
       const dt = new DataTransfer();
       dt.items.add(file);
-      const fakeInput = { target: { files: dt.files } };
-      importarDatos(fakeInput);
+      importarDatos({ target: { files: dt.files } });
     });
     await page.waitForTimeout(1500);
 
-    const estadoDespues = await page.evaluate(() => {
-      return JSON.stringify((typeof DB !== 'undefined' && DB?.alumnos?.length) || 0);
-    });
+    const estadoDespues = await page.evaluate(() =>
+      JSON.stringify((typeof DB !== 'undefined' && DB?.alumnos?.length) || 0)
+    );
 
     ok('R08-a: importarDatos muestra alert en V9',
       alertTexto !== null &&
@@ -566,20 +599,26 @@ async function eliminarFixtures(jwt, cuentaId, fixtures) {
     ok('R08-b: DB.alumnos no modificado tras importarDatos V9', estadoAntes === estadoDespues);
 
     console.log('\n⚠️  NOTA: B5 (importación/restauración) sigue PENDIENTE de implementar.');
-    console.log('    Verificar el bloqueo (R08) no es suficiente para cerrar B5.');
 
   } finally {
     if (browser) await browser.close().catch(() => {});
     if (server)  server.close();
 
-    // Limpiar fixtures siempre, incluso si hubo excepción
-    if (jwt && CUENTA_ID && fixtures) {
-      console.log('\n[finally] Eliminar fixtures propios del test');
-      await eliminarFixtures(jwt, CUENTA_ID, fixtures).catch(e =>
-        console.error('  [finally] eliminarFixtures error:', e.message)
-      );
+    // Limpiar fixtures siempre — devuelve conteo de fallos
+    if (jwt && CUENTA_ID &&
+        (fixtureCreados.cursos.length + fixtureCreados.alumnos.length + fixtureCreados.pagos.length) > 0) {
+      console.log(`\n[R09/finally] Eliminar fixtures (${fixtureCreados.cursos.length} cursos, ${fixtureCreados.alumnos.length} alumnos, ${fixtureCreados.pagos.length} pagos)`);
+      fallosCleanup = await eliminarFixtures(jwt, CUENTA_ID, fixtureCreados).catch(e => {
+        console.error('  [finally] eliminarFixtures excepción inesperada:', e.message);
+        return 99;
+      });
     }
   }
+
+  // R09: limpieza verificada — falla si algún registro no fue eliminado
+  const totalFixtures = fixtureCreados.cursos.length + fixtureCreados.alumnos.length + fixtureCreados.pagos.length;
+  if (totalFixtures > 0)
+    ok(`R09: limpieza completa (${totalFixtures} fixtures, ${fallosCleanup} fallos)`, fallosCleanup === 0);
 
   console.log(`\n${'─'.repeat(56)}`);
   console.log(`📊 E12 Respaldos V9: ${pass} ✅  ${fail} ❌`);
