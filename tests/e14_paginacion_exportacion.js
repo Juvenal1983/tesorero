@@ -200,19 +200,24 @@ async function waitAppReady(page) {
   await page.waitForFunction(() => typeof window.S !== 'undefined', { timeout: T_LARGO });
 }
 
-async function loginUI(page) {
+// loginUI — controles reales, mismos selectores validados en E12/E13.
+// Verifica que S._v9CuentaId (UI) coincida con cuentaId descubierto por REST.
+async function loginUI(page, cuentaId) {
   const APP_URL = `http://localhost:${APP_PORT}`;
   await page.goto(APP_URL);
   await waitAppReady(page);
-  await page.evaluate(
-    ([email, pass]) => {
-      document.getElementById('login-email').value = email;
-      document.getElementById('login-pass').value  = pass;
-    },
-    [USER_EMAIL, USER_PASS]
+  await page.fill('#l-email', USER_EMAIL);
+  await page.fill('#l-pass',  USER_PASS);
+  await page.click('[onclick="doLogin()"]');
+  await page.waitForFunction(
+    () => window.S?.session !== null
+       && window.S?.session !== undefined
+       && !!window.S?._v9CuentaId,
+    { timeout: T_LARGO }
   );
-  await page.click('#login-btn');
-  await page.waitForFunction(() => window.S?.v9CuentaId, { timeout: T_LARGO });
+  const cuentaUI = await page.evaluate(() => window.S?._v9CuentaId ?? null);
+  if (cuentaUI !== cuentaId)
+    throw new Error(`_v9CuentaId UI (${cuentaUI}) ≠ REST (${cuentaId})`);
 }
 
 async function navegarRespaldos(page) {
@@ -315,8 +320,8 @@ async function limpiarNotasFixture(jwt, cuentaId) {
       });
       page = await context.newPage();
 
-      await loginUI(page);
-      ok('P04-a: login UI', true);
+      await loginUI(page, cuentaId);   // verifica que S._v9CuentaId === cuentaId
+      ok('P04-a: login UI (_v9CuentaId coincide con REST)', true);
 
       await navegarRespaldos(page);
       ok('P04-b: ruta respaldos', true);
@@ -347,30 +352,22 @@ async function limpiarNotasFixture(jwt, cuentaId) {
 
         const idSet = new Set((respaldoNotas || []).map(n => n.id));
 
-        // ── P06–P09: IDs en posiciones clave ─────────────────────────────
-        ok('P06: id[0] (primera página) presente',    idSet.has(idsFixture[0]));
-        ok('P07: id[999] (límite pág. 1) presente',   idSet.has(idsFixture[999]));
-        ok('P08: id[1000] (inicio pág. 2) presente',  idSet.has(idsFixture[1000]));
-        ok(`P09: id[${N_NOTAS - 1}] (último) presente`, idSet.has(idsFixture[N_NOTAS - 1]));
-      }
-    }
+        // ── P06: posiciones de frontera de página ─────────────────────────
+        const limites = [0, 999, 1000, N_NOTAS - 1];
+        const faltanLimites = limites.filter(i => !idSet.has(idsFixture[i]));
+        ok('P06: IDs en posiciones de frontera (0, 999, 1000, 1099) presentes',
+           faltanLimites.length === 0,
+           faltanLimites.map(i => `[${i}]=${idsFixture[i]?.slice(0,8)}…`).join(', '));
 
-    // ── P10: Limpieza ─────────────────────────────────────────────────────────
-    console.log('\n── P10: Limpieza ──');
-    if (cuentaId && jwt) {
-      await limpiarNotasFixture(jwt, cuentaId);
-      // Verificar: buscar notas con el prefijo E14-EXEC_ID
-      const prefix = encodeURIComponent(`E14-${EXEC_ID}-%`);
-      const check  = await supaAuth(
-        `/rest/v1/notas?cuenta_id=eq.${encodeURIComponent(cuentaId)}&texto=like.${prefix}&select=id`,
-        jwt
-      );
-      ok('P10-a: DELETE notas fixture OK', check.status === 200);
-      ok('P10-b: notas fixture = 0 después del DELETE',
-        Array.isArray(check.body) && check.body.length === 0
-      );
-    } else {
-      skip('P10', 'sin cuentaId o jwt para limpiar');
+        // ── P07: verificación completa de los 1100 IDs del fixture ────────
+        // No basta con un conteo ni cuatro muestras: se cruza el set completo.
+        const faltantes = idsFixture.filter(id => !idSet.has(id));
+        ok(`P07: los ${N_NOTAS} IDs del fixture están en el backup`,
+           faltantes.length === 0,
+           faltantes.length > 0
+             ? `faltan ${faltantes.length} IDs; primeros 5: ${faltantes.slice(0, 5).join(', ')}`
+             : '');
+      }
     }
 
   } catch (e) {
@@ -378,7 +375,32 @@ async function limpiarNotasFixture(jwt, cuentaId) {
     fail++;
     failures.push('error no capturado: ' + e.message);
   } finally {
-    if (page)   await page.close().catch(() => {});
+    // ── P10: Limpieza — se ejecuta siempre, incluso ante setup parcial ────
+    console.log('\n── P10: Limpieza (finally) ──');
+    if (cuentaId && jwt) {
+      try {
+        await limpiarNotasFixture(jwt, cuentaId);
+      } catch (ce) {
+        console.error('⚠️  limpiarNotasFixture lanzó:', ce.message);
+        fail++;
+        failures.push('limpiarNotasFixture: ' + ce.message);
+      }
+      // Exigir GET HTTP 200 con array vacío — prefijo exacto E14-{EXEC_ID}-
+      const prefix = encodeURIComponent(`E14-${EXEC_ID}-%`);
+      const check  = await supaAuth(
+        `/rest/v1/notas?cuenta_id=eq.${encodeURIComponent(cuentaId)}&texto=like.${prefix}&select=id`,
+        jwt
+      ).catch(e => ({ status: 0, body: e.message }));
+      ok('P10-a: GET verificación HTTP 200', check.status === 200,
+         `status=${check.status}`);
+      ok('P10-b: notas fixture E14-${EXEC_ID}- = 0 tras DELETE',
+         check.status === 200 && Array.isArray(check.body) && check.body.length === 0,
+         check.status === 200 ? `quedaron ${Array.isArray(check.body) ? check.body.length : '?'}` : '');
+    } else {
+      skip('P10', 'sin cuentaId o jwt (setup no completó)');
+    }
+
+    if (page)    await page.close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
     if (server)  server.close();
   }
