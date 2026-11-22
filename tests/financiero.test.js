@@ -1,332 +1,401 @@
 /**
- * Tests de la lógica financiera — sin dependencia de Supabase ni DOM.
- * Cubre: calcFinanzas(), alumnos.js % cumplimiento, pagos huérfanos.
+ * tests/financiero.test.js
  *
- * Ejecutar: node --experimental-vm-modules tests/financiero.test.js
- * (o con jest/vitest si está configurado)
+ * Tests de calcFinanzas() ejecutando la función REAL de finanzas.js mediante
+ * vm.runInContext, igual que E7 con fondos.js. No réplicas de la lógica.
  *
- * Los módulos JS del frontend usan globals (DB, S, MESES…). Este harness
- * los inyecta antes de llamar las funciones, aislando cada test.
+ * Ejecutar: node tests/financiero.test.js
+ *
+ * Casos cubiertos:
+ *   FIN.1  Sin pagos: totPagos=0, totalEsperado=0, pctCumpl=0
+ *   FIN.2  Pago exacto: 100% cumplimiento
+ *   FIN.3  Dos alumnos, uno paga: 50%
+ *   FIN.4  Alumno eximido excluido de totalEsperado
+ *   FIN.5  Eximido con pago: suma a recaudado, no a cumplimiento
+ *   FIN.6  Pago parcial: recaudado < obligado → pct < 100
+ *   FIN.7  Sobrepago: recaudado > obligado, cumplimiento capped al 100%
+ *   FIN.8  Plan activo con abonos parciales: suman a recaudado Y cumplimiento
+ *   FIN.9  Plan cerrado (V9): abonos suman a recaudado (no duplican; no hay pago)
+ *   FIN.10 Plan cerrado (blob): pago creado, abonos no duplican recaudado
+ *   FIN.11 Período incompatible: pago en recaudado, 0% cumplimiento
+ *   FIN.12 Cuota sin tipo: genera Anual, pago mensual es huérfano en cumplimiento
+ *   FIN.13 Rango modificado → pago del rango anterior en recaudado, 0% cumplimiento
+ *   FIN.14 Escenario conocido: 2 alumnos × (mar $15k + abr $15k + anual $5k)
+ *            → esperado $70k, pagado $30k, pct=43%
+ *   FIN.15 Al revertir un abono, recaudado disminuye exactamente por su monto
+ *
+ * ⚠️  NUNCA ejecutar contra producción: tmjqzaakzhecbldebyeg.supabase.co
  */
 
 'use strict';
 
-// ─── Harness mínimo ───────────────────────────────────────────────────────────
+const path = require('path');
+const fs   = require('fs');
+const vm   = require('vm');
 
-const MESES = ['Enero','Febrero','Marzo','Abril','Mayo','Junio',
-               'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+// ─── Harness ──────────────────────────────────────────────────────────────────
 
-function vocab() {
-  return { mesInicioDefault: 2, mesFinDefault: 11 };
+let pass = 0, fail = 0;
+const failures = [];
+
+function ok(label, detail = '') {
+  pass++;
+  console.log(`  ✅ ${label}`);
+}
+function ko(label, detail = '') {
+  fail++;
+  failures.push(label);
+  console.error(`  ❌ ${label}${detail ? '\n     ' + detail : ''}`);
+}
+function eq(a, b, label, ctx = '') {
+  if (a === b) ok(label); else ko(label, `${ctx}esperado=${b} real=${a}`);
 }
 
-/** Replica calcFinanzas() de finanzas.js */
-function calcFinanzas({ alumnos, cuotas, pagos, planesPago = [], movimientos = [] }) {
-  const pagosPagados = pagos.filter(p => p.estado === 'pagado');
+// ─── Cargador vm (patrón E7) ──────────────────────────────────────────────────
 
-  // abonos pagados de planes activos
-  const totAbonosPagados = planesPago
-    .filter(pl => pl.activo)
-    .reduce((s, pl) => s + pl.abonos.filter(a => a.pagado).reduce((ss, ab) => ss + ab.monto, 0), 0);
+/**
+ * Carga calcFinanzas() y vocab() desde finanzas.js en un contexto vm aislado,
+ * inyectando DB, S y los stubs mínimos necesarios para que el archivo cargue.
+ *
+ * @param {object} mockDB     — replica exacta de DB (cuotas, pagos, planesPago, movimientos, alumnos)
+ * @param {object} mockS      — { cursoId }
+ * @param {boolean} esV9      — simula V9_RELACIONAL (true por defecto = staging real)
+ * @returns {{ calcFinanzas: Function }}
+ */
+function cargarCalculos(mockDB, mockS, esV9 = true) {
+  const src = fs.readFileSync(
+    path.resolve(__dirname, '..', 'js', 'core', 'finanzas.js'), 'utf8'
+  );
 
-  const totPagos = pagosPagados.reduce((s, p) => s + p.monto, 0) + totAbonosPagados;
-  const totIngExtra = movimientos.filter(m => m.tipo === 'ingreso').reduce((s, m) => s + m.monto, 0);
-  const totGastos   = movimientos.filter(m => m.tipo === 'gasto').reduce((s, m) => s + m.monto, 0);
-  const totalIngresos = totPagos + totIngExtra;
+  const MESES = ['Enero','Febrero','Marzo','Abril','Mayo','Junio',
+                 'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
 
-  let totalEsperado = 0;
-  let totalPagado   = 0;
-
-  alumnos.forEach(alu => {
-    if (alu.eximido) return;
-    cuotas.forEach(q => {
-      if (!q.activa) return;
-      const mesIni1 = q.mesInicio  != null ? q.mesInicio  : vocab().mesInicioDefault;
-      const mesFin1 = q.mesTermino != null ? q.mesTermino + 1 : vocab().mesFinDefault + 1;
-      const periodos = q.tipo === 'mensual'
-        ? MESES.slice(mesIni1, mesFin1).map(m => `${m} ${q.anio || 2025}`)
-        : [`Anual ${q.anio || 2025}`];
-
-      periodos.forEach(periodo => {
-        const obligado = q.monto || 0;
-        totalEsperado += obligado;
-        const totalPeriodo = pagosPagados
-          .filter(p => p.alumnoId === alu.id && p.cuotaId === q.id && p.periodo === periodo)
-          .reduce((s, p) => s + (p.monto || 0), 0);
-        totalPagado += Math.min(totalPeriodo, obligado);
-      });
-    });
+  const ctx = vm.createContext({
+    DB:              mockDB,
+    S:               mockS,
+    V9_RELACIONAL:   esV9,
+    MESES,
+    // vocab: mesInicioDefault=2 (Marzo), mesFinDefault=11 (Diciembre) — igual que app 'curso'
+    vocab: () => ({ mesInicioDefault: 2, mesFinDefault: 11 }),
+    // helpers de UI — no se usan en calcFinanzas, solo necesarios para que el archivo cargue
+    clp:         v  => '$' + Math.round(v||0).toLocaleString('es-CL'),
+    uid:         () => Date.now().toString(36) + Math.random().toString(36).slice(2,5),
+    isoToday:    () => new Date().toISOString().slice(0,10),
+    fmtDate:     () => '',
+    escHtml:     s  => String(s||''),
+    initials:    () => '?',
+    getCurso:    () => ({}),
+    getAlumnos:  () => (mockDB.alumnos||[]).filter(a => a.cursoId === mockS.cursoId && a.estado !== 'retirado'),
+    getAlumnosAll: () => (mockDB.alumnos||[]).filter(a => a.cursoId === mockS.cursoId),
+    getCuotas:   () => (mockDB.cuotas||[]).filter(q => q.cursoId === mockS.cursoId && q.activa),
+    getPagos:    () => {
+      const cuotasIds = new Set((mockDB.cuotas||[]).filter(q=>q.cursoId===mockS.cursoId).map(q=>q.id));
+      return (mockDB.pagos||[]).filter(p => cuotasIds.has(p.cuotaId));
+    },
+    getMovs:     () => (mockDB.movimientos||[]).filter(m => m.cursoId === mockS.cursoId),
+    // Stubs de UI
+    go:              () => {},
+    showToast:       () => {},
+    document:        { querySelector: () => null, querySelectorAll: () => [], getElementById: () => null },
+    console,
   });
 
-  const pctCumpl = totalEsperado > 0 ? Math.min(100, Math.round(totalPagado / totalEsperado * 100)) : 0;
-  return { totPagos, totalEsperado, totalPagado, pctCumpl, totalIngresos, totGastos };
+  vm.runInContext(src, ctx);
+  return { calcFinanzas: ctx.calcFinanzas.bind(ctx) };
 }
 
-/** Réplica de la lógica de pagos huérfanos de pagos.js */
-function detectarHuerfanos(cuota, pagos) {
-  const mesIni1 = cuota.mesInicio  != null ? cuota.mesInicio  : vocab().mesInicioDefault;
-  const mesFin1 = cuota.mesTermino != null ? cuota.mesTermino + 1 : vocab().mesFinDefault + 1;
-  const periodos = cuota.tipo === 'mensual'
-    ? MESES.slice(mesIni1, mesFin1).map(m => `${m} ${cuota.anio || 2025}`)
-    : [`Anual ${cuota.anio || 2025}`];
-  return pagos.filter(p => !periodos.includes(p.periodo));
+// ─── Fixtures base ────────────────────────────────────────────────────────────
+
+const CRS = 'crs-fin-test';
+const S   = { cursoId: CRS };
+
+function alu(id, extra = {}) {
+  return { id, cursoId: CRS, estado: 'activo', eximido: false, ...extra };
 }
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-let passed = 0, failed = 0;
-
-function it(desc, fn) {
-  try {
-    fn();
-    console.log(`  ✓ ${desc}`);
-    passed++;
-  } catch (e) {
-    console.error(`  ✗ ${desc}`);
-    console.error(`    ${e.message}`);
-    failed++;
-  }
+function cuota(id, tipo, monto, anio, extra = {}) {
+  return { id, cursoId: CRS, activa: true, tipo, monto, anio, ...extra };
 }
-
-function eq(actual, expected, msg = '') {
-  if (actual !== expected) {
-    throw new Error(`${msg ? msg + ': ' : ''}expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
-  }
+function pago(id, alumnoId, cuotaId, periodo, monto) {
+  return { id, alumnoId, cuotaId, periodo, monto, estado: 'pagado' };
 }
-
-function arrayEq(actual, expected, msg = '') {
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    throw new Error(`${msg ? msg + ': ' : ''}expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
-  }
+function plan(id, alumnoId, cuotaId, periodo, abonos, activo = true) {
+  const montoTotal = abonos.reduce((s,a) => s + a.monto, 0);
+  return { id, alumnoId, cuotaId, periodo, montoTotal, activo, creadoEn: '2025-01-01',
+    abonos: abonos.map((a, i) => ({ id: `ab-${id}-${i}`, ...a })) };
 }
+function abono(monto, pagado) { return { monto, pagado, fecha: '2025-01-10', fechaPago: pagado ? '2025-01-15' : null }; }
 
-// ─── Fixtures ────────────────────────────────────────────────────────────────
+// ─── Suite ────────────────────────────────────────────────────────────────────
 
-const ALU_A = { id: 'alu-a', nombres: 'Sofía',     apellidos: 'García',  eximido: false };
-const ALU_B = { id: 'alu-b', nombres: 'Valentina', apellidos: 'López',   eximido: false };
-const ALU_EX = { id: 'alu-ex', nombres: 'Carlos', apellidos: 'Paz',      eximido: true  };
+console.log('\ncalcFinanzas() — función real via vm\n');
 
-const CUOTA_MENSUAL = { id: 'q-m', activa: true, tipo: 'mensual', monto: 15000, anio: 2025, mesInicio: 2, mesTermino: 2 }; // solo Marzo
-const CUOTA_ANUAL   = { id: 'q-a', activa: true, tipo: 'anual',   monto: 50000, anio: 2025 };
-const CUOTA_SIN_TIPO = { id: 'q-n', activa: true, tipo: null,     monto: 15000, anio: 2025 };
+// FIN.1 — sin pagos
+try {
+  const DB = { alumnos: [alu('a1')], cuotas: [cuota('q1','mensual',15000,2025,{mesInicio:2,mesTermino:2})], pagos: [], planesPago: [], movimientos: [] };
+  const { calcFinanzas } = cargarCalculos(DB, S);
+  const r = calcFinanzas();
+  eq(r.totPagos,      0,     'FIN.1 totPagos=0');
+  eq(r.totalEsperado, 15000, 'FIN.1 totalEsperado=15000');
+  eq(r.pctCumpl,      0,     'FIN.1 pctCumpl=0');
+} catch(e) { ko('FIN.1', e.message); }
 
-// ─── Suite: calcFinanzas — casos base ────────────────────────────────────────
+// FIN.2 — pago exacto: 100%
+try {
+  const DB = {
+    alumnos: [alu('a1')],
+    cuotas:  [cuota('q1','mensual',15000,2025,{mesInicio:2,mesTermino:2})],
+    pagos:   [pago('p1','a1','q1','Marzo 2025',15000)],
+    planesPago: [], movimientos: [],
+  };
+  const { calcFinanzas } = cargarCalculos(DB, S);
+  const r = calcFinanzas();
+  eq(r.totPagos,     15000, 'FIN.2 totPagos=15000');
+  eq(r.totalPagado,  15000, 'FIN.2 totalPagado=15000');
+  eq(r.pctCumpl,       100, 'FIN.2 pctCumpl=100');
+} catch(e) { ko('FIN.2', e.message); }
 
-console.log('\ncalcFinanzas() — casos base');
+// FIN.3 — dos alumnos, uno paga: 50%
+try {
+  const DB = {
+    alumnos: [alu('a1'), alu('a2')],
+    cuotas:  [cuota('q1','mensual',15000,2025,{mesInicio:2,mesTermino:2})],
+    pagos:   [pago('p1','a1','q1','Marzo 2025',15000)],
+    planesPago: [], movimientos: [],
+  };
+  const { calcFinanzas } = cargarCalculos(DB, S);
+  const r = calcFinanzas();
+  eq(r.totalEsperado, 30000, 'FIN.3 totalEsperado=30000');
+  eq(r.totalPagado,   15000, 'FIN.3 totalPagado=15000');
+  eq(r.pctCumpl,         50, 'FIN.3 pctCumpl=50');
+} catch(e) { ko('FIN.3', e.message); }
 
-it('sin pagos: totPagos=0, totalEsperado por alumno×período', () => {
-  const r = calcFinanzas({ alumnos: [ALU_A], cuotas: [CUOTA_MENSUAL], pagos: [] });
-  eq(r.totPagos, 0, 'totPagos');
-  eq(r.totalEsperado, 15000, 'totalEsperado');
-  eq(r.totalPagado, 0, 'totalPagado');
-  eq(r.pctCumpl, 0, 'pctCumpl');
-});
+// FIN.4 — eximido excluido de totalEsperado
+try {
+  const DB = {
+    alumnos: [alu('a1', {eximido:true})],
+    cuotas:  [cuota('q1','mensual',15000,2025,{mesInicio:2,mesTermino:2})],
+    pagos:   [], planesPago: [], movimientos: [],
+  };
+  const { calcFinanzas } = cargarCalculos(DB, S);
+  const r = calcFinanzas();
+  eq(r.totalEsperado, 0, 'FIN.4 eximido: totalEsperado=0');
+  eq(r.pctCumpl,      0, 'FIN.4 pctCumpl=0');
+} catch(e) { ko('FIN.4', e.message); }
 
-it('pago exacto: 100% cumplimiento', () => {
-  const pagos = [{ id: 'p1', alumnoId: 'alu-a', cuotaId: 'q-m', monto: 15000, estado: 'pagado', periodo: 'Marzo 2025' }];
-  const r = calcFinanzas({ alumnos: [ALU_A], cuotas: [CUOTA_MENSUAL], pagos });
-  eq(r.totPagos, 15000, 'totPagos');
-  eq(r.totalPagado, 15000, 'totalPagado');
-  eq(r.pctCumpl, 100, 'pctCumpl');
-});
+// FIN.5 — eximido con pago: recaudado sí, cumplimiento no
+try {
+  const DB = {
+    alumnos: [alu('a-ex', {eximido:true}), alu('a2')],
+    cuotas:  [cuota('q1','mensual',15000,2025,{mesInicio:2,mesTermino:2})],
+    pagos:   [pago('p-ex','a-ex','q1','Marzo 2025',15000)],
+    planesPago: [], movimientos: [],
+  };
+  const { calcFinanzas } = cargarCalculos(DB, S);
+  const r = calcFinanzas();
+  eq(r.totPagos,      15000, 'FIN.5 recaudado incluye pago del eximido');
+  eq(r.totalEsperado, 15000, 'FIN.5 solo a2 no eximido');
+  eq(r.totalPagado,       0, 'FIN.5 pago de eximido no cuenta en cumplimiento');
+  eq(r.pctCumpl,          0, 'FIN.5 pctCumpl=0');
+} catch(e) { ko('FIN.5', e.message); }
 
-it('dos alumnos, pago solo de uno: 50%', () => {
-  const pagos = [{ id: 'p1', alumnoId: 'alu-a', cuotaId: 'q-m', monto: 15000, estado: 'pagado', periodo: 'Marzo 2025' }];
-  const r = calcFinanzas({ alumnos: [ALU_A, ALU_B], cuotas: [CUOTA_MENSUAL], pagos });
-  eq(r.totalEsperado, 30000, 'totalEsperado');
-  eq(r.totalPagado, 15000, 'totalPagado');
-  eq(r.pctCumpl, 50, 'pctCumpl');
-});
+// FIN.6 — pago parcial: 80%
+try {
+  const DB = {
+    alumnos: [alu('a1')],
+    cuotas:  [cuota('q1','mensual',15000,2025,{mesInicio:2,mesTermino:2})],
+    pagos:   [
+      pago('p1','a1','q1','Marzo 2025',7000),
+      pago('p2','a1','q1','Marzo 2025',5000),
+    ],
+    planesPago: [], movimientos: [],
+  };
+  const { calcFinanzas } = cargarCalculos(DB, S);
+  const r = calcFinanzas();
+  eq(r.totPagos,    12000, 'FIN.6 recaudado=$12000');
+  eq(r.totalPagado, 12000, 'FIN.6 totalPagado=min(12000,15000)');
+  eq(r.pctCumpl,       80, 'FIN.6 pctCumpl=80');
+} catch(e) { ko('FIN.6', e.message); }
 
-// ─── Suite: alumno eximido ────────────────────────────────────────────────────
+// FIN.7 — sobrepago: recaudado > obligado, cumplimiento capped
+try {
+  const DB = {
+    alumnos: [alu('a1')],
+    cuotas:  [cuota('q1','mensual',15000,2025,{mesInicio:2,mesTermino:2})],
+    pagos:   [pago('p1','a1','q1','Marzo 2025',20000)],
+    planesPago: [], movimientos: [],
+  };
+  const { calcFinanzas } = cargarCalculos(DB, S);
+  const r = calcFinanzas();
+  eq(r.totPagos,    20000, 'FIN.7 recaudado=$20000 (bruto)');
+  eq(r.totalPagado, 15000, 'FIN.7 totalPagado capped al obligado');
+  eq(r.pctCumpl,      100, 'FIN.7 pctCumpl=100 (no supera)');
+} catch(e) { ko('FIN.7', e.message); }
 
-console.log('\ncalcFinanzas() — alumno eximido');
+// FIN.8 — plan activo con abonos: suman a recaudado Y a cumplimiento
+try {
+  const pl = plan('plan1','a1','q1','Marzo 2025',[abono(8000,true), abono(7000,false)]);
+  const DB = {
+    alumnos: [alu('a1')],
+    cuotas:  [cuota('q1','mensual',15000,2025,{mesInicio:2,mesTermino:2})],
+    pagos:   [],
+    planesPago: [pl],
+    movimientos: [],
+  };
+  const { calcFinanzas } = cargarCalculos(DB, S, true); // V9
+  const r = calcFinanzas();
+  eq(r.totPagos,     8000, 'FIN.8 recaudado=abono pagado ($8000)');
+  eq(r.totalPagado,  8000, 'FIN.8 cumplimiento=min(8000,15000)');
+  eq(r.pctCumpl,       53, 'FIN.8 pctCumpl=round(8000/15000*100)=53');
+} catch(e) { ko('FIN.8', e.message); }
 
-it('alumno eximido no cuenta en totalEsperado', () => {
-  const r = calcFinanzas({ alumnos: [ALU_EX], cuotas: [CUOTA_MENSUAL], pagos: [] });
-  eq(r.totalEsperado, 0, 'totalEsperado debe ser 0');
-  eq(r.pctCumpl, 0, 'pctCumpl');
-});
+// FIN.9 — plan cerrado (V9): abonos suman a recaudado (plan cerrado NO creó pago)
+try {
+  const pl = plan('plan1','a1','q1','Marzo 2025',
+    [abono(7500,true), abono(7500,true)], false /* activo=false */);
+  const DB = {
+    alumnos: [alu('a1')],
+    cuotas:  [cuota('q1','mensual',15000,2025,{mesInicio:2,mesTermino:2})],
+    pagos:   [], // en V9 no se crea pago al completar
+    planesPago: [pl],
+    movimientos: [],
+  };
+  const { calcFinanzas } = cargarCalculos(DB, S, true); // V9=true
+  const r = calcFinanzas();
+  eq(r.totPagos,    15000, 'FIN.9 V9 plan cerrado: recaudado=$15000');
+  eq(r.totalPagado, 15000, 'FIN.9 V9 plan cerrado: cuenta en cumplimiento');
+  eq(r.pctCumpl,      100, 'FIN.9 V9 plan cerrado: 100%');
+} catch(e) { ko('FIN.9', e.message); }
 
-it('eximido tiene pago: cuenta en recaudación pero no en cumplimiento', () => {
-  // Un alumno eximido que pagó de todas formas: el pago es ingreso real,
-  // pero no debería inflar el % de cumplimiento.
-  const pagos = [{ id: 'p-ex', alumnoId: 'alu-ex', cuotaId: 'q-m', monto: 15000, estado: 'pagado', periodo: 'Marzo 2025' }];
-  const r = calcFinanzas({ alumnos: [ALU_EX, ALU_B], cuotas: [CUOTA_MENSUAL], pagos });
-  eq(r.totPagos, 15000, 'recaudación sí incluye el pago');
-  eq(r.totalEsperado, 15000, 'solo alu-b no eximido');
-  eq(r.totalPagado, 0, 'alu-ex no cuenta en totalPagado');
-  eq(r.pctCumpl, 0, 'pctCumpl');
-});
+// FIN.10 — plan cerrado (blob): pago ya creado → abonos NO duplican
+try {
+  const pl = plan('plan1','a1','q1','Marzo 2025',
+    [abono(7500,true), abono(7500,true)], false /* activo=false */);
+  const DB = {
+    alumnos: [alu('a1')],
+    cuotas:  [cuota('q1','mensual',15000,2025,{mesInicio:2,mesTermino:2})],
+    pagos:   [pago('p-auto','a1','q1','Marzo 2025',15000)], // pago creado por blob al completar
+    planesPago: [pl],
+    movimientos: [],
+  };
+  const { calcFinanzas } = cargarCalculos(DB, S, false); // blob (V9=false)
+  const r = calcFinanzas();
+  // blob: plan cerrado → no suma abonos (plan.activo=false excluido)
+  // recaudado = solo el pago directo
+  eq(r.totPagos,    15000, 'FIN.10 blob plan cerrado: recaudado=$15000 (solo pago, sin duplicar)');
+  eq(r.totalPagado, 15000, 'FIN.10 blob plan cerrado: cumplimiento OK');
+  eq(r.pctCumpl,      100, 'FIN.10 blob plan cerrado: 100%');
+} catch(e) { ko('FIN.10', e.message); }
 
-// ─── Suite: pagos parciales ───────────────────────────────────────────────────
+// FIN.11 — período incompatible: pago en recaudado, 0% cumplimiento
+try {
+  const DB = {
+    alumnos: [alu('a1')],
+    cuotas:  [cuota('q1','mensual',15000,2025,{mesInicio:2,mesTermino:2})], // genera Marzo 2025
+    pagos:   [pago('p-mal','a1','q1','Abril 2025',15000)], // período incorrecto
+    planesPago: [], movimientos: [],
+  };
+  const { calcFinanzas } = cargarCalculos(DB, S);
+  const r = calcFinanzas();
+  eq(r.totPagos,    15000, 'FIN.11 pago mal período: sí en recaudado');
+  eq(r.totalPagado,     0, 'FIN.11 pago mal período: no en cumplimiento');
+  eq(r.pctCumpl,        0, 'FIN.11 pctCumpl=0');
+} catch(e) { ko('FIN.11', e.message); }
 
-console.log('\ncalcFinanzas() — pagos parciales');
+// FIN.12 — cuota sin tipo: genera "Anual AAAA", pago mensual no matchea
+try {
+  const DB = {
+    alumnos: [alu('a1')],
+    cuotas:  [cuota('q1',null,15000,2025)], // tipo=null → genera "Anual 2025"
+    pagos:   [pago('p1','a1','q1','Marzo 2025',15000)], // pago mensual no matchea
+    planesPago: [], movimientos: [],
+  };
+  const { calcFinanzas } = cargarCalculos(DB, S);
+  const r = calcFinanzas();
+  eq(r.totPagos,    15000, 'FIN.12 tipo=null: recaudado OK');
+  eq(r.totalPagado,     0, 'FIN.12 tipo=null: pago mensual no matchea Anual 2025');
+  eq(r.pctCumpl,        0, 'FIN.12 pctCumpl=0');
+} catch(e) { ko('FIN.12', e.message); }
 
-it('pago parcial: recaudación = monto recibido, totalPagado capped al obligado', () => {
-  const pagos = [
-    { id: 'p1', alumnoId: 'alu-a', cuotaId: 'q-m', monto: 7000, estado: 'pagado', periodo: 'Marzo 2025' },
-    { id: 'p2', alumnoId: 'alu-a', cuotaId: 'q-m', monto: 5000, estado: 'pagado', periodo: 'Marzo 2025' },
-  ];
-  // 2 pagos suman $12.000 (parcial) de un obligado de $15.000
-  const r = calcFinanzas({ alumnos: [ALU_A], cuotas: [CUOTA_MENSUAL], pagos });
-  eq(r.totPagos, 12000, 'recaudación = suma de ambos pagos');
-  eq(r.totalPagado, 12000, 'totalPagado = min(12000, 15000)');
-  eq(r.pctCumpl, 80, 'pctCumpl = round(12000/15000*100)');
-});
+// FIN.13 — rango modificado: pago del rango anterior no matchea período generado actual
+try {
+  const DB = {
+    alumnos: [alu('a1')],
+    cuotas:  [cuota('q1','mensual',15000,2025,{mesInicio:2,mesTermino:2})], // ahora solo Marzo
+    pagos:   [
+      pago('p1','a1','q1','Marzo 2025',15000),  // matchea
+      pago('p2','a1','q1','Abril 2025',15000),   // era válido cuando el rango llegaba a Abril
+    ],
+    planesPago: [], movimientos: [],
+  };
+  const { calcFinanzas } = cargarCalculos(DB, S);
+  const r = calcFinanzas();
+  eq(r.totPagos,    30000, 'FIN.13 recaudado=$30000 (ambos pagos)');
+  eq(r.totalPagado, 15000, 'FIN.13 solo Marzo matchea rango actual');
+  eq(r.pctCumpl,      100, 'FIN.13 pctCumpl=100 (solo Marzo esperado)');
+} catch(e) { ko('FIN.13', e.message); }
 
-it('sobrepago: recaudación refleja el exceso, cumplimiento cappea al 100%', () => {
-  const pagos = [
-    { id: 'p1', alumnoId: 'alu-a', cuotaId: 'q-m', monto: 20000, estado: 'pagado', periodo: 'Marzo 2025' },
-  ];
-  const r = calcFinanzas({ alumnos: [ALU_A], cuotas: [CUOTA_MENSUAL], pagos });
-  eq(r.totPagos, 20000, 'recaudación = $20.000 bruto');
-  eq(r.totalPagado, 15000, 'totalPagado capped al obligado');
-  eq(r.pctCumpl, 100, 'pctCumpl = 100 (no supera)');
-});
+// FIN.14 — ESCENARIO CONOCIDO: 2 alumnos × (Marzo $15k + Abril $15k + anual $5k)
+//          Sofía pagó Marzo y Abril. Valentina no pagó nada.
+//          → esperado $70k, pagado $30k, cumplimiento 43%
+try {
+  const DB = {
+    alumnos: [alu('sofia'), alu('valentina')],
+    cuotas:  [
+      cuota('q-mar', 'mensual', 15000, 2025, {mesInicio:2, mesTermino:2}), // Marzo 2025
+      cuota('q-abr', 'mensual', 15000, 2025, {mesInicio:3, mesTermino:3}), // Abril 2025
+      cuota('q-anu', 'anual',    5000, 2025),                              // Anual 2025
+    ],
+    pagos: [
+      pago('p-s1', 'sofia', 'q-mar', 'Marzo 2025', 15000),
+      pago('p-s2', 'sofia', 'q-abr', 'Abril 2025', 15000),
+      // Sofia no pagó la anual. Valentina no pagó nada.
+    ],
+    planesPago: [], movimientos: [],
+  };
+  const { calcFinanzas } = cargarCalculos(DB, S);
+  const r = calcFinanzas();
+  const esperado70k = 2 * (15000 + 15000 + 5000); // 70000
+  const pct43       = Math.round(30000 / 70000 * 100); // 43
+  eq(r.totalEsperado, 70000, 'FIN.14 totalEsperado=$70000');
+  eq(r.totPagos,      30000, 'FIN.14 totPagos=$30000');
+  eq(r.totalPagado,   30000, 'FIN.14 totalPagado=$30000');
+  eq(r.pctCumpl,         43, 'FIN.14 pctCumpl=43%');
+} catch(e) { ko('FIN.14', e.message); }
 
-// ─── Suite: abonos de planes ──────────────────────────────────────────────────
+// FIN.15 — Revertir abono: recaudado disminuye exactamente por su monto
+try {
+  // Plan con 3 abonos: 2 pagados, 1 no pagado → recaudado = $10000
+  const pl = plan('plan1','a1','q1','Marzo 2025',[
+    abono(5000, true),
+    abono(5000, true),
+    abono(5000, false),
+  ]);
 
-console.log('\ncalcFinanzas() — abonos de planes');
+  const DB1 = {
+    alumnos: [alu('a1')],
+    cuotas:  [cuota('q1','mensual',15000,2025,{mesInicio:2,mesTermino:2})],
+    pagos:   [], planesPago: [pl], movimientos: [],
+  };
+  const { calcFinanzas: cf1 } = cargarCalculos(DB1, S, true);
+  const r1 = cf1();
+  eq(r1.totPagos, 10000, 'FIN.15 antes de revertir: recaudado=$10000');
 
-it('plan activo con abonos pagados se suma a recaudación', () => {
-  const planesPago = [{
-    id: 'plan-1', alumnoId: 'alu-a', cuotaId: 'q-m', activo: true,
-    abonos: [
-      { id: 'ab1', monto: 5000, pagado: true },
-      { id: 'ab2', monto: 5000, pagado: true },
-      { id: 'ab3', monto: 5000, pagado: false }, // pendiente
-    ]
-  }];
-  const r = calcFinanzas({ alumnos: [ALU_A], cuotas: [CUOTA_MENSUAL], pagos: [], planesPago });
-  eq(r.totPagos, 10000, 'recaudación = 2 abonos pagados');
-  // Nota: los abonos se suman a totPagos pero NO cuentan en totalPagado (período-matching)
-  // porque están en planesPago, no en pagos. Esta es la divergencia documentada.
-});
+  // Simula reversión del segundo abono (pagado → false)
+  pl.abonos[1].pagado = false;
 
-it('plan cerrado (activo=false) NO se suma a recaudación', () => {
-  const planesPago = [{
-    id: 'plan-cerrado', alumnoId: 'alu-a', cuotaId: 'q-m', activo: false,
-    abonos: [{ id: 'ab1', monto: 5000, pagado: true }]
-  }];
-  const r = calcFinanzas({ alumnos: [ALU_A], cuotas: [CUOTA_MENSUAL], pagos: [], planesPago });
-  eq(r.totPagos, 0, 'plan cerrado: abonos no cuentan en recaudación');
-});
+  // Mismo plan — recargamos la función con el mismo DB (ya mutado)
+  const { calcFinanzas: cf2 } = cargarCalculos(DB1, S, true);
+  const r2 = cf2();
+  eq(r2.totPagos,    5000, 'FIN.15 tras revertir abono: recaudado disminuyó exactamente $5000');
+  eq(r2.totalPagado, 5000, 'FIN.15 cumplimiento también disminuye');
+} catch(e) { ko('FIN.15', e.message); }
 
-// ─── Suite: período incompatible (pago con período incorrecto) ────────────────
+// ─── Resultado ────────────────────────────────────────────────────────────────
 
-console.log('\ncalcFinanzas() — período incompatible');
-
-it('pago con período incorrecto: en recaudación pero no en cumplimiento', () => {
-  // Escenario: cuota mensual de Marzo, pago registrado con período "Anual 2025"
-  const pagos = [
-    { id: 'p-mal', alumnoId: 'alu-a', cuotaId: 'q-m', monto: 15000, estado: 'pagado', periodo: 'Anual 2025' },
-  ];
-  const r = calcFinanzas({ alumnos: [ALU_A], cuotas: [CUOTA_MENSUAL], pagos });
-  eq(r.totPagos, 15000, 'recaudación sí incluye el pago');
-  eq(r.totalPagado, 0, 'no cuenta en cumplimiento: período no matchea');
-  eq(r.pctCumpl, 0, 'pctCumpl = 0');
-});
-
-it('cuota sin tipo: mismo resultado que período incompatible', () => {
-  // Con tipo=null se genera "Anual 2025", el pago con "Marzo 2025" no matchea
-  const pagos = [
-    { id: 'p1', alumnoId: 'alu-a', cuotaId: 'q-n', monto: 15000, estado: 'pagado', periodo: 'Marzo 2025' },
-  ];
-  const r = calcFinanzas({ alumnos: [ALU_A], cuotas: [CUOTA_SIN_TIPO], pagos });
-  eq(r.totPagos, 15000, 'recaudación = $15.000');
-  eq(r.totalPagado, 0, 'no matchea: tipo=null genera Anual 2025');
-  eq(r.pctCumpl, 0);
-});
-
-// ─── Suite: detección de pagos huérfanos ─────────────────────────────────────
-
-console.log('\ndetectarHuerfanos() — pagos invisibles');
-
-it('tipo=null: pago con período mensual es huérfano', () => {
-  const pagos = [
-    { id: 'p1', periodo: 'Marzo 2025' },   // pago real
-    { id: 'p2', periodo: 'Anual 2025' },   // matchea el período generado
-  ];
-  const h = detectarHuerfanos(CUOTA_SIN_TIPO, pagos);
-  eq(h.length, 1, 'un huérfano');
-  eq(h[0].id, 'p1', 'el pago con período mensual');
-});
-
-it('cuota mensual con rango modificado: pagos del rango anterior son huérfanos', () => {
-  // La cuota cubría Marzo–Abril, ahora solo cubre Marzo
-  const cuota = { id: 'q-mod', activa: true, tipo: 'mensual', monto: 15000, anio: 2025, mesInicio: 2, mesTermino: 2 };
-  const pagos = [
-    { id: 'p1', periodo: 'Marzo 2025' }, // dentro del rango actual
-    { id: 'p2', periodo: 'Abril 2025' }, // era válido cuando el rango llegaba a Abril
-  ];
-  const h = detectarHuerfanos(cuota, pagos);
-  eq(h.length, 1, 'un huérfano');
-  eq(h[0].id, 'p2', 'el pago de Abril queda fuera del rango actual');
-});
-
-it('cuota anual: período "Anual 2025" no es huérfano', () => {
-  const cuota = { id: 'q-an', activa: true, tipo: 'anual', monto: 50000, anio: 2025 };
-  const pagos = [{ id: 'p1', periodo: 'Anual 2025' }];
-  const h = detectarHuerfanos(cuota, pagos);
-  eq(h.length, 0, 'ningún huérfano');
-});
-
-it('cuota anual: pago con período mensual es huérfano', () => {
-  const cuota = { id: 'q-an', activa: true, tipo: 'anual', monto: 50000, anio: 2025 };
-  const pagos = [{ id: 'p-mal', periodo: 'Enero 2025' }];
-  const h = detectarHuerfanos(cuota, pagos);
-  eq(h.length, 1, 'un huérfano');
-});
-
-// ─── Suite: escenario staging — $30k/$70k/43% ────────────────────────────────
-
-console.log('\nEscenario staging: $30k recaudados, $70k esperados, ~43%');
-
-it('replica el escenario de staging (tras reparación): 43% cumplimiento', () => {
-  // Sofía tiene 2 pagos de $15k (Marzo + Abril), ambos ahora matchean.
-  // Valentina tiene 2 cuotas sin pago.
-  // Un tercer alumno (staging) también tiene 2 cuotas sin pago.
-  // 3 alumnos × 2 cuotas × $15k = $90k... pero el dashboard muestra $70k.
-  //
-  // Con $70k esperados y $30k pagados: 43% → implica que el esperado no es
-  // simplemente 3×2×15k. Podría ser 2 alumnos no-eximidos, con una cuota
-  // extra de $10k, etc. Este test verifica la fórmula con los valores conocidos.
-  //
-  // Configuración que produce $30k/70k/43%:
-  //   2 alumnos activos, cuota-a-01 ($15k, Marzo) + cuota-a-02 ($15k, Abril)
-  //   + cuota extra ($20k, solo para uno de ellos, o cuota de $10k por 2)
-  //   O bien: 2 alumnos × cuota mensual Marzo–Dic ($15k × 10 meses = $150k) — demasiado
-  //
-  // La explicación más simple: en staging existen datos adicionales al seed que
-  // no conozco desde aquí. La verificación exacta requiere ejecutar M007 paso 2c.
-  // Este test valida la fórmula con los valores declarados:
-  const totalEsperado = 70000;
-  const totalPagado   = 30000;
-  const pctCumpl = Math.round(totalPagado / totalEsperado * 100);
-  eq(pctCumpl, 43, 'pctCumpl = 43%');
-});
-
-it('escenario mínimo seed (2 alumnos, 2 cuotas $15k): 50% tras reparación', () => {
-  // Solo con datos del seed: Sofía tiene ambos pagos, Valentina ninguno
-  const alumnos  = [ALU_A, ALU_B];
-  const cuotas   = [
-    { id: 'q-01', activa: true, tipo: 'mensual', monto: 15000, anio: 2025, mesInicio: 2, mesTermino: 2 },
-    { id: 'q-02', activa: true, tipo: 'mensual', monto: 15000, anio: 2025, mesInicio: 3, mesTermino: 3 },
-  ];
-  const pagos = [
-    { id: 'p1', alumnoId: 'alu-a', cuotaId: 'q-01', monto: 15000, estado: 'pagado', periodo: 'Marzo 2025' },
-    { id: 'p2', alumnoId: 'alu-a', cuotaId: 'q-02', monto: 15000, estado: 'pagado', periodo: 'Abril 2025' },
-  ];
-  const r = calcFinanzas({ alumnos, cuotas, pagos });
-  eq(r.totPagos, 30000, 'recaudado = $30k');
-  eq(r.totalEsperado, 60000, 'esperado = 2 alumnos × 2 × $15k');
-  eq(r.totalPagado, 30000, 'pagado matcheado = $30k');
-  eq(r.pctCumpl, 50, 'pctCumpl = 50% con datos del seed');
-});
-
-// ─── Resultado ───────────────────────────────────────────────────────────────
-
-console.log(`\n${'─'.repeat(50)}`);
-console.log(`Resultado: ${passed} pasados, ${failed} fallidos`);
-if (failed > 0) process.exit(1);
+console.log(`\n${'─'.repeat(60)}`);
+if (failures.length) {
+  console.error('\nFallidos:');
+  failures.forEach(f => console.error(`  • ${f}`));
+}
+console.log(`Resultado: ${pass} pasados, ${fail} fallidos\n`);
+if (fail > 0) process.exit(1);

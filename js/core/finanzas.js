@@ -52,12 +52,21 @@ function calcFinanzas(){
   const alumnos = getAlumnos();
 
   const pagosPagados = pagos.filter(p=>p.estado==='pagado');
-  // Sumar abonos pagados de planes activos
-  const planesActivos = (DB.planesPago||[]).filter(p=>{
+
+  // Planes del curso — activos Y cerrados.
+  // Anti-duplicación: en modo blob (V9_RELACIONAL=false) un plan cerrado crea
+  // automáticamente un pago en DB.pagos al completarse, por lo que sus abonos
+  // ya están contabilizados en pagosPagados. Para evitar doble conteo, en ese
+  // modo solo se suman los abonos de planes ACTIVOS (parcialmente pagados).
+  // En modo V9 (V9_RELACIONAL=true) completar un plan NO crea un pago;
+  // los abonos de planes cerrados son la única fuente de ese ingreso.
+  const esV9 = typeof V9_RELACIONAL !== 'undefined' && V9_RELACIONAL;
+  const planesDelCurso = (DB.planesPago||[]).filter(p=>{
     const q=(DB.cuotas||[]).find(x=>x.id===p.cuotaId);
-    return q&&q.cursoId===S.cursoId&&p.activo;
+    if(!q || q.cursoId!==S.cursoId) return false;
+    return esV9 ? true : p.activo; // blob: solo activos; V9: todos
   });
-  const totAbonosPagados = planesActivos.reduce((s,plan)=>
+  const totAbonosPagados = planesDelCurso.reduce((s,plan)=>
     s+plan.abonos.filter(a=>a.pagado).reduce((ss,ab)=>ss+ab.monto,0),0);
   const totPagos = pagosPagados.reduce((s,p)=>s+p.monto,0) + totAbonosPagados;
   const totIngExtra = movs.filter(m=>m.tipo==='ingreso').reduce((s,m)=>s+m.monto,0);
@@ -86,9 +95,22 @@ function calcFinanzas(){
         totalEsperado += obligado;
         // B10-fix: usar filter+reduce para sumar TODOS los pagos del período
         // (antes: find() solo tomaba el primero; con pagos acumulables puede haber varios)
-        const totalPeriodo = pagosPagados
+        // Pagos directos para este período
+        const directos = pagosPagados
           .filter(p => p.alumnoId===alu.id && p.cuotaId===q.id && p.periodo===periodo)
           .reduce((s, p) => s + (p.monto||0), 0);
+        // Abonos de plan de pago para este período.
+        // Anti-duplicación: en blob, los planes cerrados ya generaron un pago directo;
+        // solo se suman abonos de planes activos (pagos parciales sin pago final aún).
+        // En V9, todos los planes (activo o cerrado) aportan sus abonos pagados.
+        const plan = (DB.planesPago||[]).find(p=>
+          p.alumnoId===alu.id && p.cuotaId===q.id && p.periodo===periodo
+          && (esV9 ? true : p.activo)
+        );
+        const abonosPlan = plan
+          ? plan.abonos.filter(a=>a.pagado).reduce((s,a)=>s+(a.monto||0),0)
+          : 0;
+        const totalPeriodo = directos + abonosPlan;
         // F-EXC-fix: limitar al obligado para que excedentes no inflen pctCumpl.
         // totPagos (ingresos brutos) ya recoge el excedente real;
         // totalPagado solo mide cumplimiento de la obligación.
