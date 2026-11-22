@@ -304,6 +304,7 @@ async function saveCuota(id){
   const monto=parseInt(document.getElementById('q-monto').value);
   if(!nombre||!monto){alert('Completa nombre y monto.');return;}
   const tipo = document.getElementById('q-tipo').value;
+  if(!tipo){alert('Selecciona el tipo de cuota (Mensual, Anual o Extraordinaria).');return;}
   const mesInicio  = tipo==='mensual' ? parseInt(document.getElementById('q-mes-inicio')?.value||'2')  : undefined;
   const mesTermino = tipo==='mensual' ? parseInt(document.getElementById('q-mes-termino')?.value||'11') : undefined;
   const data={nombre,tipo,monto,anio:parseInt(document.getElementById('q-anio').value)||2026,obs:document.getElementById('q-obs').value,activa:true,cursoId:S.cursoId,mesInicio,mesTermino};

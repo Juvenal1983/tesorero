@@ -394,7 +394,7 @@ async function crearCuotaV9(cuentaId, cursoId, data, accessToken) {
     curso_id:    cursoId,
     nombre:      data.nombre,
     monto:       Math.round(Number(data.monto)),
-    tipo:        data.tipo   || 'unica',
+    tipo:        data.tipo   || null,  // null explícito; la restricción DB rechazará el INSERT si falta
     anio:        data.anio   || new Date().getFullYear(),
     activa:      data.activa !== false,
     mes_inicio:  data.mesInicio  != null ? data.mesInicio  : null,

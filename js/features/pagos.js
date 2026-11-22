@@ -33,12 +33,23 @@ function renderPagos(){
       const periodos = q.tipo==='mensual'
         ? MESES.slice(mesIni1, mesFin1).map(m => `${m} ${q.anio||new Date().getFullYear()}`)
         : [`Anual ${q.anio||2026}`];
+
+      // ── Cuota sin tipo: detectar pagos huérfanos que no matchean ningún período ──
+      // Estos pagos existen en DB pero quedan invisibles con la generación de períodos actual.
+      const sinTipo = !q.tipo;
+      const pagosHuerfanos = sinTipo
+        ? pagosQ.filter(p=>!periodos.includes(p.periodo))
+        : [];
+
       detalleHtml += `
         <div class="card" style="margin-bottom:14px">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px">
-            <div class="card-title" style="margin:0">${escHtml(q.nombre)} <span class="badge ${q.tipo==='mensual'?'bgb':'bga'}" style="margin-left:6px">${q.tipo}</span></div>
+            <div class="card-title" style="margin:0">${escHtml(q.nombre)} <span class="badge ${q.tipo==='mensual'?'bgb':q.tipo==='anual'?'bga':q.tipo?'bga':'bgr'}" style="margin-left:6px" title="${q.tipo?'':'tipo no definido'}">${escHtml(q.tipo||'⚠ sin tipo')}</span></div>
             ${puedeEscribir()?`<button class="btn bp bs" style="font-size:13px" onclick="showModal('addPago',{aluId:'${sel}',cuotaId:'${q.id}'})">+ Registrar pago</button>`:''}
           </div>
+          ${sinTipo?`<div style="background:#FFF8E7;border:1px solid #F59E0B;border-radius:6px;padding:8px 12px;font-size:12px;color:#92400E;margin-bottom:12px">
+            ⚠️ Esta cuota no tiene tipo definido — los períodos y el resumen financiero pueden ser incorrectos. Corrige el tipo desde Configuración → Cuotas.
+          </div>`:''}
           <div class="tbl-wrap">
           <table>
             <thead><tr><th>Período</th><th>Estado</th><th>Monto</th><th style="display:none" class="hide-mobile">Fecha</th><th style="display:none" class="hide-mobile">Medio</th><th></th></tr></thead>
@@ -78,6 +89,18 @@ function renderPagos(){
                     }
                     return `<button class="btn bs" onclick="showModal('planPago',{aluId:'${sel}',cuotaId:'${q.id}',periodo:'${periodo}'})" style="font-size:11px;color:var(--t3)" title="Crear plan de pago">📅</button>`;
                   })()}</td>
+                </tr>`;
+              }).join('')}
+              ${pagosHuerfanos.map(p=>{
+                // Pagos reales que no matchean ningún período generado (porque tipo es null/incorrecto)
+                const montoP = Number(p.monto)||0;
+                return `<tr style="background:#FFFBEB">
+                  <td style="font-weight:500;white-space:nowrap;color:#92400E">${escHtml(p.periodo||'Sin período')} <span style="font-size:10px;color:#B45309">(⚠ fuera de período)</span></td>
+                  <td><span class="badge" style="background:#FFF8E7;color:#92400E;white-space:nowrap">⚠ Huérfano</span></td>
+                  <td style="color:#92400E;font-weight:600;white-space:nowrap">${clp(montoP)}</td>
+                  <td style="color:var(--t3);font-size:12px;white-space:nowrap">${p.fecha?fmtDate(p.fecha):'—'}</td>
+                  <td style="color:var(--t3);font-size:12px;white-space:nowrap">${escHtml(p.medio||'—')}</td>
+                  <td style="white-space:nowrap">${puedeEscribir()?`<div style="display:flex;gap:4px"><button class="btn bs" onclick="showModal('editPago',{pagoId:'${p.id}'})" title="Editar pago" style="font-size:11px;padding:3px 7px">✏️</button><button class="btn bs bd" onclick="delPago('${p.id}')" title="Eliminar pago" style="font-size:11px;padding:3px 7px">✕</button></div>`:''}</td>
                 </tr>`;
               }).join('')}
             </tbody>

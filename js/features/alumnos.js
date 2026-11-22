@@ -129,22 +129,40 @@ function renderAlumnos(){
         <tbody>
           ${(()=>{
             const cuotas = getCuotas();
+            const todosPagos = getPagos();
             return all.map(al=>{
-              const pagosAlu = getPagos().filter(p=>p.alumnoId===al.id&&p.estado==='pagado');
-              const pagado = pagosAlu.reduce((s,p)=>s+p.monto,0);
+              // ── Recaudado (bruto): todo lo recibido del alumno, sin filtro de período.
+              // Es la cifra contable real: cuánto ingresó a caja de este alumno.
+              const pagosAlu = todosPagos.filter(p=>p.alumnoId===al.id&&p.estado==='pagado');
+              const recaudado = pagosAlu.reduce((s,p)=>s+p.monto,0);
+
+              // ── Cumplimiento: idéntico a calcFinanzas() — período a período, capped al obligado.
+              // Numerador y denominador usan la misma base (períodos generados),
+              // por lo que el porcentaje refleja si cada obligación fue satisfecha,
+              // sin inflar por pagos fuera de período ni por cuotas sin tipo.
               let esperado = 0;
+              let pagadoMatcheado = 0;
               cuotas.forEach(q=>{
                 if(!q.activa) return;
-                const mesIni=(q.mesInicio!==undefined&&q.mesInicio!==null)?q.mesInicio:2;
-                const mesFin=(q.mesTermino!==undefined&&q.mesTermino!==null)?q.mesTermino+1:12;
-                const periodos=q.tipo==='mensual'?MESES.slice(mesIni,mesFin):[1];
-                esperado+=q.monto*periodos.length;
+                const mesIni=(q.mesInicio!==undefined&&q.mesInicio!==null)?q.mesInicio:vocab().mesInicioDefault;
+                const mesFin=(q.mesTermino!==undefined&&q.mesTermino!==null)?q.mesTermino+1:vocab().mesFinDefault+1;
+                const periodos=q.tipo==='mensual'
+                  ? MESES.slice(mesIni,mesFin).map(m=>`${m} ${q.anio||new Date().getFullYear()}`)
+                  : [`Anual ${q.anio||2026}`];
+                periodos.forEach(periodo=>{
+                  const obligado=q.monto||0;
+                  esperado+=obligado;
+                  const totalPeriodo=pagosAlu
+                    .filter(p=>p.cuotaId===q.id&&p.periodo===periodo)
+                    .reduce((s,p)=>s+(p.monto||0),0);
+                  pagadoMatcheado+=Math.min(totalPeriodo,obligado);
+                });
               });
-              const pct=esperado>0?Math.min(100,Math.round(pagado/esperado*100)):0;
+              const pct=esperado>0?Math.min(100,Math.round(pagadoMatcheado/esperado*100)):0;
               const color=pct>=80?'var(--g)':pct>=50?'#D97706':'var(--r)';
               return `<tr>
                 <td style="font-weight:600">${escHtml(al.nombres+' '+al.apellidos)}</td>
-                <td style="color:var(--g);font-weight:600">${clp(pagado)}</td>
+                <td style="color:var(--g);font-weight:600">${clp(recaudado)}</td>
                 <td><span style="font-weight:700;color:${color}">${pct}%</span>
                   <div style="height:4px;background:var(--brd);border-radius:2px;margin-top:4px;width:80px">
                     <div style="width:${pct}%;height:100%;background:${color};border-radius:2px"></div>
