@@ -34,12 +34,17 @@ function renderPagos(){
         ? MESES.slice(mesIni1, mesFin1).map(m => `${m} ${q.anio||new Date().getFullYear()}`)
         : [`Anual ${q.anio||2026}`];
 
-      // ── Cuota sin tipo: detectar pagos huérfanos que no matchean ningún período ──
-      // Estos pagos existen en DB pero quedan invisibles con la generación de períodos actual.
+      // ── Detectar pagos huérfanos: registros que no encajan en ningún período generado.
+      // Ocurre por dos razones distintas:
+      //   1. tipo=null → el motor genera un período incorrecto ("Anual AAAA") y los
+      //      pagos registrados con período real (ej. "Marzo 2025") quedan sin match.
+      //   2. tipo correcto pero rango de meses modificado → pagos registrados con el
+      //      rango anterior (ej. "Octubre 2025") quedan fuera del nuevo rango.
+      // En ambos casos los pagos existen en DB, deben mostrarse y nunca presentarse
+      // como "Pendiente" sin señalar la inconsistencia.
       const sinTipo = !q.tipo;
-      const pagosHuerfanos = sinTipo
-        ? pagosQ.filter(p=>!periodos.includes(p.periodo))
-        : [];
+      const pagosHuerfanos = pagosQ.filter(p => !periodos.includes(p.periodo));
+      const hayHuerfanos = pagosHuerfanos.length > 0;
 
       detalleHtml += `
         <div class="card" style="margin-bottom:14px">
@@ -49,6 +54,8 @@ function renderPagos(){
           </div>
           ${sinTipo?`<div style="background:#FFF8E7;border:1px solid #F59E0B;border-radius:6px;padding:8px 12px;font-size:12px;color:#92400E;margin-bottom:12px">
             ⚠️ Esta cuota no tiene tipo definido — los períodos y el resumen financiero pueden ser incorrectos. Corrige el tipo desde Configuración → Cuotas.
+          </div>`:hayHuerfanos?`<div style="background:#FFF8E7;border:1px solid #F59E0B;border-radius:6px;padding:8px 12px;font-size:12px;color:#92400E;margin-bottom:12px">
+            ⚠️ ${pagosHuerfanos.length} pago${pagosHuerfanos.length>1?'s':''} registrado${pagosHuerfanos.length>1?'s':''} con período fuera del rango actual de esta cuota. Revisa si el rango de meses fue modificado después de registrarlos.
           </div>`:''}
           <div class="tbl-wrap">
           <table>

@@ -123,8 +123,8 @@ function renderAlumnos(){
       <table class="tbl">
         <thead><tr>
           <th onclick="ordenarTablaFondos('nombre')" style="cursor:pointer">Alumno</th>
-          <th>Cuotas pagadas</th>
-          <th>% Cumplimiento</th>
+          <th title="Total recibido de este alumno (todos los pagos pagados, sin filtro de período)">Recibido</th>
+          <th title="% de períodos obligatorios cubiertos, período a período — igual que el dashboard">% Obligaciones</th>
         </tr></thead>
         <tbody>
           ${(()=>{

@@ -387,6 +387,16 @@ async function buscarPagoV9(cuentaId, pagoId, accessToken) {
  * Crea una cuota en Supabase y devuelve la fila insertada.
  */
 async function crearCuotaV9(cuentaId, cursoId, data, accessToken) {
+  // Validación explícita de tipo ANTES del INSERT.
+  // Mientras M006 no esté instalada en DB, es esta guardia la que previene
+  // guardar null o valores no reconocidos como 'unica'.
+  const TIPOS_VALIDOS = ['mensual', 'anual', 'extraordinaria'];
+  if (!data.tipo || !TIPOS_VALIDOS.includes(data.tipo)) {
+    throw new Error(
+      `[datos_v9] crearCuotaV9: tipo inválido "${data.tipo}". ` +
+      `Debe ser uno de: ${TIPOS_VALIDOS.join(', ')}.`
+    );
+  }
   const id = data.id || uid();
   const payload = {
     cuenta_id:   cuentaId,
@@ -394,7 +404,7 @@ async function crearCuotaV9(cuentaId, cursoId, data, accessToken) {
     curso_id:    cursoId,
     nombre:      data.nombre,
     monto:       Math.round(Number(data.monto)),
-    tipo:        data.tipo   || null,  // null explícito; la restricción DB rechazará el INSERT si falta
+    tipo:        data.tipo,
     anio:        data.anio   || new Date().getFullYear(),
     activa:      data.activa !== false,
     mes_inicio:  data.mesInicio  != null ? data.mesInicio  : null,
@@ -415,6 +425,13 @@ async function crearCuotaV9(cuentaId, cursoId, data, accessToken) {
  * Actualiza campos de una cuota existente. Devuelve la fila actualizada.
  */
 async function actualizarCuotaV9(cuentaId, cuotaId, data, accessToken) {
+  const TIPOS_VALIDOS = ['mensual', 'anual', 'extraordinaria'];
+  if (data.tipo !== undefined && (!data.tipo || !TIPOS_VALIDOS.includes(data.tipo))) {
+    throw new Error(
+      `[datos_v9] actualizarCuotaV9: tipo inválido "${data.tipo}". ` +
+      `Debe ser uno de: ${TIPOS_VALIDOS.join(', ')}.`
+    );
+  }
   const patch = {};
   if (data.nombre     !== undefined) patch.nombre      = data.nombre;
   if (data.monto      !== undefined) patch.monto       = Math.round(Number(data.monto));
