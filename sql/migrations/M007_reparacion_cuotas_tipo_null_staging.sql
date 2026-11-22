@@ -7,7 +7,10 @@
 -- INSTRUCCIONES:
 --   1. Ejecuta primero el bloque INVENTARIO PREVIO (SELECT) y
 --      confirma que los valores coinciden con lo esperado.
---   2. Recién entonces ejecuta el bloque BEGIN…COMMIT.
+--   2. Ejecuta el bloque BEGIN…COMMIT completo de una vez.
+--      Los DO-blocks dentro de la transacción verifican las
+--      precondiciones antes de cada UPDATE; si alguna falla,
+--      la transacción completa se anula automáticamente.
 --   3. Ejecuta el bloque VERIFICACIÓN POST-REPARACIÓN y comprueba:
 --        - 0 cuotas con tipo IS NULL
 --        - totales financieros: $30.000 recaudados, $70.000 esperados, ~43%
@@ -48,27 +51,66 @@ ORDER BY c.id;
 
 -- ═══════════════════════════════════════════════════════════
 -- PASO 1 — REPARACIÓN (transaccional)
+--
+-- Todos los DO-blocks se ejecutan DENTRO de la transacción.
+-- Si cualquier precondición falla, RAISE EXCEPTION aborta el
+-- BEGIN…COMMIT completo sin modificar ninguna fila.
 -- ═══════════════════════════════════════════════════════════
 BEGIN;
 
+-- ── PRE-FLIGHT 1a: cuota-a-01 debe existir con tipo IS NULL ─────────────────
+-- Si ya fue reparada o el ID no existe, la transacción se cancela aquí.
+DO $$
+DECLARE
+  v_count INTEGER;
+BEGIN
+  SELECT COUNT(*) INTO v_count
+    FROM cuotas
+   WHERE cuenta_id = '00000000-0000-0000-aaaa-000000000001'::uuid
+     AND id        = 'cuota-a-01'
+     AND tipo IS NULL;
+
+  IF v_count = 0 THEN
+    RAISE EXCEPTION
+      'PRE-FLIGHT 1a FALLÓ: cuota-a-01 no existe con tipo IS NULL en esta cuenta. '
+      'Puede que ya haya sido reparada o que el ID/cuenta sea incorrecto. '
+      'Verifica el inventario previo antes de reintentar.';
+  END IF;
+END $$;
+
 -- ── 1a. Reparar cuota-a-01: "Cuota marzo 2025" ──────────────────────────────
--- Evidencia de tipo=mensual: seed 08_seed_staging.sql línea 212 la crea
--- explícitamente como mensual; pago-a-01 tiene periodo='Marzo 2025' (período mensual).
+-- Evidencia de tipo=mensual: seed 08_seed_staging.sql la crea como mensual;
+-- pago-a-01 tiene periodo='Marzo 2025' (período mensual).
 -- Rango propuesto: solo marzo (mes_inicio=2, mes_termino=2).
--- Ajusta mes_termino si esta cuota cubre más meses en tu setup real.
 UPDATE cuotas
    SET tipo        = 'mensual',
        mes_inicio  = 2,     -- Marzo (0-indexed, igual que JS)
        mes_termino = 2      -- Marzo solo → genera ['Marzo 2025']
  WHERE cuenta_id = '00000000-0000-0000-aaaa-000000000001'::uuid
    AND id = 'cuota-a-01'
-   AND tipo IS NULL;        -- guardia: solo toca filas sin tipo, no sobreescribe una reparación existente
+   AND tipo IS NULL;        -- guardia idempotente: solo toca filas sin tipo
 
--- Verifica: exactamente 1 fila afectada
--- (si devuelve 0, ya fue reparada o el ID no existe — revisa el inventario)
+-- ── PRE-FLIGHT 1b: cuota-a-02 debe existir con tipo IS NULL ─────────────────
+DO $$
+DECLARE
+  v_count INTEGER;
+BEGIN
+  SELECT COUNT(*) INTO v_count
+    FROM cuotas
+   WHERE cuenta_id = '00000000-0000-0000-aaaa-000000000001'::uuid
+     AND id        = 'cuota-a-02'
+     AND tipo IS NULL;
+
+  IF v_count = 0 THEN
+    RAISE EXCEPTION
+      'PRE-FLIGHT 1b FALLÓ: cuota-a-02 no existe con tipo IS NULL en esta cuenta. '
+      'Puede que ya haya sido reparada o que el ID/cuenta sea incorrecto. '
+      'Verifica el inventario previo antes de reintentar.';
+  END IF;
+END $$;
 
 -- ── 1b. Reparar cuota-a-02: "Cuota abril 2025" ──────────────────────────────
--- Evidencia de tipo=mensual: seed 08_seed_staging.sql línea 214.
+-- Evidencia de tipo=mensual: seed 08_seed_staging.sql.
 -- Rango propuesto: solo abril (mes_inicio=3, mes_termino=3).
 UPDATE cuotas
    SET tipo        = 'mensual',
@@ -78,16 +120,44 @@ UPDATE cuotas
    AND id = 'cuota-a-02'
    AND tipo IS NULL;
 
+-- ── PRE-FLIGHT 1c: el pago huérfano debe existir ────────────────────────────
+-- Verifica que haya exactamente 1 pago de Sofía (alu-a-01) en cuota-a-02
+-- con periodo='Anual 2025'. Si no existe, la transacción se cancela:
+-- podría ser que ya fue corregido, o que el alumno/cuota/período difieren
+-- de lo que contiene este staging.
+DO $$
+DECLARE
+  v_count INTEGER;
+BEGIN
+  SELECT COUNT(*) INTO v_count
+    FROM pagos
+   WHERE cuenta_id = '00000000-0000-0000-aaaa-000000000001'::uuid
+     AND cuota_id  = 'cuota-a-02'
+     AND alumno_id = 'alu-a-01'
+     AND periodo   = 'Anual 2025'
+     AND estado    = 'pagado';
+
+  IF v_count = 0 THEN
+    RAISE EXCEPTION
+      'PRE-FLIGHT 1c FALLÓ: no se encontró el pago de alu-a-01 en cuota-a-02 '
+      'con periodo=''Anual 2025'' y estado=''pagado''. '
+      'El pago puede haber sido ya corregido, o el alumno/cuota/período son distintos '
+      'en este staging. Verifica el inventario previo antes de reintentar.';
+  END IF;
+
+  IF v_count > 1 THEN
+    RAISE EXCEPTION
+      'PRE-FLIGHT 1c FALLÓ: se encontraron % pagos de alu-a-01 en cuota-a-02 '
+      'con periodo=''Anual 2025''. Se esperaba exactamente 1. '
+      'Revisa manualmente antes de continuar.', v_count;
+  END IF;
+END $$;
+
 -- ── 1c. Corregir el pago huérfano de cuota-a-02 ─────────────────────────────
 -- Este pago fue registrado cuando cuota-a-02 tenía tipo=null, por lo que el
 -- modal generó el período "Anual 2025". Al corregir la cuota a mensual/abril,
 -- ese pago quedaría fuera del período generado ('Abril 2025') y seguiría
 -- oculto. Debe corregirse en la misma transacción para no crear otro huérfano.
---
--- El ID del pago se resuelve dinámicamente: busca el único pago de Sofía
--- (alu-a-01) en cuota-a-02 con periodo='Anual 2025'.
--- La CTE lo identifica antes del UPDATE para que el mensaje de error sea claro
--- si no existe.
 WITH pago_huerfano AS (
   SELECT id
     FROM pagos
@@ -103,8 +173,41 @@ UPDATE pagos
  WHERE pagos.id = pago_huerfano.id
    AND pagos.cuenta_id = '00000000-0000-0000-aaaa-000000000001'::uuid;
 
--- Verifica: exactamente 1 fila afectada
--- (si devuelve 0, el pago ya fue corregido o no existe — revisa el inventario)
+-- ── POST-CHECK DENTRO DE TRANSACCIÓN: verificar que las 3 reparaciones ocurrieron ──
+-- Si algún UPDATE no afectó exactamente las filas esperadas, cancela todo.
+DO $$
+DECLARE
+  v_sin_tipo     INTEGER;
+  v_pago_huerfano INTEGER;
+BEGIN
+  -- (a) Ninguna de las dos cuotas debe quedar con tipo NULL
+  SELECT COUNT(*) INTO v_sin_tipo
+    FROM cuotas
+   WHERE cuenta_id = '00000000-0000-0000-aaaa-000000000001'::uuid
+     AND id IN ('cuota-a-01', 'cuota-a-02')
+     AND tipo IS NULL;
+
+  IF v_sin_tipo > 0 THEN
+    RAISE EXCEPTION
+      'POST-CHECK FALLÓ: % cuota(s) siguen con tipo IS NULL tras los UPDATEs. '
+      'La transacción se cancela.', v_sin_tipo;
+  END IF;
+
+  -- (b) El pago huérfano debe haber sido corregido
+  SELECT COUNT(*) INTO v_pago_huerfano
+    FROM pagos
+   WHERE cuenta_id = '00000000-0000-0000-aaaa-000000000001'::uuid
+     AND cuota_id  = 'cuota-a-02'
+     AND alumno_id = 'alu-a-01'
+     AND periodo   = 'Anual 2025'  -- período incorrecto que debería haber desaparecido
+     AND estado    = 'pagado';
+
+  IF v_pago_huerfano > 0 THEN
+    RAISE EXCEPTION
+      'POST-CHECK FALLÓ: el pago de alu-a-01 en cuota-a-02 sigue con periodo=''Anual 2025''. '
+      'La corrección del período no surtió efecto. La transacción se cancela.';
+  END IF;
+END $$;
 
 COMMIT;
 
@@ -139,7 +242,7 @@ ORDER BY c.id, p.id;
 
 -- Esperado:
 --   cuota-a-01 | mensual | mes_inicio=2 | mes_termino=2
---     pago-a-01 | alu-a-01 | "Marzo 2025" | $15.000 | pagado   ← ahora matchea el período generado
+--     pago-a-01 | alu-a-01 | "Marzo 2025" | $15.000 | pagado   ← matchea el período generado
 --   cuota-a-02 | mensual | mes_inicio=3 | mes_termino=3
 --     <id>      | alu-a-01 | "Abril 2025" | $15.000 | pagado   ← ya no es "Anual 2025"
 
